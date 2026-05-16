@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { AppShell } from "@/components/AppShell";
 
 export const metadata: Metadata = {
-  title: "AI Backoffice",
-  description: "Generated backoffice app",
+  title: "AI BackOffice",
+  description: "Contractor growth platform demo",
 };
 
 export default function RootLayout({
@@ -13,8 +14,8 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body className="min-h-screen">
-        <main className="mx-auto max-w-5xl p-6">{children}</main>
+      <body>
+        <AppShell>{children}</AppShell>
       </body>
     </html>
   );
