@@ -3,7 +3,7 @@ export type Lead = {
   customerName: string;
   tradeType: string;
   serviceNeeded: string;
-  source: string;
+  source: "Missed Call" | "Website Form" | "Facebook" | "Google Business Profile";
   urgency: "High" | "Medium" | "Low";
   status: "New" | "Contacted" | "Estimate Sent" | "Booked";
   lastMessage: string;
@@ -16,11 +16,11 @@ export type Lead = {
 };
 
 export const dashboardStats = [
-  { label: "Missed Leads", value: 14, trend: "+3 this week" },
-  { label: "Follow-Ups Due", value: 22, trend: "8 overdue" },
-  { label: "Open Estimates", value: 11, trend: "$42,600 pipeline" },
-  { label: "Booked Jobs", value: 19, trend: "+5 vs last week" },
-  { label: "Review Requests", value: 27, trend: "74% send rate" },
+  { label: "Leads at Risk", value: 14, trend: "+3 in the last 7 days", impact: "$11,400 left on the table" },
+  { label: "Follow-Ups Due Today", value: 22, trend: "8 overdue past 24 hours", impact: "Recover up to $6,200" },
+  { label: "Open Estimates", value: 11, trend: "$42,600 active pipeline", impact: "$18,900 unclosed this week" },
+  { label: "Booked Jobs", value: 19, trend: "+5 vs last week", impact: "$28,300 scheduled revenue" },
+  { label: "Review Requests Sent", value: 27, trend: "74% send rate", impact: "12 new reviews this month" },
 ];
 
 export const leads: Lead[] = [
@@ -29,7 +29,7 @@ export const leads: Lead[] = [
     customerName: "Jason Miller",
     tradeType: "Plumbing",
     serviceNeeded: "Water heater replacement",
-    source: "Google Local Services",
+    source: "Missed Call",
     urgency: "High",
     status: "Estimate Sent",
     lastMessage: "Can you install before Friday?",
@@ -45,7 +45,7 @@ export const leads: Lead[] = [
     customerName: "Angela Ruiz",
     tradeType: "HVAC",
     serviceNeeded: "AC not cooling",
-    source: "Website form",
+    source: "Website Form",
     urgency: "High",
     status: "Contacted",
     lastMessage: "Unit is blowing warm air.",
@@ -61,7 +61,7 @@ export const leads: Lead[] = [
     customerName: "Marcus Lee",
     tradeType: "Electrical",
     serviceNeeded: "Panel upgrade",
-    source: "Facebook ad",
+    source: "Facebook",
     urgency: "Medium",
     status: "New",
     lastMessage: "Need quote for 200A upgrade.",
@@ -77,7 +77,7 @@ export const leads: Lead[] = [
     customerName: "Sharon Patel",
     tradeType: "Roofing",
     serviceNeeded: "Leak inspection",
-    source: "Referral",
+    source: "Google Business Profile",
     urgency: "Low",
     status: "Booked",
     lastMessage: "Saturday morning works.",
@@ -91,14 +91,14 @@ export const leads: Lead[] = [
 ];
 
 export const recentActivity = [
-  "AI replied to 3 missed calls in under 2 minutes.",
-  "Estimate sent to Jason Miller with financing options.",
-  "Follow-up text queued for Marcus Lee at 8:15 AM.",
-  "Review request sent after Sharon Patel's completed job.",
+  "AI answered 3 missed calls and captured all caller details before office hours.",
+  "Estimate reminder sent to Jason Miller 4 hours after quote delivery.",
+  "Follow-up text queued for Marcus Lee before end-of-day to prevent lead drop-off.",
+  "Review request sent after Sharon Patel's completed roofing job.",
 ];
 
 export const aiRecommendations = [
-  "Call Angela Ruiz now: high urgency HVAC issue and no booking yet.",
-  "Offer a same-week slot to Jason Miller to increase close rate.",
-  "Send panel upgrade checklist to Marcus Lee before estimate call.",
+  "Call Angela Ruiz in the next 15 minutes: high urgency HVAC lead could book today.",
+  "Offer Jason Miller a same-week install slot and financing to prevent quote shopping.",
+  "Send Marcus Lee an estimate reminder now to recover $3,900 pipeline opportunity.",
 ];
