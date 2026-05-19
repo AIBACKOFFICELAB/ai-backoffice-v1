@@ -1,42 +1,43 @@
-import { aiRecommendations, dashboardStats, recentActivity } from "@/data/mockData";
+import { plumbingLeads } from "@/data/plumbingLeads";
 
 export default function DashboardPage() {
+  const today = new Date().toISOString().slice(0, 10);
+  const totalLeads = plumbingLeads.length;
+  const newLeads = plumbingLeads.filter((lead) => lead.status === "New").length;
+  const emergencyLeads = plumbingLeads.filter((lead) => lead.emergency === "Yes").length;
+  const followUpsDue = plumbingLeads.filter((lead) => lead.followUpDate && lead.followUpDate <= today).length;
+  const estimatesSent = plumbingLeads.filter((lead) => lead.status === "Estimate Sent").length;
+  const jobsWon = plumbingLeads.filter((lead) => lead.status === "Won").length;
+  const revenuePipeline = plumbingLeads
+    .filter((lead) => !["Lost", "Completed"].includes(lead.status))
+    .reduce((sum, lead) => sum + lead.estimateAmount, 0);
+  const reviewPending = plumbingLeads.filter((lead) => lead.reviewRequestStatus === "Ready to Send").length;
+
+  const metrics = [
+    ["Total Leads", totalLeads],
+    ["New Leads", newLeads],
+    ["Emergency Leads", emergencyLeads],
+    ["Follow-Ups Due", followUpsDue],
+    ["Estimates Sent", estimatesSent],
+    ["Jobs Won", jobsWon],
+    ["Revenue Pipeline", `$${revenuePipeline.toLocaleString()}`],
+    ["Review Requests Pending", reviewPending],
+  ];
+
   return (
     <div className="space-y-8">
       <section className="rounded-2xl bg-slate-900 p-6 text-white shadow-lg ring-1 ring-slate-800">
         <h1 className="text-3xl font-bold">Revenue Command Center</h1>
-        <p className="mt-2 text-slate-300">Track lead response speed, estimate follow-up, and money left on the table in one place.</p>
+        <p className="mt-2 text-slate-300">5 Star Plumbing private alpha dashboard powered by lead inbox data.</p>
       </section>
 
-      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-        {dashboardStats.map((stat) => (
-          <div key={stat.label} className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-            <p className="text-sm font-semibold text-slate-500">{stat.label}</p>
-            <p className="mt-2 text-3xl font-bold text-slate-900">{stat.value}</p>
-            <p className="mt-1 text-xs text-slate-500">{stat.trend}</p>
-            <p className="mt-3 rounded-lg bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700">{stat.impact}</p>
+      <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        {metrics.map(([label, value]) => (
+          <div key={String(label)} className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <p className="text-sm font-semibold text-slate-500">{label}</p>
+            <p className="mt-2 text-3xl font-bold text-slate-900">{value}</p>
           </div>
         ))}
-      </section>
-
-      <section className="grid gap-4 lg:grid-cols-2">
-        <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-          <h2 className="text-xl font-semibold text-slate-900">Recent Activity</h2>
-          <ul className="mt-4 space-y-3 text-sm text-slate-600">
-            {recentActivity.map((item) => (
-              <li key={item} className="rounded-lg bg-slate-50 p-3">{item}</li>
-            ))}
-          </ul>
-        </div>
-
-        <div className="rounded-2xl bg-white p-6 shadow-sm ring-1 ring-slate-200">
-          <h2 className="text-xl font-semibold text-slate-900">AI Recommendations</h2>
-          <ul className="mt-4 space-y-3 text-sm text-slate-600">
-            {aiRecommendations.map((item) => (
-              <li key={item} className="rounded-lg border border-blue-100 bg-blue-50 p-3">{item}</li>
-            ))}
-          </ul>
-        </div>
       </section>
     </div>
   );

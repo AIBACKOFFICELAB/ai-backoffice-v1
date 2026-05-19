@@ -1,24 +1,31 @@
-const ready = ["Sharon Patel", "Liam Thompson", "Erica Nguyen"];
-const sent = ["Carlos Diaz — sent 3h ago", "Nina Brooks — sent yesterday", "Tony Webb — sent yesterday"];
+import Link from "next/link";
+import { plumbingLeads, reviewVisibleStatuses } from "@/data/plumbingLeads";
 
 export default function ReviewRequestsPage() {
+  const leads = plumbingLeads.filter((lead) => reviewVisibleStatuses.includes(lead.reviewRequestStatus));
+
   return (
     <div className="space-y-6">
       <h1 className="text-3xl font-bold">Review Requests</h1>
+      <p className="text-slate-600">Track which completed plumbing jobs are ready, sent, and converted into reviews.</p>
       <div className="grid gap-4 md:grid-cols-3">
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm text-slate-500">Requests Sent</p><p className="text-3xl font-bold">41</p>
-        </div>
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm text-slate-500">Response Rate</p><p className="text-3xl font-bold">63%</p>
-        </div>
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-          <p className="text-sm text-slate-500">New 5★ Reviews</p><p className="text-3xl font-bold">18</p>
-        </div>
+        {reviewVisibleStatuses.map((status) => (
+          <div key={status} className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <p className="text-sm text-slate-500">{status}</p>
+            <p className="text-3xl font-bold">{leads.filter((lead) => lead.reviewRequestStatus === status).length}</p>
+          </div>
+        ))}
       </div>
-      <div className="grid gap-4 md:grid-cols-2">
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200"><h2 className="font-semibold">Ready to Request</h2><ul className="mt-3 space-y-2 text-sm text-slate-600">{ready.map((n)=><li key={n}>• {n}</li>)}</ul></div>
-        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200"><h2 className="font-semibold">Recently Sent</h2><ul className="mt-3 space-y-2 text-sm text-slate-600">{sent.map((n)=><li key={n}>• {n}</li>)}</ul></div>
+      <div className="grid gap-4">
+        {leads.map((lead) => (
+          <Link key={lead.id} href={`/leads/${lead.id}`} className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-semibold">{lead.customerName}</h2>
+              <span className="rounded-full bg-blue-100 px-2 py-1 text-xs font-semibold text-blue-700">{lead.reviewRequestStatus}</span>
+            </div>
+            <p className="mt-1 text-sm text-slate-600">{lead.serviceType} • {lead.status}</p>
+          </Link>
+        ))}
       </div>
     </div>
   );
