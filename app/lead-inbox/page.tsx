@@ -53,7 +53,7 @@ export default function LeadInboxPage() {
                 <p><span className="font-semibold">Review Request:</span> {lead.reviewRequestStatus}</p>
               </div>
               <p className="mt-2 text-sm text-slate-600"><span className="font-semibold text-slate-900">Job:</span> {lead.jobDescription}</p>
-              <p className="mt-1 text-sm text-slate-600"><span className="font-semibold text-slate-900">Notes:</span> {lead.notes}</p>
+              <p className="mt-1 text-sm text-slate-600"><span className="font-semibold text-slate-900">Notes:</span> {lead.internalNotes}</p>
             </Link>
           );
         })}

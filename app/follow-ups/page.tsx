@@ -19,7 +19,7 @@ export default function FollowUpsPage() {
               <span className="rounded-full bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-700">Due {lead.followUpDate}</span>
             </div>
             <p className="mt-1 text-sm text-slate-600">{lead.serviceType} • {lead.phone} • {lead.status}</p>
-            <p className="mt-2 text-sm text-slate-600">{lead.notes}</p>
+            <p className="mt-2 text-sm text-slate-600">{lead.internalNotes}</p>
           </Link>
         ))}
       </div>
