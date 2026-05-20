@@ -7,9 +7,7 @@ export type LeadDataSource = "google-sheets" | "mock-fallback";
 export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadDataSource }> {
   try {
     const liveLeads = await fetchGoogleSheetLeads();
-    if (liveLeads.length > 0) {
-      return { leads: liveLeads, source: "google-sheets" };
-    }
+    return { leads: liveLeads, source: "google-sheets" };
   } catch {
     // Intentionally fall through to mock fallback.
   }
