@@ -48,8 +48,9 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
       </section>
 
       <section className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
-        <h2 className="font-semibold text-slate-900">Internal Notes</h2>
-        <p className="mt-2 text-sm text-slate-700">{lead.notes}</p>
+        <h2 className="font-semibold text-slate-900">Customer & Internal Notes</h2>
+        <p className="mt-2 text-sm text-slate-700"><span className="font-semibold">Customer Notes:</span> {lead.customerNotes}</p>
+        <p className="mt-2 text-sm text-slate-700"><span className="font-semibold">Internal Notes:</span> {lead.internalNotes}</p>
       </section>
 
       <section className="rounded-xl border border-blue-100 bg-blue-50 p-5 shadow-sm">
