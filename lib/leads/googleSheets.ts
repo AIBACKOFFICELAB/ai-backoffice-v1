@@ -34,6 +34,14 @@ function safeNumber(value: string): number {
   return Number.isFinite(numeric) ? numeric : 0;
 }
 
+function safeIsoDate(value: string): string {
+  const raw = value.trim();
+  if (!raw) return new Date().toISOString();
+
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+}
+
 export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
   if (!rows.length) return [];
 
@@ -43,12 +51,15 @@ export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
   return dataRows
     .filter((row) => row.some((cell) => cell?.trim()))
     .map((row, index): PlumbingLead => {
-      const read = (header: string) => row[headerIndex[header] ?? -1] ?? "";
-      const date = read(SHEET_HEADERS.timestamp);
+      const read = (header: string) => (row[headerIndex[header] ?? -1] ?? "").trim();
+      const rawTimestamp = read(SHEET_HEADERS.timestamp);
+      const safeDate = safeIsoDate(rawTimestamp);
+      const parsedDate = Date.parse(rawTimestamp);
+      const timestampForId = Number.isFinite(parsedDate) ? parsedDate : Date.now();
 
       return {
-        id: `GS-${index + 1}-${Date.parse(date) || Date.now()}`,
-        date: new Date(date).toISOString(),
+        id: `GS-${index + 1}-${timestampForId}`,
+        date: safeDate,
         customerName: read(SHEET_HEADERS.customerName) || "Unknown Customer",
         phone: read(SHEET_HEADERS.phone),
         email: read(SHEET_HEADERS.email),
