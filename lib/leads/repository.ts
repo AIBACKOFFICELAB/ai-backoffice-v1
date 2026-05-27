@@ -8,8 +8,8 @@ export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadD
   try {
     const liveLeads = await fetchGoogleSheetLeads();
     return { leads: liveLeads, source: "google-sheets" };
-  } catch {
-    // Intentionally fall through to mock fallback.
+  } catch (error) {
+    console.error("[leads] Google Sheets fetch failed, falling back to mock data.", error);
   }
 
   return { leads: plumbingLeads, source: "mock-fallback" };
