@@ -1,6 +1,13 @@
+import { createSign } from "node:crypto";
 import { PlumbingLead } from "@/data/leadModel";
 
 type SheetResponse = { values?: string[][] };
+
+type GoogleTokenResponse = {
+  access_token?: string;
+  error?: string;
+  error_description?: string;
+};
 
 const SHEET_HEADERS = {
   timestamp: "Timestamp",
@@ -40,6 +47,61 @@ function safeIsoDate(value: string): string {
 
   const parsed = new Date(raw);
   return Number.isNaN(parsed.getTime()) ? new Date().toISOString() : parsed.toISOString();
+}
+
+function base64UrlEncode(value: string): string {
+  return Buffer.from(value).toString("base64url");
+}
+
+function createSignedJwt(clientEmail: string, privateKey: string): string {
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/spreadsheets.readonly",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now,
+  };
+
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const unsignedToken = `${encodedHeader}.${encodedPayload}`;
+
+  const signer = createSign("RSA-SHA256");
+  signer.update(unsignedToken);
+  signer.end();
+
+  const signature = signer.sign(privateKey).toString("base64url");
+  return `${unsignedToken}.${signature}`;
+}
+
+async function getGoogleAccessToken(): Promise<string> {
+  const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+  if (!clientEmail || !privateKey) {
+    throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY.");
+  }
+
+  const assertion = createSignedJwt(clientEmail, privateKey);
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+      assertion,
+    }),
+    cache: "no-store",
+  });
+
+  const payload = (await tokenResponse.json()) as GoogleTokenResponse;
+
+  if (!tokenResponse.ok || !payload.access_token) {
+    throw new Error(`Failed to get Google access token (${tokenResponse.status}): ${payload.error ?? "unknown"} ${payload.error_description ?? ""}`.trim());
+  }
+
+  return payload.access_token;
 }
 
 export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
@@ -84,25 +146,28 @@ export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
 }
 
 export async function fetchGoogleSheetLeads(): Promise<PlumbingLead[]> {
-  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  const spreadsheetId = process.env.GOOGLE_SHEET_ID || process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
   const range = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:T";
-  const apiKey = process.env.GOOGLE_SHEETS_API_KEY;
 
-  if (!spreadsheetId || !apiKey) {
-    throw new Error("Google Sheets environment variables are not fully configured.");
+  if (!spreadsheetId) {
+    throw new Error("Missing GOOGLE_SHEET_ID (or GOOGLE_SHEETS_SPREADSHEET_ID).");
   }
 
-  const url = new URL(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${encodeURIComponent(range)}`);
-  url.searchParams.set("key", apiKey);
+  const accessToken = await getGoogleAccessToken();
 
-  const response = await fetch(url.toString(), {
+  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(range)}`;
+  const response = await fetch(url, {
     method: "GET",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
     next: { revalidate: 60 },
   });
 
   if (!response.ok) {
-    throw new Error(`Google Sheets API request failed (${response.status}).`);
+    const detail = await response.text();
+    throw new Error(`Google Sheets API request failed (${response.status}): ${detail}`);
   }
 
   const payload = (await response.json()) as SheetResponse;
