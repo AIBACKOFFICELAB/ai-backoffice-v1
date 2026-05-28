@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic';
+
 import { buildLeadMetrics, getLeads } from "@/lib/leads/repository";
 
 export default async function DashboardPage() {
