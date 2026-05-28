@@ -1,18 +1,17 @@
 import { PlumbingLead, reviewVisibleStatuses } from "@/data/leadModel";
-import { plumbingLeads } from "@/data/plumbingLeads";
 import { fetchGoogleSheetLeads } from "@/lib/leads/googleSheets";
 
 export type LeadDataSource = "google-sheets" | "mock-fallback";
 
-export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadDataSource }> {
+export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
   try {
     const liveLeads = await fetchGoogleSheetLeads();
     return { leads: liveLeads, source: "google-sheets" };
   } catch (error) {
-    console.error("[leads] Google Sheets fetch failed, falling back to mock data.", error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[leads] Google Sheets fetch failed.", error);
+    return { leads: [], source: "mock-fallback", error: true, message };
   }
-
-  return { leads: plumbingLeads, source: "mock-fallback" };
 }
 
 export async function getLeadById(id: string) {
