@@ -78,7 +78,7 @@ function createSignedJwt(clientEmail: string, privateKey: string): string {
 
 async function getGoogleAccessToken(): Promise<string> {
   const clientEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, "\n");
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 
   if (!clientEmail || !privateKey) {
     throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_EMAIL or GOOGLE_PRIVATE_KEY.");
@@ -147,7 +147,7 @@ export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
 
 export async function fetchGoogleSheetLeads(): Promise<PlumbingLead[]> {
   const spreadsheetId = process.env.GOOGLE_SHEET_ID || process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
-  const range = process.env.GOOGLE_SHEETS_RANGE || "Sheet1!A:T";
+  const range = process.env.GOOGLE_SHEETS_RANGE || "'Form Responses 1'!A:Z";
 
   if (!spreadsheetId) {
     throw new Error("Missing GOOGLE_SHEET_ID (or GOOGLE_SHEETS_SPREADSHEET_ID).");
