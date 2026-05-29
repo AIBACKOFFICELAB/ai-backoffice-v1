@@ -11,9 +11,9 @@ type GoogleTokenResponse = {
 
 const SHEET_HEADERS = {
   timestamp: "Timestamp",
-  customerName: "Customer Name",
-  phone: "Phone Number (required for confirmation)",
-  email: "Email Address (optional)",
+  customerNameFallbacks: ["Customer Name", "Name", "name", "customer_name"],
+  phone: "Phone Number (Required for confirmation)",
+  email: "Email Address (Optional)",
   serviceAddress: "Service Address (Full Address)",
   propertyType: "Property Type",
   serviceNeeded: "Service Needed",
@@ -114,6 +114,14 @@ export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
     .filter((row) => row.some((cell) => cell?.trim()))
     .map((row, index): PlumbingLead => {
       const read = (header: string) => (row[headerIndex[header] ?? -1] ?? "").trim();
+      const readFirst = (headers: readonly string[]) => {
+        for (const header of headers) {
+          const value = read(header);
+          if (value) return value;
+        }
+
+        return "";
+      };
       const rawTimestamp = read(SHEET_HEADERS.timestamp);
       const safeDate = safeIsoDate(rawTimestamp);
       const parsedDate = Date.parse(rawTimestamp);
@@ -122,7 +130,7 @@ export function mapSheetRowsToLeads(rows: string[][]): PlumbingLead[] {
       return {
         id: `GS-${index + 1}-${timestampForId}`,
         date: safeDate,
-        customerName: read(SHEET_HEADERS.customerName) || "Unknown Customer",
+        customerName: readFirst(SHEET_HEADERS.customerNameFallbacks) || "Unknown Customer",
         phone: read(SHEET_HEADERS.phone),
         email: read(SHEET_HEADERS.email),
         serviceAddress: read(SHEET_HEADERS.serviceAddress),
