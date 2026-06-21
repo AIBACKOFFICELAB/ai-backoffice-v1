@@ -1,7 +1,14 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { EmergencyLeadPayload, isEmergencyLead, sendOwnerEmergencySms } from "@/lib/sms/twilio";
+import { checkAuth } from "@/lib/api-auth";
 
-export async function POST(request: Request) {
+export async function POST(request: NextRequest) {
+  // Check authentication
+  const auth = await checkAuth(request);
+  if (!auth.authenticated) {
+    return auth.response!;
+  }
+
   let payload: EmergencyLeadPayload;
 
   try {

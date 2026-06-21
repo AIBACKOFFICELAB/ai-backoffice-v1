@@ -1,9 +1,16 @@
 export const dynamic = 'force-dynamic';
  
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { google } from 'googleapis';
+import { checkAuth } from '@/lib/api-auth';
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  // Check authentication
+  const auth = await checkAuth(request);
+  if (!auth.authenticated) {
+    return auth.response!;
+  }
+
   try {
     const email = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
     const key = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
@@ -16,7 +23,7 @@ export async function GET() {
       });
     }
 
-    const auth = new google.auth.GoogleAuth({
+    const authClient = new google.auth.GoogleAuth({
       credentials: {
         client_email: email,
         private_key: key,
@@ -24,7 +31,7 @@ export async function GET() {
       scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
 
-    const sheets = google.sheets({ version: 'v4', auth });
+    const sheets = google.sheets({ version: 'v4', auth: authClient });
 
     const response = await sheets.spreadsheets.values.get({
       spreadsheetId: sheetId,
