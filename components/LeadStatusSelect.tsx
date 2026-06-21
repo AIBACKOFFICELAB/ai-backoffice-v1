@@ -3,14 +3,16 @@
 import { useState } from "react";
 import { LeadStatus } from "@/data/leadModel";
 
-const STATUSES: LeadStatus[] = ["New", "Contacted", "Estimate Sent", "Won", "Lost"];
+const STATUSES: LeadStatus[] = ["New", "Contacted", "Scheduled", "Estimate Sent", "Won", "Lost", "Completed"];
 
 const STATUS_STYLES: Record<string, string> = {
   New: "bg-blue-100 text-blue-700",
   Contacted: "bg-amber-100 text-amber-700",
+  Scheduled: "bg-cyan-100 text-cyan-700",
   "Estimate Sent": "bg-purple-100 text-purple-700",
   Won: "bg-green-100 text-green-700",
   Lost: "bg-red-100 text-red-700",
+  Completed: "bg-slate-100 text-slate-700",
 };
 
 type Props = {
@@ -19,9 +21,9 @@ type Props = {
 };
 
 export default function LeadStatusSelect({ leadId, initialStatus }: Props) {
-  const normalizedInitial = STATUSES.includes(initialStatus as LeadStatus)
-    ? (initialStatus as LeadStatus)
-    : "New";
+  const normalizedInitial = (
+    STATUSES.includes(initialStatus as LeadStatus) ? initialStatus : "New"
+  ) as LeadStatus;
 
   const [status, setStatus] = useState<LeadStatus>(normalizedInitial);
   const [saving, setSaving] = useState(false);

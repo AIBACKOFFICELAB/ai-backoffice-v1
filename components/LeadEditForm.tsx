@@ -4,21 +4,23 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { PlumbingLead, LeadStatus } from "@/data/leadModel";
 
-const STATUSES: LeadStatus[] = ["New", "Contacted", "Estimate Sent", "Won", "Lost"];
+const STATUSES: LeadStatus[] = ["New", "Contacted", "Scheduled", "Estimate Sent", "Won", "Lost", "Completed"];
 
 const STATUS_STYLES: Record<string, string> = {
   New: "bg-blue-100 text-blue-800",
   Contacted: "bg-amber-100 text-amber-800",
+  Scheduled: "bg-cyan-100 text-cyan-800",
   "Estimate Sent": "bg-purple-100 text-purple-800",
   Won: "bg-green-100 text-green-800",
   Lost: "bg-red-100 text-red-800",
+  Completed: "bg-slate-100 text-slate-800",
 };
 
 export default function LeadEditForm({ lead }: { lead: PlumbingLead }) {
   const router = useRouter();
 
   const [status, setStatus] = useState<LeadStatus>(
-    STATUSES.includes(lead.status as LeadStatus) ? (lead.status as LeadStatus) : "New"
+    (STATUSES.includes(lead.status as LeadStatus) ? lead.status : "New") as LeadStatus
   );
   const [estimateAmount, setEstimateAmount] = useState(lead.estimateAmount.toString());
   const [followUpDate, setFollowUpDate] = useState(lead.followUpDate || "");

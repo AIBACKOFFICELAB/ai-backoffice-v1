@@ -1,31 +1,33 @@
+import { createServerClient } from "@supabase/ssr";
 import { NextRequest, NextResponse } from "next/server";
 
-async function validateSupabaseSession(request: NextRequest) {
-  const accessToken = request.cookies.get("sb-access-token")?.value;
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-  if (!accessToken || !supabaseUrl || !supabaseAnonKey) {
-    return false;
-  }
-
-  try {
-    const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        apikey: supabaseAnonKey,
-      },
-    });
-
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
 export async function middleware(request: NextRequest) {
-  // Protected routes that require authentication
+  let response = NextResponse.next({
+    request: { headers: request.headers },
+  });
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll();
+        },
+        setAll(cookiesToSet: Array<{ name: string; value: string; options?: Record<string, unknown> }>) {
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options)
+          );
+        },
+      },
+    }
+  );
+
+  // getUser() validates the session against Supabase; never trust local JWT alone
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
   const protectedRoutes = [
     "/dashboard",
     "/lead-inbox",
@@ -36,32 +38,22 @@ export async function middleware(request: NextRequest) {
   ];
 
   const pathname = request.nextUrl.pathname;
-  const isProtectedRoute = protectedRoutes.some((route) =>
-    pathname.startsWith(route)
-  );
+  const isProtected = protectedRoutes.some((r) => pathname.startsWith(r));
 
-  const isAuthenticated = await validateSupabaseSession(request);
-
-  // If route is protected and the session is invalid, redirect to login
-  if (isProtectedRoute && !isAuthenticated) {
+  if (isProtected && !user) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/auth/login";
     redirectUrl.search = `?redirectTo=${encodeURIComponent(pathname)}`;
     return NextResponse.redirect(redirectUrl);
   }
 
-  // If user is authenticated and tries to access login, redirect to dashboard
-  if (pathname === "/auth/login" && isAuthenticated) {
+  if (pathname === "/auth/login" && user) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/dashboard";
     return NextResponse.redirect(redirectUrl);
   }
 
-  return NextResponse.next({
-    request: {
-      headers: request.headers,
-    },
-  });
+  return response;
 }
 
 export const config = {

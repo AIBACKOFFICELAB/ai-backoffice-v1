@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkAuth } from "@/lib/api-auth";
-import { updateLead, deleteLead, getLeadById } from "@/lib/leads/repository";
+import { updateLead, createLead, deleteLead, getLeadById } from "@/lib/leads/repository";
 import { LeadUpdate } from "@/data/leadModel";
 
 export const dynamic = "force-dynamic";
@@ -34,9 +34,15 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
   }
 
   const { id } = params;
-  const updatedLead = await updateLead(id, payload);
+  let updatedLead = await updateLead(id, payload);
+
+  // Lead exists in Google Sheets but not yet in Supabase — shadow-write it
   if (!updatedLead) {
-    return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+    const { lead: sourceLead } = await getLeadById(id);
+    if (!sourceLead) {
+      return NextResponse.json({ error: "Lead not found" }, { status: 404 });
+    }
+    updatedLead = await createLead({ ...sourceLead, ...payload, id });
   }
 
   return NextResponse.json({ lead: updatedLead });
