@@ -1,9 +1,19 @@
-import { PlumbingLead, reviewVisibleStatuses } from "@/data/leadModel";
+import { PlumbingLead, LeadInsert, LeadUpdate, reviewVisibleStatuses } from "@/data/leadModel";
 import { fetchGoogleSheetLeads } from "@/lib/leads/googleSheets";
+import { fetchLeadsFromDb, fetchLeadByIdFromDb, insertLeadToDb, updateLeadInDb, deleteLeadFromDb } from "@/lib/leads/supabase";
 
-export type LeadDataSource = "google-sheets" | "mock-fallback";
+export type LeadDataSource = "supabase" | "google-sheets" | "mock-fallback";
 
 export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
+  try {
+    const dbLeads = await fetchLeadsFromDb();
+    if (dbLeads.length > 0) {
+      return { leads: dbLeads, source: "supabase" };
+    }
+  } catch (error) {
+    console.error("[leads] Supabase fetch failed.", error);
+  }
+
   try {
     const liveLeads = await fetchGoogleSheetLeads();
     return { leads: liveLeads, source: "google-sheets" };
@@ -15,8 +25,29 @@ export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadD
 }
 
 export async function getLeadById(id: string) {
+  try {
+    const dbLead = await fetchLeadByIdFromDb(id);
+    if (dbLead) {
+      return { lead: dbLead, source: "supabase" as const };
+    }
+  } catch (error) {
+    console.error("[leads] Supabase fetch by id failed.", error);
+  }
+
   const { leads, source } = await getLeads();
   return { lead: leads.find((item) => item.id === id), source };
+}
+
+export async function createLead(lead: LeadInsert) {
+  return insertLeadToDb(lead);
+}
+
+export async function updateLead(id: string, update: LeadUpdate) {
+  return updateLeadInDb(id, update);
+}
+
+export async function deleteLead(id: string) {
+  return deleteLeadFromDb(id);
 }
 
 export function buildLeadMetrics(leads: PlumbingLead[]) {
