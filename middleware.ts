@@ -1,35 +1,30 @@
-import { createServerClient } from "@supabase/ssr";
 import { NextRequest, NextResponse } from "next/server";
 
-export async function middleware(request: NextRequest) {
-  let response = NextResponse.next({
-    request: {
-      headers: request.headers,
-    },
-  });
+async function validateSupabaseSession(request: NextRequest) {
+  const accessToken = request.cookies.get("sb-access-token")?.value;
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll();
-        },
-        setAll(cookiesToSet: Array<{ name: string; value: string; options?: Record<string, unknown> }>) {
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, options)
-          );
-        },
+  if (!accessToken || !supabaseUrl || !supabaseAnonKey) {
+    return false;
+  }
+
+  try {
+    const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        apikey: supabaseAnonKey,
       },
-    }
-  );
+    });
 
-  // Refresh auth session
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
 
+export async function middleware(request: NextRequest) {
   // Protected routes that require authentication
   const protectedRoutes = [
     "/dashboard",
@@ -45,8 +40,10 @@ export async function middleware(request: NextRequest) {
     pathname.startsWith(route)
   );
 
-  // If route is protected and user is not authenticated, redirect to login
-  if (isProtectedRoute && !user) {
+  const isAuthenticated = await validateSupabaseSession(request);
+
+  // If route is protected and the session is invalid, redirect to login
+  if (isProtectedRoute && !isAuthenticated) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/auth/login";
     redirectUrl.search = `?redirectTo=${encodeURIComponent(pathname)}`;
@@ -54,13 +51,17 @@ export async function middleware(request: NextRequest) {
   }
 
   // If user is authenticated and tries to access login, redirect to dashboard
-  if (pathname === "/auth/login" && user) {
+  if (pathname === "/auth/login" && isAuthenticated) {
     const redirectUrl = request.nextUrl.clone();
     redirectUrl.pathname = "/dashboard";
     return NextResponse.redirect(redirectUrl);
   }
 
-  return response;
+  return NextResponse.next({
+    request: {
+      headers: request.headers,
+    },
+  });
 }
 
 export const config = {
