@@ -44,6 +44,10 @@ export async function PUT(request: NextRequest) {
       businessPhone: payload.businessPhone as string | undefined,
       smsTemplate: payload.smsTemplate as string | undefined,
       ownerAlertPhone: payload.ownerAlertPhone as string | undefined,
+      ownerNotificationEmail: payload.ownerNotificationEmail as string | undefined,
+      intakeFormUrl: payload.intakeFormUrl as string | undefined,
+      emergencyPhone: payload.emergencyPhone as string | undefined,
+      businessTagline: payload.businessTagline as string | undefined,
       emergencyKeywords: payload.emergencyKeywords as string[] | undefined,
     });
     return NextResponse.json({ success: true });

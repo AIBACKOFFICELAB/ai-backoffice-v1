@@ -4,7 +4,23 @@ import { notFound, redirect } from "next/navigation";
 import Link from "next/link";
 import { getLeadById } from "@/lib/leads/repository";
 import { getTenantContext } from "@/lib/tenant";
+import { getMissedCallHistoryForLead } from "@/lib/modules/missedCallRecovery/service";
 import LeadEditForm from "@/components/LeadEditForm";
+
+function statusBadge(status: string) {
+  const styles: Record<string, string> = {
+    sent: "bg-green-100 text-green-700",
+    recovered: "bg-green-100 text-green-700",
+    failed: "bg-red-100 text-red-700",
+    skipped: "bg-amber-100 text-amber-700",
+    pending: "bg-slate-100 text-slate-700",
+  };
+  return (
+    <span className={`rounded-full px-2 py-1 text-xs font-semibold ${styles[status] ?? "bg-slate-100 text-slate-700"}`}>
+      {status}
+    </span>
+  );
+}
 
 function recommendedAction(status: string, emergency: string, reviewStatus: string) {
   if (emergency === "Yes" && status === "New") return "Call immediately and confirm dispatch window for emergency service.";
@@ -21,6 +37,8 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
   const { id } = await params;
   const { lead, source } = await getLeadById(id, tenant.tenantId);
   if (!lead) notFound();
+
+  const mcrHistory = await getMissedCallHistoryForLead(tenant.tenantId, id);
 
   return (
     <div className="space-y-6">
@@ -45,6 +63,39 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
 
       {/* Editable fields */}
       <LeadEditForm lead={lead} />
+
+      {mcrHistory && (
+        <div className="rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+          <h2 className="font-semibold text-slate-900 mb-3">Missed Call Recovery</h2>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Recovery SMS (Intake Form Sent)</p>
+              <div className="mt-1">{statusBadge(mcrHistory.recovery_sms_status ?? "pending")}</div>
+              {mcrHistory.recovery_sms_failure_reason && (
+                <p className="mt-1 text-xs text-red-600">{mcrHistory.recovery_sms_failure_reason}</p>
+              )}
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Owner SMS Notification</p>
+              <div className="mt-1">{statusBadge(mcrHistory.owner_sms_status ?? "pending")}</div>
+              {mcrHistory.owner_sms_failure_reason && (
+                <p className="mt-1 text-xs text-red-600">{mcrHistory.owner_sms_failure_reason}</p>
+              )}
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Owner Email Notification</p>
+              <div className="mt-1">{statusBadge(mcrHistory.owner_email_status ?? "pending")}</div>
+              {mcrHistory.owner_email_failure_reason && (
+                <p className="mt-1 text-xs text-red-600">{mcrHistory.owner_email_failure_reason}</p>
+              )}
+            </div>
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Emergency Instructions Sent</p>
+              <div className="mt-1">{statusBadge(mcrHistory.recovery_sms_status === "sent" ? "sent" : "pending")}</div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Read-only details */}
       <div className="grid gap-4 lg:grid-cols-2">

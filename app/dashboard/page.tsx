@@ -52,7 +52,7 @@ export default async function DashboardPage() {
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <div className="rounded-2xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
             <p className="text-sm font-semibold text-slate-500">Missed Call Recovery</p>
-            <div className="mt-3 grid grid-cols-3 gap-3 text-center">
+            <div className="mt-3 grid grid-cols-4 gap-3 text-center">
               <div>
                 <p className="text-2xl font-bold text-slate-900">{missedCallAnalytics.totalMissedCalls}</p>
                 <p className="text-xs text-slate-500">Missed Calls</p>
@@ -62,8 +62,14 @@ export default async function DashboardPage() {
                 <p className="text-xs text-slate-500">Recovered</p>
               </div>
               <div>
-                <p className="text-2xl font-bold text-slate-900">{missedCallAnalytics.recoveryRate}%</p>
-                <p className="text-xs text-slate-500">Recovery Rate</p>
+                <p className="text-2xl font-bold text-slate-900">{missedCallAnalytics.ownerNotified}</p>
+                <p className="text-xs text-slate-500">Owner Notified</p>
+              </div>
+              <div>
+                <p className={`text-2xl font-bold ${missedCallAnalytics.ownerNotificationFailures > 0 ? "text-red-600" : "text-slate-900"}`}>
+                  {missedCallAnalytics.ownerNotificationFailures}
+                </p>
+                <p className="text-xs text-slate-500">Notify Failures</p>
               </div>
             </div>
           </div>
