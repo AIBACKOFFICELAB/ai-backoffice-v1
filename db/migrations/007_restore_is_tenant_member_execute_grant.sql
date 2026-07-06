@@ -1,0 +1,14 @@
+-- Migration 003 revoked EXECUTE on is_tenant_member() from anon/authenticated
+-- to stop it being callable as a public RPC endpoint. That broke every RLS
+-- policy that calls it (tenants, leads, module tables), because Postgres
+-- requires the querying role to hold EXECUTE on any function an RLS policy
+-- invokes, even SECURITY DEFINER ones — regardless of whether the call
+-- comes from a policy or a direct RPC request. This surfaced as PostgREST
+-- 403s on every authenticated request touching those tables, breaking
+-- Dashboard/Lead Inbox for the logged-in founder in production.
+--
+-- Restoring the grant so RLS works again. The direct-RPC-exposure concern
+-- from migration 003 is real but must be solved differently (e.g. moving
+-- the function to a schema PostgREST doesn't expose), not by revoking
+-- EXECUTE, which breaks RLS itself.
+GRANT EXECUTE ON FUNCTION public.is_tenant_member(uuid) TO anon, authenticated;
