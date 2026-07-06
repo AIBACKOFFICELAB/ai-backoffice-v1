@@ -45,7 +45,12 @@ export default function LoginPage() {
       });
 
       if (authError) {
-        console.error("[login] Supabase auth error:", authError);
+        // TEMPORARY debug logging for the Founder Deployment login
+        // investigation — name/status/message only, never credentials or
+        // tokens. Remove once the production login issue is resolved.
+        console.error("[login] Supabase auth error name:", authError.name);
+        console.error("[login] Supabase auth error status:", authError.status);
+        console.error("[login] Supabase auth error message:", authError.message);
         setError(safeErrorMessage(authError));
         setLoading(false);
         return;
