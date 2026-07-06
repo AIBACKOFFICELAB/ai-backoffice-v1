@@ -55,7 +55,7 @@ Go to **Project Settings → API**:
 
 Go to **Authentication → URL Configuration**:
 
-- [ ] Set **Site URL** to your Vercel production URL (e.g. `https://ai-backoffice-v1.vercel.app`)
+- [ ] Set **Site URL** to your Vercel production URL (e.g. `https://aibackoffice.app`)
 - [ ] Add the same URL to **Redirect URLs**
 - [ ] Also add `http://localhost:3000` to Redirect URLs for local testing
 
@@ -154,7 +154,7 @@ In **Project Settings → Environment Variables**, add all six required variable
 
 - [ ] Click **Deploy**
 - [ ] Wait for build to complete — build passes locally with `npm run build` so no surprises expected
-- [ ] Note the assigned production URL (e.g. `https://ai-backoffice-v1.vercel.app`)
+- [ ] Note the assigned production URL (e.g. `https://aibackoffice.app`)
 - [ ] Update Supabase → Authentication → Site URL and Redirect URLs with this production URL (Section 1d)
 
 ### 5d. Local Verification (Before Smoke Testing)

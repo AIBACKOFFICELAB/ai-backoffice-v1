@@ -7,7 +7,7 @@ analytics) is actually safe to run 5 Star Plumbing Service's daily operations
 on. It records what was verified by automated/DB inspection versus what still
 requires the founder to execute live.
 
-**Production app domain: `https://ai-backoffice-v1.vercel.app`** — confirmed
+**Production app domain: `https://aibackoffice.app`** — confirmed
 live (Step 1 resolved). Fetched directly and matches this repo's own landing
 page (`app/page.tsx`: "Turn missed calls into booked jobs..."). The Vercel
 project hosting it is under a different Vercel account/team than the one
@@ -86,15 +86,15 @@ No secret values were read, printed, or exposed as part of this validation — o
 
 1. Confirm or purchase the Twilio phone number 5 Star Plumbing will use as its business line.
 2. In the Twilio Console, on that number's configuration page, set:
-   - **Voice → A Call Comes In**: point at your call-forwarding/IVR flow, and set **Voice → Call Status Changes** (StatusCallback) to `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger`, method `POST`. Twilio must be configured to fire the status callback on `no-answer`, `busy`, and `failed` — those are the three statuses the trigger route checks.
-   - **Messaging → A Message Comes In**: `https://ai-backoffice-v1.vercel.app/api/modules/estimate-followup/trigger`, method `POST`. This is the same endpoint used for the Day 1/3/7 cron scan (`GET`, separately authenticated) — inbound SMS uses `POST` with Twilio's standard form-encoded webhook body.
+   - **Voice → A Call Comes In**: point at your call-forwarding/IVR flow, and set **Voice → Call Status Changes** (StatusCallback) to `https://aibackoffice.app/api/modules/missed-call-recovery/trigger`, method `POST`. Twilio must be configured to fire the status callback on `no-answer`, `busy`, and `failed` — those are the three statuses the trigger route checks.
+   - **Messaging → A Message Comes In**: `https://aibackoffice.app/api/modules/estimate-followup/trigger`, method `POST`. This is the same endpoint used for the Day 1/3/7 cron scan (`GET`, separately authenticated) — inbound SMS uses `POST` with Twilio's standard form-encoded webhook body.
 3. Set the environment variables `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` in the deployment environment (see §4).
 4. Update the 5 Star Plumbing tenant's Missed Call Recovery settings (`business_phone`) to match the Twilio number — via `PUT /api/modules/missed-call-recovery/settings` once logged in, or directly in Supabase.
 
 ## 4. Vercel Deployment Steps
 
 **Step 1 — RESOLVED.** Production app confirmed live at
-**`https://ai-backoffice-v1.vercel.app`**. Fetched directly and confirmed it
+**`https://aibackoffice.app`**. Fetched directly and confirmed it
 serves this repo's actual landing page (`app/page.tsx`), not a placeholder.
 The hosting Vercel project is under a **different Vercel account/team** than
 the one connected to this tooling session (the connected account
@@ -151,7 +151,7 @@ the walkthrough.
 | 2 | Tenant scoping works | Every query filters by `tenant_id`; a user from another tenant cannot see 5 Star's data | Code inspection confirms `lib/leads/supabase.ts`, `lib/leads/repository.ts`, all leads pages/API routes, and both module services filter by `tenant_id` explicitly (required because the app uses the service-role key, which bypasses RLS — see [[06_DATABASE_PRINCIPLES]]). Only one tenant exists currently, so cross-tenant isolation itself isn't yet exercised live — code path is sound but there's no second tenant to prove leakage can't happen | ✅ Verified by code inspection; ⏳ true cross-tenant test needs a 2nd tenant |
 | 3 | Dashboard loads real tenant data | `/dashboard` shows 5 Star's leads + module analytics, not another tenant's | `getTenantContext()` correctly resolves the founder's single `tenant_memberships` row to "5 Star Plumbing Service" (confirmed via direct SQL join); DB currently has 0 leads for this tenant so the dashboard correctly shows zeros, not another tenant's data | ✅ Verified by DB inspection + live login |
 | 4 | Twilio env vars documented and checked | All required vars present in `.env.example`; code fails closed (skips, doesn't crash) when unset | Confirmed in `.env.example`; `lib/sms/twilio.ts` `getTwilioBaseEnv()`/`getTwilioEnv()` return `configured: false` and calling code logs + skips rather than throwing. **Founder confirmed all 4 vars (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `CRON_SECRET`) present on the Production Vercel environment** | ✅ Verified |
-| 5 | Missed Call Recovery can receive a real webhook | Twilio StatusCallback POST to `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger` resolves tenant and fires | Route logic confirmed correct; public URL live (B0 resolved); Twilio env vars confirmed present (B1 resolved); `business_phone` now set to `+17868087223` (B3 resolved). **Not yet fired with a real call** — needs the Twilio Console webhook wiring in §3 below | ⏳ Ready for live test |
+| 5 | Missed Call Recovery can receive a real webhook | Twilio StatusCallback POST to `https://aibackoffice.app/api/modules/missed-call-recovery/trigger` resolves tenant and fires | Route logic confirmed correct; public URL live (B0 resolved); Twilio env vars confirmed present (B1 resolved); `business_phone` now set to `+17868087223` (B3 resolved). **Not yet fired with a real call** — needs the Twilio Console webhook wiring in §3 below | ⏳ Ready for live test |
 | 6 | A missed call creates/updates a lead | New lead row with `source = 'missed-call-recovery'`, `tenant_id` set | Code confirmed in `executeMissedCallRecovery()`; not exercised live | ⏳ Pending founder (blocked on #5) |
 | 7 | Recovery SMS sends successfully | Twilio SMS delivered to caller | `sendSms()` implementation confirmed; not exercised live (no Twilio creds confirmed set) | ⏳ Pending founder |
 | 8 | Recovery history is recorded | Row in `missed_call_recovery_history` | Table + insert logic confirmed present; 0 rows currently (expected, nothing fired yet) | ⏳ Pending founder |
@@ -172,7 +172,7 @@ the walkthrough.
 
 | ID | Blocker | Severity | Owner | Unblocks |
 |---|---|---|---|---|
-| B0 | ~~No Vercel project found under the connected account~~ — **RESOLVED**. Confirmed live at `https://ai-backoffice-v1.vercel.app` under a different Vercel account/team than the one connected to this tooling session | Resolved | — | #1, #5–9, #12–13, #16 |
+| B0 | ~~No Vercel project found under the connected account~~ — **RESOLVED**. Confirmed live at `https://aibackoffice.app` under a different Vercel account/team than the one connected to this tooling session | Resolved | — | #1, #5–9, #12–13, #16 |
 | B1 | ~~Twilio credentials not confirmed set~~ — **RESOLVED**. Founder confirmed `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` all present on the Production Vercel environment | Resolved | — | #5, #7 |
 | B2 | ~~`CRON_SECRET` not confirmed set~~ — **RESOLVED**. Confirmed present alongside the other 3 Twilio vars | Resolved | — | #12 |
 | B3 | ~~`missed_call_recovery_settings.business_phone` is `NULL`~~ — **RESOLVED**. Set to `+17868087223` (the confirmed `TWILIO_PHONE_NUMBER` value) via direct SQL update | Resolved | — | #5, #6 |
@@ -194,8 +194,8 @@ Exact URLs for the Twilio Console, for the number `+17868087223`:
 
 | Purpose | URL | Method | Where in Twilio Console |
 |---|---|---|---|
-| Missed call recovery (voice status callback) | `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Voice Configuration → Call Status Changes** |
-| Estimate follow-up reply detection (inbound SMS) | `https://ai-backoffice-v1.vercel.app/api/modules/estimate-followup/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Messaging Configuration → A Message Comes In** |
+| Missed call recovery (voice status callback) | `https://aibackoffice.app/api/modules/missed-call-recovery/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Voice Configuration → Call Status Changes** |
+| Estimate follow-up reply detection (inbound SMS) | `https://aibackoffice.app/api/modules/estimate-followup/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Messaging Configuration → A Message Comes In** |
 
 Notes:
 - The Voice Status Callback must be configured to fire on **all** relevant statuses — specifically `no-answer`, `busy`, and `failed`. These are the exact three the trigger route checks; anything else is ignored (returns `{ok: true, fired: false, reason: "not-a-missed-call"}`).

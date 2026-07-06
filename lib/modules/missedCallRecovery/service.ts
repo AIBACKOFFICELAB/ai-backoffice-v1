@@ -4,7 +4,7 @@ import { createLead } from "@/lib/leads/repository";
 import { sendSms, SendSmsResult } from "@/lib/sms/twilio";
 import { sendEmail, SendEmailResult } from "@/lib/email/resend";
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://ai-backoffice-v1.vercel.app";
+const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://aibackoffice.app";
 
 export type MissedCallSettings = {
   tenantId: string;
