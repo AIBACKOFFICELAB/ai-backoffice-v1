@@ -87,9 +87,21 @@ the walkthrough.
 5. If any are missing: add them (values only known to you/the founder), save,
    then trigger a redeploy (Vercel does not hot-reload env vars into an
    already-running deployment).
-6. Confirm the project's plan supports **Vercel Cron** (Hobby plans historically
-   limited cron frequency/count — Pro removes those limits). This matters
-   because `vercel.json` schedules the Estimate Follow-up scan hourly.
+6. **Root cause of the post-push production 500s: Vercel Hobby plan rejects
+   cron schedules more frequent than once per day.** `vercel.json` originally
+   scheduled the Estimate Follow-up scan hourly (`0 * * * *`), which Vercel's
+   Hobby tier does not allow — this caused the deployment itself to fail,
+   which is why `/`, `/auth/login`, and `/dashboard` all returned bare 500s
+   after commit `2a59ed5` was pushed (nothing to do with the middleware or
+   login fixes in that same commit — those were correct).
+   **Fixed:** the cron schedule is now `0 9 * * *` (once daily, 9am UTC),
+   which is Hobby-plan compatible.
+   **TODO (future):** if Estimate Follow-up needs sub-daily precision (e.g.
+   hourly scanning so a Day 1 message goes out within an hour of becoming due
+   rather than up to ~24h late), upgrade the Vercel project to a Pro plan and
+   change the schedule back to `0 * * * *` (or a finer interval). Not required
+   for Founder Deployment MVP scope — a daily scan still satisfies "Day 1 / 3
+   / 7" sequencing correctness, just with coarser same-day timing.
 
 ## 5. Manual Test Checklist, Expected vs. Actual Results
 
@@ -126,7 +138,8 @@ the walkthrough.
 | B3 | 5 Star Plumbing tenant's `missed_call_recovery_settings.business_phone` is `NULL` — the trigger route cannot resolve which tenant a missed call belongs to until this is set to the real Twilio number | **Critical** | Founder (via Settings UI or direct DB update once the Twilio number is chosen) | #5, #6 |
 | B4 | No real leads exist yet for the tenant — Estimate Follow-up enrollment (#11) and sequence timing (#12) cannot be exercised end-to-end until at least one real lead is marked "Estimate Sent" | Medium | Founder | #11, #12, #13 |
 | B5 | Landing page form (separate repo, `aibackoffice-landing.vercel.app`) has not been updated to POST to `/api/prospects/intake` | Medium | Founder / whoever owns that repo | #16 |
-| B6 | No `npm run typecheck` script exists in `package.json` — typecheck was run via `npx tsc --noEmit` directly. Minor, but worth adding per docs/constitution/09_DEVELOPMENT_STANDARDS.md | Low | Engineering | tooling convenience only |
+| B6 | ~~No `npm run typecheck` script~~ — **RESOLVED**. Added `"typecheck": "tsc --noEmit"` to `package.json` | Resolved | — | tooling convenience only |
+| B7 | Vercel Hobby plan rejects cron schedules more frequent than once/day — the original hourly Estimate Follow-up scan schedule (`0 * * * *`) blocked deployment of commit `2a59ed5`, producing the site-wide 500s. **Fixed**: schedule changed to `0 9 * * *` (daily). See §4A item 6 for the future Pro-upgrade TODO if sub-daily scanning is needed | Resolved | — | #12 (Day 1/3/7 timing precision) |
 
 ## 7. Fixes Applied During This Validation Pass
 
