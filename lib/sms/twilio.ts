@@ -31,23 +31,73 @@ export function buildEmergencySmsMessage(payload: EmergencyLeadPayload): string 
   ].join("\n");
 }
 
-function getTwilioEnv() {
+export type SendSmsResult =
+  | { ok: true; skipped: false; sid?: string }
+  | { ok: false; skipped: true; reason: "missing-env" }
+  | { ok: false; skipped: false; reason: "twilio-error" | "unexpected-error"; status?: number };
+
+/** Generic single-recipient SMS send, shared by every module's Execution layer. */
+export async function sendSms(toPhone: string, message: string): Promise<SendSmsResult> {
+  const env = getTwilioBaseEnv();
+
+  if (!env.configured) {
+    console.warn("[SMS] Twilio is not fully configured. Skipping SMS send.");
+    return { ok: false, skipped: true, reason: "missing-env" };
+  }
+
+  const endpoint = `${TWILIO_API_BASE}/Accounts/${env.accountSid}/Messages.json`;
+  const body = new URLSearchParams({
+    To: toPhone,
+    From: env.fromPhone,
+    Body: message,
+  });
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(`${env.accountSid}:${env.authToken}`).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: body.toString(),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("[SMS] Twilio send failed", { status: response.status, errorText });
+      return { ok: false, skipped: false, reason: "twilio-error", status: response.status };
+    }
+
+    const result = (await response.json()) as { sid?: string };
+    return { ok: true, skipped: false, sid: result.sid };
+  } catch (error) {
+    console.error("[SMS] Unexpected error while sending SMS", error);
+    return { ok: false, skipped: false, reason: "unexpected-error" };
+  }
+}
+
+function getTwilioBaseEnv() {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
   const fromPhone = process.env.TWILIO_PHONE_NUMBER;
-  const toPhone = process.env.OWNER_ALERT_PHONE;
 
-  if (!accountSid || !authToken || !fromPhone || !toPhone) {
+  if (!accountSid || !authToken || !fromPhone) {
     return { configured: false as const };
   }
 
-  return {
-    configured: true as const,
-    accountSid,
-    authToken,
-    fromPhone,
-    toPhone,
-  };
+  return { configured: true as const, accountSid, authToken, fromPhone };
+}
+
+function getTwilioEnv() {
+  const base = getTwilioBaseEnv();
+  const toPhone = process.env.OWNER_ALERT_PHONE;
+
+  if (!base.configured || !toPhone) {
+    return { configured: false as const };
+  }
+
+  const { configured: _configured, ...baseFields } = base;
+  return { configured: true as const, ...baseFields, toPhone };
 }
 
 export async function sendOwnerEmergencySms(payload: EmergencyLeadPayload) {

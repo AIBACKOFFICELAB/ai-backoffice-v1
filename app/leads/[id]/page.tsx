@@ -1,8 +1,9 @@
 export const dynamic = "force-dynamic";
 
-import { notFound } from "next/navigation";
+import { notFound, redirect } from "next/navigation";
 import Link from "next/link";
 import { getLeadById } from "@/lib/leads/repository";
+import { getTenantContext } from "@/lib/tenant";
 import LeadEditForm from "@/components/LeadEditForm";
 
 function recommendedAction(status: string, emergency: string, reviewStatus: string) {
@@ -14,8 +15,11 @@ function recommendedAction(status: string, emergency: string, reviewStatus: stri
 }
 
 export default async function LeadDetailPage({ params }: { params: Promise<{ id: string }> }) {
+  const tenant = await getTenantContext();
+  if (!tenant) redirect("/auth/login");
+
   const { id } = await params;
-  const { lead, source } = await getLeadById(id);
+  const { lead, source } = await getLeadById(id, tenant.tenantId);
   if (!lead) notFound();
 
   return (

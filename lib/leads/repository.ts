@@ -4,9 +4,15 @@ import { fetchLeadsFromDb, fetchLeadByIdFromDb, insertLeadToDb, updateLeadInDb, 
 
 export type LeadDataSource = "supabase" | "google-sheets" | "mock-fallback";
 
-export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
+/**
+ * Google Sheets / mock fallback data has no tenant boundary. It only remains
+ * as a bootstrap path for a tenant with zero rows in Supabase yet (e.g. during
+ * initial onboarding before real leads exist) and must never be used to answer
+ * a query for one tenant with another tenant's spreadsheet data.
+ */
+export async function getLeads(tenantId: string): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
   try {
-    const dbLeads = await fetchLeadsFromDb();
+    const dbLeads = await fetchLeadsFromDb(tenantId);
     if (dbLeads.length > 0) {
       return { leads: dbLeads, source: "supabase" };
     }
@@ -24,9 +30,9 @@ export async function getLeads(): Promise<{ leads: PlumbingLead[]; source: LeadD
   }
 }
 
-export async function getLeadById(id: string) {
+export async function getLeadById(id: string, tenantId: string) {
   try {
-    const dbLead = await fetchLeadByIdFromDb(id);
+    const dbLead = await fetchLeadByIdFromDb(id, tenantId);
     if (dbLead) {
       return { lead: dbLead, source: "supabase" as const };
     }
@@ -34,20 +40,20 @@ export async function getLeadById(id: string) {
     console.error("[leads] Supabase fetch by id failed.", error);
   }
 
-  const { leads, source } = await getLeads();
+  const { leads, source } = await getLeads(tenantId);
   return { lead: leads.find((item) => item.id === id), source };
 }
 
-export async function createLead(lead: LeadInsert) {
-  return insertLeadToDb(lead);
+export async function createLead(lead: LeadInsert, tenantId: string) {
+  return insertLeadToDb(lead, tenantId);
 }
 
-export async function updateLead(id: string, update: LeadUpdate) {
-  return updateLeadInDb(id, update);
+export async function updateLead(id: string, update: LeadUpdate, tenantId: string) {
+  return updateLeadInDb(id, update, tenantId);
 }
 
-export async function deleteLead(id: string) {
-  return deleteLeadFromDb(id);
+export async function deleteLead(id: string, tenantId: string) {
+  return deleteLeadFromDb(id, tenantId);
 }
 
 export function buildLeadMetrics(leads: PlumbingLead[]) {

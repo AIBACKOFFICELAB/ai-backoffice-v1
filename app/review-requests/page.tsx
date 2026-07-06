@@ -1,10 +1,15 @@
 export const dynamic = 'force-dynamic';
 
+import { redirect } from "next/navigation";
 import Link from "next/link";
 import { buildLeadMetrics, getLeads } from "@/lib/leads/repository";
+import { getTenantContext } from "@/lib/tenant";
 
 export default async function ReviewRequestsPage() {
-  const { leads } = await getLeads();
+  const tenant = await getTenantContext();
+  if (!tenant) redirect("/auth/login");
+
+  const { leads } = await getLeads(tenant.tenantId);
   const { reviewVisibleStatuses } = buildLeadMetrics(leads);
   const visibleLeads = leads.filter((lead) => reviewVisibleStatuses.includes(lead.reviewRequestStatus));
 

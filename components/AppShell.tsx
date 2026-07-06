@@ -16,6 +16,7 @@ const protectedNavItems = [
   { href: "/lead-inbox", label: "Lead Inbox" },
   { href: "/follow-ups", label: "Follow-Ups" },
   { href: "/review-requests", label: "Review Requests" },
+  { href: "/prospects", label: "Prospects" },
   { href: "/settings", label: "Settings" },
 ];
 

@@ -1,11 +1,16 @@
 export const dynamic = "force-dynamic";
 
+import { redirect } from "next/navigation";
 import Link from "next/link";
 import { getLeads } from "@/lib/leads/repository";
+import { getTenantContext } from "@/lib/tenant";
 import LeadStatusSelect from "@/components/LeadStatusSelect";
 
 export default async function LeadInboxPage() {
-  const { leads, source } = await getLeads();
+  const tenant = await getTenantContext();
+  if (!tenant) redirect("/auth/login");
+
+  const { leads, source } = await getLeads(tenant.tenantId);
 
   const sortedLeads = [...leads].sort((a, b) => {
     if (a.emergency === "Yes" && b.emergency !== "Yes") return -1;
@@ -19,7 +24,7 @@ export default async function LeadInboxPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold text-slate-900">Lead Inbox</h1>
-        <p className="text-slate-600">5 Star Plumbing Service Request Form → Google Sheet → AI BackOffice Lead Inbox.</p>
+        <p className="text-slate-600">{tenant.tenantName} Service Request Form → Google Sheet → AI BackOffice Lead Inbox.</p>
         <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">
           Data source: {source === "google-sheets" ? "Live Google Sheet" : source === "supabase" ? "Supabase" : "Fallback"}
         </p>

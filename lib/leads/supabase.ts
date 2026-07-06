@@ -92,18 +92,18 @@ function mapLeadToRow(lead: LeadInsert): Partial<LeadRow> {
   };
 }
 
-export async function fetchLeadsFromDb(): Promise<PlumbingLead[]> {
+export async function fetchLeadsFromDb(tenantId: string): Promise<PlumbingLead[]> {
   const supabase = await createServerSupabaseClient();
-  const { data, error } = await supabase.from(tableName).select("*");
+  const { data, error } = await supabase.from(tableName).select("*").eq("tenant_id", tenantId);
   if (error) {
     throw new Error(error.message);
   }
   return (data as LeadRow[]).map(mapRowToLead);
 }
 
-export async function fetchLeadByIdFromDb(id: string): Promise<PlumbingLead | null> {
+export async function fetchLeadByIdFromDb(id: string, tenantId: string): Promise<PlumbingLead | null> {
   const supabase = await createServerSupabaseClient();
-  const { data, error } = await supabase.from(tableName).select("*").eq("id", id).single();
+  const { data, error } = await supabase.from(tableName).select("*").eq("id", id).eq("tenant_id", tenantId).single();
   if (error) {
     if (error.code === "PGRST116") {
       return null;
@@ -113,9 +113,9 @@ export async function fetchLeadByIdFromDb(id: string): Promise<PlumbingLead | nu
   return data ? mapRowToLead(data as LeadRow) : null;
 }
 
-export async function insertLeadToDb(lead: LeadInsert): Promise<PlumbingLead> {
+export async function insertLeadToDb(lead: LeadInsert, tenantId: string): Promise<PlumbingLead> {
   const supabase = await createServerSupabaseClient();
-  const row = mapLeadToRow(lead);
+  const row = { ...mapLeadToRow(lead), tenant_id: tenantId };
   const { data, error } = await supabase.from(tableName).insert(row).select().single();
   if (error) {
     throw new Error(error.message);
@@ -123,7 +123,7 @@ export async function insertLeadToDb(lead: LeadInsert): Promise<PlumbingLead> {
   return mapRowToLead(data as LeadRow);
 }
 
-export async function updateLeadInDb(id: string, update: LeadUpdate): Promise<PlumbingLead | null> {
+export async function updateLeadInDb(id: string, update: LeadUpdate, tenantId: string): Promise<PlumbingLead | null> {
   const supabase = await createServerSupabaseClient();
   const updateRow = {
     ...(update.date && { date: update.date }),
@@ -149,7 +149,7 @@ export async function updateLeadInDb(id: string, update: LeadUpdate): Promise<Pl
     updated_at: new Date().toISOString(),
   };
 
-  const { data, error } = await supabase.from(tableName).update(updateRow).eq("id", id).select().single();
+  const { data, error } = await supabase.from(tableName).update(updateRow).eq("id", id).eq("tenant_id", tenantId).select().single();
   if (error) {
     if (error.code === "PGRST116") {
       return null;
@@ -159,9 +159,9 @@ export async function updateLeadInDb(id: string, update: LeadUpdate): Promise<Pl
   return mapRowToLead(data as LeadRow);
 }
 
-export async function deleteLeadFromDb(id: string): Promise<boolean> {
+export async function deleteLeadFromDb(id: string, tenantId: string): Promise<boolean> {
   const supabase = await createServerSupabaseClient();
-  const { error } = await supabase.from(tableName).delete().eq("id", id);
+  const { error } = await supabase.from(tableName).delete().eq("id", id).eq("tenant_id", tenantId);
   if (error) {
     throw new Error(error.message);
   }

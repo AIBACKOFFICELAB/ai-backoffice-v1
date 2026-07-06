@@ -5,6 +5,23 @@ import { createClient } from "@/lib/supabase/client";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 
+/**
+ * Supabase auth errors are usually a string `.message`, but a misconfigured
+ * client (e.g. wrong/missing project URL or anon key) can surface a network
+ * failure or malformed response that isn't a normal AuthError — in that case
+ * `.message` may be empty or absent. Never let that reach the UI as a raw
+ * object (which renders as "{}" or throws); always fall back to a safe,
+ * human-readable string and leave the raw value in the console for debugging.
+ */
+function safeErrorMessage(err: unknown): string {
+  if (err && typeof err === "object" && "message" in err && typeof (err as { message: unknown }).message === "string") {
+    const message = (err as { message: string }).message;
+    if (message.trim().length > 0) return message;
+  }
+  if (typeof err === "string" && err.trim().length > 0) return err;
+  return "We couldn't sign you in. Please check your email/password and try again, or contact support if this keeps happening.";
+}
+
 export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -28,7 +45,8 @@ export default function LoginPage() {
       });
 
       if (authError) {
-        setError(authError.message);
+        console.error("[login] Supabase auth error:", authError);
+        setError(safeErrorMessage(authError));
         setLoading(false);
         return;
       }
@@ -36,7 +54,8 @@ export default function LoginPage() {
       // Success - redirect to dashboard or intended page
       router.push(redirectTo);
     } catch (err) {
-      setError("An unexpected error occurred");
+      console.error("[login] Unexpected error during sign-in:", err);
+      setError(safeErrorMessage(err));
       setLoading(false);
     }
   };
