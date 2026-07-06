@@ -15,6 +15,46 @@ connected to this session, so env vars there cannot be read or listed via
 tooling here — verification of that project's env vars must happen through
 the Vercel dashboard directly (see §4A).
 
+## 0. Founder Login Root Cause (RESOLVED)
+
+Login previously failed in production with an opaque `"{}"` error on every
+attempt. Root cause, confirmed via Supabase's own Auth (GoTrue) service logs
+(`get_logs`, service `auth`):
+
+> `sql: Scan error on column index 8, name "email_change": converting NULL
+> to string is unsupported` — on both `POST /token` (password login) and
+> `GET /admin/users` (Admin API), status `500`.
+
+The founder's `auth.users` row was created via a manual SQL `INSERT` earlier
+in this sprint (necessary since this project had zero auth users at the
+time). That insert set `confirmation_token`/`recovery_token` to `''` but left
+`email_change` and `email_change_token_new` as `NULL`. GoTrue's Go SQL scanner
+expects those columns as non-nullable strings and crashes with a 500 on
+*any* request touching that user row — which is why the error was identical
+regardless of correct credentials, correct tenant/membership data, correct
+env vars, or the concurrent (and otherwise unrelated) Supabase `us-east-1`
+platform incident that was investigated and ruled out in parallel.
+
+**Fix applied** (data-only, no code changes):
+```sql
+update auth.users
+set email_change = '', email_change_token_new = ''
+where email = '5starplumbing05@gmail.com';
+```
+
+**Verified**: Auth logs show the next `GET /admin/users` returning a clean
+`200` immediately after the fix (previously an unbroken string of `500`s).
+Founder confirmed live login + dashboard load in production immediately
+after.
+
+**Standing risk**: any *future* manually-seeded `auth.users` row must set
+every nullable-but-treated-as-non-null GoTrue text column
+(`email_change`, `email_change_token_new`, `email_change_token_current`,
+`phone_change`, `phone_change_token`, `confirmation_token`, `recovery_token`,
+`reauthentication_token`) to `''`, not `NULL`, or this exact failure mode
+recurs. Prefer Supabase's Admin API / dashboard "Invite user" flow over raw
+SQL insert for any future user creation to avoid this class of bug entirely.
+
 ## 1. Environment Variables Required
 
 | Variable | Purpose | Status (this check) |
@@ -107,11 +147,11 @@ the walkthrough.
 
 | # | Check | Expected | Actual (this pass) | Status |
 |---|---|---|---|---|
-| 1 | Founder login works | Login with `5starplumbing05@gmail.com` succeeds, session persists | Auth user + password confirmed created in Supabase; **not exercised through the live login form** (requires a reachable deployment) | ⏳ Pending founder |
-| 2 | Tenant scoping works | Every query filters by `tenant_id`; a user from another tenant cannot see 5 Star's data | Code inspection confirms `lib/leads/supabase.ts`, `lib/leads/repository.ts`, all leads pages/API routes, and both module services filter by `tenant_id` explicitly (required because the app uses the service-role key, which bypasses RLS — see [[06_DATABASE_PRINCIPLES]]) | ✅ Verified by code inspection |
-| 3 | Dashboard loads real tenant data | `/dashboard` shows 5 Star's leads + module analytics, not another tenant's | `getTenantContext()` resolves via `tenant_memberships`; dashboard queries are tenant-scoped; DB currently has 0 leads for this tenant so the dashboard will correctly show zeros | ✅ Verified by code + DB inspection; ⏳ visual confirmation pending founder login |
-| 4 | Twilio env vars documented and checked | All required vars present in `.env.example`; code fails closed (skips, doesn't crash) when unset | Confirmed in `.env.example`; `lib/sms/twilio.ts` `getTwilioBaseEnv()`/`getTwilioEnv()` return `configured: false` and calling code logs + skips rather than throwing | ✅ Verified |
-| 5 | Missed Call Recovery can receive a real webhook | Twilio StatusCallback POST to `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger` resolves tenant and fires | Route logic confirmed correct (checks `CallStatus` in `no-answer/busy/failed`, resolves tenant via `To` number); public URL now confirmed live (B0 resolved), but **cannot fire for real yet** — `business_phone` still unset (Blocker B3) and Twilio env vars not yet confirmed on this Vercel project (Blocker B1) | ❌ Blocked |
+| 1 | Founder login works | Login with `5starplumbing05@gmail.com` succeeds, session persists | **Confirmed live** — root cause (NULL `email_change`/`email_change_token_new` in `auth.users`, see §0) fixed via SQL update; founder confirmed successful login + dashboard load in production | ✅ Verified live |
+| 2 | Tenant scoping works | Every query filters by `tenant_id`; a user from another tenant cannot see 5 Star's data | Code inspection confirms `lib/leads/supabase.ts`, `lib/leads/repository.ts`, all leads pages/API routes, and both module services filter by `tenant_id` explicitly (required because the app uses the service-role key, which bypasses RLS — see [[06_DATABASE_PRINCIPLES]]). Only one tenant exists currently, so cross-tenant isolation itself isn't yet exercised live — code path is sound but there's no second tenant to prove leakage can't happen | ✅ Verified by code inspection; ⏳ true cross-tenant test needs a 2nd tenant |
+| 3 | Dashboard loads real tenant data | `/dashboard` shows 5 Star's leads + module analytics, not another tenant's | `getTenantContext()` correctly resolves the founder's single `tenant_memberships` row to "5 Star Plumbing Service" (confirmed via direct SQL join); DB currently has 0 leads for this tenant so the dashboard correctly shows zeros, not another tenant's data | ✅ Verified by DB inspection + live login |
+| 4 | Twilio env vars documented and checked | All required vars present in `.env.example`; code fails closed (skips, doesn't crash) when unset | Confirmed in `.env.example`; `lib/sms/twilio.ts` `getTwilioBaseEnv()`/`getTwilioEnv()` return `configured: false` and calling code logs + skips rather than throwing. **Founder confirmed all 4 vars (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`, `CRON_SECRET`) present on the Production Vercel environment** | ✅ Verified |
+| 5 | Missed Call Recovery can receive a real webhook | Twilio StatusCallback POST to `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger` resolves tenant and fires | Route logic confirmed correct; public URL live (B0 resolved); Twilio env vars confirmed present (B1 resolved); `business_phone` now set to `+17868087223` (B3 resolved). **Not yet fired with a real call** — needs the Twilio Console webhook wiring in §3 below | ⏳ Ready for live test |
 | 6 | A missed call creates/updates a lead | New lead row with `source = 'missed-call-recovery'`, `tenant_id` set | Code confirmed in `executeMissedCallRecovery()`; not exercised live | ⏳ Pending founder (blocked on #5) |
 | 7 | Recovery SMS sends successfully | Twilio SMS delivered to caller | `sendSms()` implementation confirmed; not exercised live (no Twilio creds confirmed set) | ⏳ Pending founder |
 | 8 | Recovery history is recorded | Row in `missed_call_recovery_history` | Table + insert logic confirmed present; 0 rows currently (expected, nothing fired yet) | ⏳ Pending founder |
@@ -133,9 +173,10 @@ the walkthrough.
 | ID | Blocker | Severity | Owner | Unblocks |
 |---|---|---|---|---|
 | B0 | ~~No Vercel project found under the connected account~~ — **RESOLVED**. Confirmed live at `https://ai-backoffice-v1.vercel.app` under a different Vercel account/team than the one connected to this tooling session | Resolved | — | #1, #5–9, #12–13, #16 |
-| B1 | Twilio credentials (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER`) not yet confirmed set on the `ai-backoffice-v1` Vercel project — cannot be checked via tooling since it's on a different account; see §4A for the manual dashboard walkthrough | **Critical** | Founder | #5, #7 |
-| B2 | `CRON_SECRET` not yet confirmed set on the `ai-backoffice-v1` Vercel project — without it the Day 1/3/7 scheduled scan (`GET` on the trigger route) will reject with 401 even though the deployment itself is live; see §4A | High | Founder | #12 |
-| B3 | 5 Star Plumbing tenant's `missed_call_recovery_settings.business_phone` is `NULL` — the trigger route cannot resolve which tenant a missed call belongs to until this is set to the real Twilio number | **Critical** | Founder (via Settings UI or direct DB update once the Twilio number is chosen) | #5, #6 |
+| B1 | ~~Twilio credentials not confirmed set~~ — **RESOLVED**. Founder confirmed `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` all present on the Production Vercel environment | Resolved | — | #5, #7 |
+| B2 | ~~`CRON_SECRET` not confirmed set~~ — **RESOLVED**. Confirmed present alongside the other 3 Twilio vars | Resolved | — | #12 |
+| B3 | ~~`missed_call_recovery_settings.business_phone` is `NULL`~~ — **RESOLVED**. Set to `+17868087223` (the confirmed `TWILIO_PHONE_NUMBER` value) via direct SQL update | Resolved | — | #5, #6 |
+| B8 | Founder login was blocked by corrupt `auth.users` data (NULL `email_change`/`email_change_token_new`), not a code or config bug — **RESOLVED**, see §0 for full root cause and fix | Resolved | — | #1 |
 | B4 | No real leads exist yet for the tenant — Estimate Follow-up enrollment (#11) and sequence timing (#12) cannot be exercised end-to-end until at least one real lead is marked "Estimate Sent" | Medium | Founder | #11, #12, #13 |
 | B5 | Landing page form (separate repo, `aibackoffice-landing.vercel.app`) has not been updated to POST to `/api/prospects/intake` | Medium | Founder / whoever owns that repo | #16 |
 | B6 | ~~No `npm run typecheck` script~~ — **RESOLVED**. Added `"typecheck": "tsc --noEmit"` to `package.json` | Resolved | — | tooling convenience only |
@@ -143,12 +184,46 @@ the walkthrough.
 
 ## 7. Fixes Applied During This Validation Pass
 
-None — per instructions, this pass was read-only/inspection-only (no destructive database changes, no secret exposure). No code or schema changes were made. If any of the above blockers are resolved (Twilio configured, Vercel project confirmed, business_phone set), re-run this checklist and update the Actual Results column rather than assuming it's fixed.
+- Fixed founder login root cause: `UPDATE auth.users SET email_change = '', email_change_token_new = '' WHERE email = '5starplumbing05@gmail.com'` (see §0). Data-only fix, no code changes.
+- Set `missed_call_recovery_settings.business_phone = '+17868087223'` for the 5 Star Plumbing tenant, matching the confirmed `TWILIO_PHONE_NUMBER` value.
+- Confirmed (via founder) all 4 Twilio/cron env vars present on Production Vercel.
 
-## 8. Final Go/No-Go Verdict
+## 8. Twilio Webhook URLs to Configure
 
-**NO-GO for live production traffic (unchanged).** The foundation is sound — multi-tenant isolation, RLS, module architecture, and business logic all check out under static/code/DB inspection, and build + typecheck both pass cleanly. The deployment itself is now confirmed live (B0 resolved), but two critical blockers remain (B1, B3): Twilio credentials are not yet confirmed set on the `ai-backoffice-v1` Vercel project, and no business phone number is configured for the tenant. The MVP automation modules **still cannot fire for a single real event** until those clear.
+Exact URLs for the Twilio Console, for the number `+17868087223`:
 
-**GO for founder-guided live validation**, in this exact order (see step-by-step guide below): verify env vars in the Vercel dashboard (§4A) → set business_phone → configure Twilio webhooks → send a real test SMS → place a real test missed call → mark a real lead as Estimate Sent → wait for/force the Day 1 send → reply to stop the sequence → submit a test prospect.
+| Purpose | URL | Method | Where in Twilio Console |
+|---|---|---|---|
+| Missed call recovery (voice status callback) | `https://ai-backoffice-v1.vercel.app/api/modules/missed-call-recovery/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Voice Configuration → Call Status Changes** |
+| Estimate follow-up reply detection (inbound SMS) | `https://ai-backoffice-v1.vercel.app/api/modules/estimate-followup/trigger` | `POST` | Phone Numbers → Manage → Active Numbers → `+17868087223` → **Messaging Configuration → A Message Comes In** |
+
+Notes:
+- The Voice Status Callback must be configured to fire on **all** relevant statuses — specifically `no-answer`, `busy`, and `failed`. These are the exact three the trigger route checks; anything else is ignored (returns `{ok: true, fired: false, reason: "not-a-missed-call"}`).
+- The Estimate Follow-up trigger endpoint also handles the daily cron scan via `GET` with `Authorization: Bearer $CRON_SECRET` (Vercel Cron calls this automatically per `vercel.json` — no manual Twilio Console action needed for that half).
+- No separate voice webhook ("A Call Comes In") change is required for this test — that's whatever call-forwarding/IVR flow already exists on this number; only the **Status Callback** needs to point at AI BackOffice.
+
+## 9. Live Missed-Call Test Checklist
+
+Run in this exact order. Each step's evidence should be pulled from Supabase directly (`get_logs` service `auth`/`api`, or `execute_sql` against `missed_call_recovery_history`) rather than assumed from the UI alone.
+
+1. **Twilio Console**: set the Voice Status Callback URL on `+17868087223` per §8, method `POST`, statuses `no-answer`/`busy`/`failed` (or "all" if that's the only option offered).
+2. **Place a real test call** to `+17868087223` from a phone you control, and let it go unanswered (or busy it out) to trigger `no-answer`/`busy`.
+3. **Check `missed_call_recovery_history`** for a new row: `select * from missed_call_recovery_history order by created_at desc limit 1;` — confirm `tenant_id` matches 5 Star Plumbing, `caller_phone` matches your test number, `status` is `recovered` (not `failed`/`skipped`).
+4. **Confirm the recovery SMS arrived** on the phone you called from.
+5. **Check `/lead-inbox`** in the app (logged in as founder) — confirm a new lead appears with `source: missed-call-recovery` and the caller's phone number.
+6. **Check `/api/modules/missed-call-recovery/analytics`** (authenticated) — confirm `totalMissedCalls` and `recovered` incremented by 1.
+7. If step 3 shows `status: failed` or no row at all, pull fresh Twilio Console **Debugger** logs for that call SID, and Supabase `get_logs` for service `api` (not `auth`) around the same timestamp — that will show whether the request reached AI BackOffice at all versus failing inside it.
+
+Do **not** proceed to Estimate Follow-up or landing-page-intake live testing until this checklist passes end-to-end — Missed Call Recovery was the first MVP module in the Founder Deployment priority order and should be proven live before moving on.
+
+## 10. Final Go/No-Go Verdict
+
+**Founder login: GO — confirmed live and working.** Root cause identified with hard evidence (Supabase Auth service logs), fixed with a minimal data-only repair, verified via both a clean `200` in the logs and an actual successful login.
+
+**Missed Call Recovery: GO for live testing, not yet fired.** All blockers that were blocking this (B0, B1, B2, B3) are now resolved — deployment live, Twilio env vars present, business_phone set. What remains is purely the Twilio Console webhook configuration in §8 and running the checklist in §9. This is the very next action.
+
+**Estimate Follow-up: still needs a real lead.** Enrollment/sequencing logic is verified by code inspection only (B4 — no real leads exist for this tenant yet). Once Missed Call Recovery is live and producing real leads, mark one "Estimate Sent" and re-run rows #10-15 in §5 as live checks.
+
+**Landing page intake: endpoint ready, integration pending.** `/api/prospects/intake` works; the actual landing page form (separate repo) still needs to be pointed at it (B5) — out of scope for this repo's validation.
 
 Do not consider this sprint complete until every row in §5 reads ✅ with a live (not code-inspected) result.
