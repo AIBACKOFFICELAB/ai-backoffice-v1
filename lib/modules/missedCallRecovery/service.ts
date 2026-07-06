@@ -2,7 +2,7 @@ import { randomUUID } from "crypto";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { createLead } from "@/lib/leads/repository";
 import { sendSms, SendSmsResult } from "@/lib/sms/twilio";
-import { sendEmail, SendEmailResult } from "@/lib/email/sendgrid";
+import { sendEmail, SendEmailResult } from "@/lib/email/resend";
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://ai-backoffice-v1.vercel.app";
 
@@ -111,7 +111,7 @@ function outcomeFromEmail(result: SendEmailResult): ChannelOutcome {
 
 function reasonFromEmail(result: SendEmailResult): string | undefined {
   if (result.ok) return undefined;
-  return result.reason === "sendgrid-error" || result.reason === "unexpected-error" ? `${result.reason}: ${result.detail ?? ""}`.trim() : result.reason;
+  return result.reason === "resend-error" || result.reason === "unexpected-error" ? `${result.reason}: ${result.detail ?? ""}`.trim() : result.reason;
 }
 
 /**
