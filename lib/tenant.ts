@@ -42,3 +42,47 @@ export async function getTenantContext(): Promise<TenantContext | null> {
     role: data.role as "owner" | "staff",
   };
 }
+
+export type TenantProfile = {
+  name: string;
+  businessType: string | null;
+  phone: string | null;
+  email: string | null;
+};
+
+export async function getTenantProfile(tenantId: string): Promise<TenantProfile | null> {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("tenants")
+    .select("name, business_type, phone, email")
+    .eq("id", tenantId)
+    .single();
+
+  if (error || !data) return null;
+
+  return {
+    name: data.name,
+    businessType: data.business_type,
+    phone: data.phone,
+    email: data.email,
+  };
+}
+
+export async function updateTenantProfile(
+  tenantId: string,
+  profile: Partial<TenantProfile>
+): Promise<boolean> {
+  const supabase = await createServerSupabaseClient();
+  const { error } = await supabase
+    .from("tenants")
+    .update({
+      ...(profile.name !== undefined ? { name: profile.name } : {}),
+      ...(profile.businessType !== undefined ? { business_type: profile.businessType } : {}),
+      ...(profile.phone !== undefined ? { phone: profile.phone } : {}),
+      ...(profile.email !== undefined ? { email: profile.email } : {}),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", tenantId);
+
+  return !error;
+}
