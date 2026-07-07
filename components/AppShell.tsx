@@ -1,17 +1,9 @@
 import Link from "next/link";
 import { getUser } from "@/lib/auth";
+import { getTenantContext } from "@/lib/tenant";
+import { AppNav } from "@/components/AppNav";
 
-const navItems = [
-  { href: "/", label: "Home" },
-  { href: "/dashboard", label: "Dashboard" },
-  { href: "/lead-inbox", label: "Lead Inbox" },
-  { href: "/follow-ups", label: "Follow-Ups" },
-  { href: "/review-requests", label: "Review Requests" },
-  { href: "/pricing", label: "Pricing" },
-  { href: "/settings", label: "Settings" },
-];
-
-const protectedNavItems = [
+const ownerNavItems = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/lead-inbox", label: "Lead Inbox" },
   { href: "/follow-ups", label: "Follow-Ups" },
@@ -20,35 +12,31 @@ const protectedNavItems = [
   { href: "/settings", label: "Settings" },
 ];
 
+const staffNavItems = ownerNavItems.filter((item) => item.href !== "/settings");
+
 export async function AppShell({ children }: { children: React.ReactNode }) {
   const user = await getUser();
-  
-  // Use protected nav items if user is authenticated, otherwise show all items
-  const displayNavItems = user ? protectedNavItems : navItems;
+  const tenant = user ? await getTenantContext() : null;
+  const navItems = tenant?.role === "staff" ? staffNavItems : ownerNavItems;
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="border-b border-slate-200 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-6 py-4">
-          <Link href="/" className="text-lg font-bold">AI BackOffice</Link>
-          <nav className="flex flex-wrap gap-2 text-sm">
-            {displayNavItems.map((item) => (
-              <Link key={item.href} href={item.href} className="rounded-full px-3 py-1.5 font-medium text-slate-600 transition hover:bg-slate-100 hover:text-slate-900">
-                {item.label}
-              </Link>
-            ))}
-          </nav>
-          {user && (
-            <div className="flex items-center gap-3 text-sm">
-              <span className="text-slate-600">{user.email}</span>
-              <Link href="/auth/logout" className="rounded-full bg-slate-100 px-3 py-1.5 font-medium text-slate-700 transition hover:bg-red-100 hover:text-red-700">
-                Sign Out
-              </Link>
-            </div>
-          )}
+    <div className="min-h-screen bg-surface text-ink-900">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-50 focus:rounded-control focus:bg-white focus:px-4 focus:py-2 focus:text-sm focus:font-semibold focus:shadow-floating"
+      >
+        Skip to content
+      </a>
+      <header className="sticky top-0 z-40 border-b border-surface-border bg-white/90 backdrop-blur">
+        <div className="mx-auto flex h-16 max-w-page items-center justify-between gap-3 px-5 sm:px-8">
+          <Link href={user ? "/dashboard" : "/"} className="font-display text-[17px] font-bold tracking-tight">
+            AI BackOffice
+          </Link>
+
+          <AppNav navItems={navItems} userEmail={user?.email ?? null} />
         </div>
       </header>
-      <main className="mx-auto max-w-6xl px-6 py-8">{children}</main>
+      <main id="main-content" className="mx-auto max-w-page px-5 py-8 sm:px-8">{children}</main>
     </div>
   );
 }

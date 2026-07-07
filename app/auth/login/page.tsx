@@ -1,9 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
+import { Button } from "@/components/ui/Button";
+import { Card } from "@/components/ui/Card";
+import { Input, Label } from "@/components/ui/Field";
+import { AUDIT_URL } from "@/lib/constants";
 
 /**
  * Supabase auth errors are usually a string `.message`, but a misconfigured
@@ -22,7 +26,7 @@ function safeErrorMessage(err: unknown): string {
   return "We couldn't sign you in. Please check your email/password and try again, or contact support if this keeps happening.";
 }
 
-export default function LoginPage() {
+function LoginForm() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -45,18 +49,12 @@ export default function LoginPage() {
       });
 
       if (authError) {
-        // TEMPORARY debug logging for the Founder Deployment login
-        // investigation — name/status/message only, never credentials or
-        // tokens. Remove once the production login issue is resolved.
-        console.error("[login] Supabase auth error name:", authError.name);
-        console.error("[login] Supabase auth error status:", authError.status);
-        console.error("[login] Supabase auth error message:", authError.message);
+        console.error("[login] Supabase auth error:", authError.name, authError.status, authError.message);
         setError(safeErrorMessage(authError));
         setLoading(false);
         return;
       }
 
-      // Success - redirect to dashboard or intended page
       router.push(redirectTo);
     } catch (err) {
       console.error("[login] Unexpected error during sign-in:", err);
@@ -66,50 +64,40 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-slate-50">
+    <div className="flex min-h-screen items-center justify-center bg-surface px-5 py-12">
       <div className="w-full max-w-md">
-        <div className="rounded-2xl bg-white p-8 shadow-md ring-1 ring-slate-200">
-          <h1 className="text-2xl font-bold text-slate-900 text-center">
-            Sign In to AI BackOffice
-          </h1>
-          <p className="mt-2 text-center text-sm text-slate-600">
-            Enter your credentials to access the dashboard
-          </p>
+        <div className="mb-8 text-center">
+          <Link href="/" className="font-display text-lg font-bold text-ink-900">
+            AI BackOffice
+          </Link>
+        </div>
+        <Card className="p-8">
+          <h1 className="text-center text-2xl font-bold text-ink-900">Log in</h1>
+          <p className="mt-2 text-center text-sm text-ink-500">Access your Lead Inbox, dashboard, and settings.</p>
 
-          <form onSubmit={handleLogin} className="mt-6 space-y-4">
+          <form onSubmit={handleLogin} className="mt-7 space-y-4" noValidate>
             {error && (
-              <div className="rounded-lg bg-red-50 p-3 text-sm text-red-800 ring-1 ring-red-200">
+              <div role="alert" className="rounded-control bg-red-50 p-3 text-sm text-red-800 ring-1 ring-red-200">
                 {error}
               </div>
             )}
 
             <div>
-              <label
-                htmlFor="email"
-                className="block text-sm font-semibold text-slate-700"
-              >
-                Email
-              </label>
-              <input
+              <Label htmlFor="email">Email</Label>
+              <Input
                 id="email"
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder="you@example.com"
+                placeholder="you@yourbusiness.com"
                 required
                 disabled={loading}
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-slate-900 placeholder-slate-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-slate-50 disabled:text-slate-500"
               />
             </div>
 
             <div>
-              <label
-                htmlFor="password"
-                className="block text-sm font-semibold text-slate-700"
-              >
-                Password
-              </label>
-              <input
+              <Label htmlFor="password">Password</Label>
+              <Input
                 id="password"
                 type="password"
                 value={password}
@@ -117,33 +105,36 @@ export default function LoginPage() {
                 placeholder="••••••••"
                 required
                 disabled={loading}
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-slate-900 placeholder-slate-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 disabled:bg-slate-50 disabled:text-slate-500"
               />
             </div>
 
-            <button
-              type="submit"
-              disabled={loading}
-              className="mt-6 w-full rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white transition hover:bg-blue-700 disabled:bg-blue-400"
-            >
-              {loading ? "Signing in..." : "Sign In"}
-            </button>
+            <Button type="submit" disabled={loading} className="mt-2 w-full">
+              {loading ? "Signing in…" : "Sign in"}
+            </Button>
           </form>
 
-          <p className="mt-4 text-center text-sm text-slate-600">
-            Demo credentials: Use any email and password. Create an account in
-            Supabase first.
+          <p className="mt-5 text-center text-sm text-ink-500">
+            Not a customer yet?{" "}
+            <a href={AUDIT_URL} target="_blank" rel="noopener noreferrer" className="font-medium text-brand-700 hover:underline">
+              Get a free audit
+            </a>
           </p>
 
-          <div className="mt-6 border-t border-slate-200 pt-6">
-            <p className="text-center text-xs text-slate-500">
-              <Link href="/" className="text-blue-600 hover:underline">
-                Back to home
-              </Link>
-            </p>
+          <div className="mt-6 border-t border-surface-border pt-5 text-center">
+            <Link href="/" className="text-xs font-medium text-ink-400 hover:text-ink-700">
+              ← Back to home
+            </Link>
           </div>
-        </div>
+        </Card>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
   );
 }

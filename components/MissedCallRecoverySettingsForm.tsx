@@ -1,6 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
+import { Button } from "@/components/ui/Button";
+import { Input, Label, Textarea, FieldHint } from "@/components/ui/Field";
 
 export type MissedCallRecoverySettingsData = {
   enabled: boolean;
@@ -18,6 +20,7 @@ export default function MissedCallRecoverySettingsForm({ initial }: { initial: M
   const [saving, setSaving] = useState(false);
   const [savedMessage, setSavedMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const statusId = useId();
 
   function update<K extends keyof MissedCallRecoverySettingsData>(key: K, value: MissedCallRecoverySettingsData[K]) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -48,104 +51,109 @@ export default function MissedCallRecoverySettingsForm({ initial }: { initial: M
   }
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
-      <div className="flex items-center gap-2">
+    <form onSubmit={handleSubmit} className="space-y-5">
+      <label className="flex items-center gap-2.5">
         <input
           id="mcr-enabled"
           type="checkbox"
           checked={form.enabled}
           onChange={(e) => update("enabled", e.target.checked)}
+          className="h-4 w-4 rounded border-surface-border text-brand-700 focus-ring"
         />
-        <label htmlFor="mcr-enabled" className="text-sm font-medium text-slate-700">
-          Missed Call Recovery enabled
-        </label>
-      </div>
+        <span className="text-sm font-medium text-ink-700">Missed Call Recovery enabled</span>
+      </label>
 
       <div className="grid gap-4 md:grid-cols-2">
-        <label className="text-sm font-medium text-slate-700">
-          Business phone (Twilio number)
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-business-phone">Business phone</Label>
+          <Input
+            id="mcr-business-phone"
             value={form.businessPhone ?? ""}
             onChange={(e) => update("businessPhone", e.target.value)}
             placeholder="+17868087223"
           />
-        </label>
+          <FieldHint>The Twilio number that receives missed calls.</FieldHint>
+        </div>
 
-        <label className="text-sm font-medium text-slate-700">
-          Owner notification phone
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-owner-phone">Owner notification phone</Label>
+          <Input
+            id="mcr-owner-phone"
             value={form.ownerAlertPhone ?? ""}
             onChange={(e) => update("ownerAlertPhone", e.target.value)}
             placeholder="+17866066944"
           />
-        </label>
+          <FieldHint>Where you get a text every time a call is recovered.</FieldHint>
+        </div>
 
-        <label className="text-sm font-medium text-slate-700">
-          Owner notification email
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-owner-email">Owner notification email</Label>
+          <Input
+            id="mcr-owner-email"
+            type="email"
             value={form.ownerNotificationEmail ?? ""}
             onChange={(e) => update("ownerNotificationEmail", e.target.value)}
             placeholder="owner@example.com"
           />
-        </label>
+          <FieldHint>Backup notification channel alongside the SMS alert.</FieldHint>
+        </div>
 
-        <label className="text-sm font-medium text-slate-700">
-          Emergency phone
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-emergency-phone">Emergency phone</Label>
+          <Input
+            id="mcr-emergency-phone"
             value={form.emergencyPhone ?? ""}
             onChange={(e) => update("emergencyPhone", e.target.value)}
             placeholder="+17866066944"
           />
-        </label>
+          <FieldHint>Given to the caller directly when a call is flagged urgent.</FieldHint>
+        </div>
 
-        <label className="text-sm font-medium text-slate-700">
-          Intake form URL
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-intake-url">Intake form URL</Label>
+          <Input
+            id="mcr-intake-url"
             value={form.intakeFormUrl ?? ""}
             onChange={(e) => update("intakeFormUrl", e.target.value)}
             placeholder="https://bit.ly/..."
           />
-        </label>
+          <FieldHint>Booking link sent in the recovery text.</FieldHint>
+        </div>
 
-        <label className="text-sm font-medium text-slate-700">
-          Business tagline
-          <input
-            className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+        <div>
+          <Label htmlFor="mcr-tagline">Business tagline</Label>
+          <Input
+            id="mcr-tagline"
             value={form.businessTagline ?? ""}
             onChange={(e) => update("businessTagline", e.target.value)}
             placeholder="The Right Way"
           />
-        </label>
+          <FieldHint>Appears in the recovery text signature.</FieldHint>
+        </div>
       </div>
 
-      <label className="block text-sm font-medium text-slate-700">
-        Recovery message template
-        <textarea
-          className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2"
+      <div>
+        <Label htmlFor="mcr-template">Recovery message template</Label>
+        <Textarea
+          id="mcr-template"
           rows={5}
           value={form.smsTemplate}
           onChange={(e) => update("smsTemplate", e.target.value)}
         />
-        <span className="mt-1 block text-xs text-slate-500">
+        <FieldHint>
           Available variables: {"{{business_name}}"}, {"{{intake_form_url}}"}, {"{{emergency_phone}}"}, {"{{business_tagline}}"}
-        </span>
-      </label>
+        </FieldHint>
+      </div>
 
-      {error && <div className="rounded-lg bg-red-50 p-3 text-sm text-red-800 ring-1 ring-red-200">{error}</div>}
-      {savedMessage && <div className="rounded-lg bg-green-50 p-3 text-sm text-green-800 ring-1 ring-green-200">{savedMessage}</div>}
-
-      <button
-        type="submit"
-        disabled={saving}
-        className="rounded-lg bg-blue-600 px-4 py-2 font-semibold text-white transition hover:bg-blue-700 disabled:bg-blue-400"
-      >
-        {saving ? "Saving..." : "Save Missed Call Recovery Settings"}
-      </button>
+      <div className="flex items-center gap-3">
+        <Button type="submit" disabled={saving} size="sm">
+          {saving ? "Saving…" : "Save Missed Call Recovery settings"}
+        </Button>
+        <p id={statusId} aria-live="polite" className="text-sm">
+          {error && <span className="font-medium text-red-600">{error}</span>}
+          {savedMessage && <span className="font-medium text-emerald-600">{savedMessage}</span>}
+        </p>
+      </div>
     </form>
   );
 }

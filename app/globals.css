@@ -7,5 +7,19 @@
 }
 
 body {
-  @apply bg-slate-50 text-slate-900;
+  @apply bg-surface text-ink-900 font-sans antialiased;
+}
+
+h1, h2, h3, h4 {
+  @apply font-display;
+}
+
+::selection {
+  background-color: theme("colors.brand.200");
+}
+
+@layer utilities {
+  .focus-ring {
+    @apply focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface;
+  }
 }
