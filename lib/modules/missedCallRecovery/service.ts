@@ -3,6 +3,9 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { createLead } from "@/lib/leads/repository";
 import { sendSms, SendSmsResult } from "@/lib/sms/twilio";
 import { sendEmail, SendEmailResult } from "@/lib/email/resend";
+import { emitEventSafely } from "@/lib/events/service";
+import { recordOutcomeSafely } from "@/lib/outcomes/service";
+import { renderTemplate } from "@/lib/templates";
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://aibackoffice.app";
 
@@ -42,10 +45,6 @@ function mapSettingsRow(data: Record<string, any>): MissedCallSettings {
     businessTagline: data.business_tagline,
     emergencyKeywords: data.emergency_keywords ?? [],
   };
-}
-
-function renderTemplate(template: string, vars: Record<string, string>): string {
-  return template.replace(/{{\s*(\w+)\s*}}/g, (_, key) => vars[key] ?? "");
 }
 
 /** Trigger layer: resolves which tenant a missed call belongs to, by the number that was called. */
@@ -135,6 +134,21 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
     }
   }
 
+  // Compatibility adapter (P0.5): emit a canonical business event alongside
+  // this module's existing execution path, without changing that path's
+  // behavior. See docs/EVENT_SYSTEM.md "Migration strategy." Never allowed
+  // to affect the outcome below — emitEventSafely swallows its own errors.
+  await emitEventSafely({
+    tenantId,
+    eventType: "call.missed",
+    actorType: "integration",
+    actorId: "twilio",
+    entityType: "caller",
+    entityId: payload.callerPhone,
+    idempotencyKey: payload.callSid ? `call.missed:${payload.callSid}` : undefined,
+    payload: { callerPhone: payload.callerPhone, callSid: payload.callSid ?? null, triggerSource: payload.triggerSource ?? "twilio_missed_call" },
+  });
+
   if (!settings.enabled) {
     await writeHistory(tenantId, payload, {
       status: "skipped",
@@ -185,6 +199,15 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
       tenantId
     );
     leadId = lead.id;
+    await emitEventSafely({
+      tenantId,
+      eventType: "lead.created",
+      actorType: "system",
+      actorId: "missed-call-recovery",
+      entityType: "lead",
+      entityId: leadId,
+      payload: { source: "missed-call-recovery", callerPhone: payload.callerPhone },
+    });
   } catch (error) {
     console.error("[missed-call-recovery] failed to create lead", error);
   }
@@ -212,6 +235,28 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
   }
 
   const overallStatus = recoverySmsResult.ok ? "recovered" : recoverySmsResult.skipped ? "skipped" : "failed";
+
+  if (overallStatus === "recovered") {
+    await emitEventSafely({
+      tenantId,
+      eventType: "call.recovered",
+      actorType: "system",
+      actorId: "missed-call-recovery",
+      entityType: "lead",
+      entityId: leadId,
+      payload: { callerPhone: payload.callerPhone, recoverySmsSid: recoverySmsResult.ok ? recoverySmsResult.sid : undefined },
+    });
+    await recordOutcomeSafely({
+      tenantId,
+      entityType: "lead",
+      entityId: leadId,
+      outcomeType: "lead_recovered",
+      // The recovery SMS going out IS the module's action — no intermediate
+      // human step, so this is a direct attribution, not a guess.
+      attributionConfidence: "direct",
+      metadata: { module: "missed-call-recovery", callerPhone: payload.callerPhone },
+    });
+  }
 
   await writeHistory(tenantId, payload, {
     status: overallStatus,

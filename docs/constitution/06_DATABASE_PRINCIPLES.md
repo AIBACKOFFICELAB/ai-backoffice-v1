@@ -63,6 +63,38 @@ pilot tenant to many.
 - Materialize only when a specific dashboard's query performance requires it;
   default to live views for MVP-scale data volumes.
 
+## P0 Amendment (Agentic Foundation)
+
+*Added per Article VIII of [[02_PRODUCT_CONSTITUTION]] — deliberate,
+dated, documented here rather than left as undocumented precedent. Date:
+see git log for this amendment's introducing commit.*
+
+The P0 Agentic Foundation (see `../../ARCHITECTURE.md`) added
+`business_events`, `agents`, `agent_runs`, `tool_calls`,
+`model_invocations`, `approvals`, `outcomes`, and `durable_jobs`
+(migrations `009`–`016`). `business_events` in particular could look like
+it violates "Automation History Storage" below — it doesn't:
+
+- **`business_events`** is a cross-module orchestration/observability log
+  (JSONB payload, read by the agent runtime and future infra) — not a
+  replacement for any module's History table. This document's rule against
+  collapsing "all module history into one generic events table" is about
+  the business-outcome-facing, first-class-columned History layer required
+  by [[03_MODULE_ARCHITECTURE]] (`missed_call_recovery_history`,
+  `estimate_followup_history`, and their successors). Those tables are
+  unchanged and remain the source of truth for module Analytics. See
+  `../../EVENT_SYSTEM.md` for the full distinction.
+- Every P0 table follows every existing rule in this document unchanged:
+  `tenant_id NOT NULL`, RLS enabled with a tenant-membership `SELECT`
+  policy, writes via the service-role client with explicit `tenant_id`
+  filtering in application code (RLS is the backstop, not the enforcement
+  mechanism — see "Row-Level Security" above), migrations as the only
+  accepted schema-change path.
+- Entity references on the new tables (`entity_type`/`entity_id`) are
+  polymorphic rather than hard foreign keys into `leads` — see
+  `../../DOMAIN_MODEL.md` for why, and for what canonical-model work (a
+  `customers`/`jobs`/`properties` split) remains deliberately deferred.
+
 ## Future Extensibility
 
 - New modules (post-MVP) must be able to add their Configuration, History, and

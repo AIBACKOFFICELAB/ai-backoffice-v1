@@ -91,3 +91,35 @@ GOOGLE_SHEET_ID=your-google-sheet-id
 - Google Sheets integration is preserved as a temporary fallback while Supabase persistence is added.
 - No multi-tenant or advanced analytics logic was added.
 - The system is intended for a single pilot customer.
+
+---
+
+## P0 Agentic Foundation tables (migrations 009–016)
+
+Added by the P0 Agentic Foundation (see `ARCHITECTURE.md`). Full column
+detail lives in the migration files themselves
+(`db/migrations/009_business_events.sql` through
+`016_durable_jobs.sql`) — this is the summary. Every table below:
+`tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE`, RLS
+enabled, `SELECT` policy via `is_tenant_member()`, writes via the
+service-role client only (see `docs/constitution/06_DATABASE_PRINCIPLES.md`'s
+P0 amendment below).
+
+| Table | Purpose | Doc |
+|---|---|---|
+| `business_events` | Canonical cross-module event log | `EVENT_SYSTEM.md` |
+| `agents` | Agent registry: type, status, tools, approval/model policy | `AGENT_SECURITY.md` |
+| `agent_runs` | One row per agent invocation | `AGENT_SECURITY.md` |
+| `tool_calls` | One row per tool a run invoked | `AGENT_SECURITY.md` |
+| `model_invocations` | One row per model gateway call | `MODEL_GATEWAY.md` |
+| `approvals` | Human sign-off records for gated agent actions | `AGENT_SECURITY.md` |
+| `outcomes` | Business-outcome attribution | `OUTCOME_ATTRIBUTION.md` |
+| `durable_jobs` | Execution queue (retries/backoff/dead-letter) | `docs/adr/0001-durable-execution-layer.md` |
+
+New required environment variable:
+
+```bash
+# Model Gateway (optional — falls back to a deterministic mock provider
+# when unset, so dev/CI/tests never need this). See MODEL_GATEWAY.md.
+ANTHROPIC_API_KEY=your-anthropic-api-key
+```
