@@ -56,3 +56,21 @@ describe("validateInput — a malformed request never reaches execute() or an ap
     expect(draftCustomerMessageTool.validateInput({ draft: 1 }).ok).toBe(false);
   });
 });
+
+/**
+ * validateOutput (P0.9 Slice B, finding B-09) — enforced by the runtime
+ * (lib/agents/runtime.ts::executeToolDefinition), unit-tested here in
+ * isolation for the contract itself.
+ */
+describe("validateOutput — a malformed tool response is detectable", () => {
+  it("ping's real execute() output always passes its own validateOutput", async () => {
+    const result = await pingTool.execute({}, { tenantId: "t1", agentRunId: "run-1" });
+    expect(pingTool.validateOutput!(result.summary)).toEqual({ ok: true });
+  });
+
+  it("ping's validateOutput rejects a response missing pong: true", () => {
+    expect(pingTool.validateOutput!({})).toMatchObject({ ok: false });
+    expect(pingTool.validateOutput!({ pong: false })).toMatchObject({ ok: false });
+    expect(pingTool.validateOutput!(null)).toMatchObject({ ok: false });
+  });
+});

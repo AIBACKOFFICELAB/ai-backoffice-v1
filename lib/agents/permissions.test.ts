@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { evaluateToolCall, canRead, canWrite } from "./permissions";
+import { evaluateToolCall, canRead, canWrite, buildPolicySnapshot, PolicyDecision } from "./permissions";
 import { Agent, AutonomyTier, Permission } from "./types";
 import { AnyToolDefinition, ToolContext, ToolResult } from "./toolRegistry";
 
@@ -203,6 +203,80 @@ describe("evaluateToolCall — agent permission enforcement (P0.4 / P0.9 Slice A
       const decision = evaluateToolCall(maximallyPermissiveAgent, tool);
       expect(decision.decision).toBe("require_approval");
     });
+  });
+});
+
+/**
+ * Immutable policy-decision audit snapshot (P0.9 Slice B, finding H-04/B-08).
+ */
+describe("buildPolicySnapshot", () => {
+  it("captures the decision actually made, from the registered tool, at build time", () => {
+    const agent = makeAgent({ allowedTools: ["draft"], approvalPolicy: { draft: "REQUIRE_APPROVAL" }, instructionsVersion: 4 });
+    const tool = makeTool({ name: "draft", intrinsicPermission: "SEND", minimumAutonomyTier: "REQUIRE_APPROVAL", version: 2 });
+    const decision = evaluateToolCall(agent, tool);
+
+    const snapshot = buildPolicySnapshot(agent, tool, "draft", "execute", decision);
+    expect(snapshot).toMatchObject({
+      snapshotVersion: 1,
+      toolName: "draft",
+      action: "execute",
+      intrinsicPermission: "SEND",
+      toolDefinitionVersion: 2,
+      resolvedTier: "REQUIRE_APPROVAL",
+      decision: "require_approval",
+      agentInstructionsVersion: 4,
+      agentConfiguredTier: "REQUIRE_APPROVAL",
+    });
+  });
+
+  it("handles the unregistered-tool case (tool: null) uniformly", () => {
+    const agent = makeAgent();
+    const decision: PolicyDecision = { decision: "deny", reason: "tool 'ghost' is not registered" };
+    const snapshot = buildPolicySnapshot(agent, null, "ghost", "execute", decision);
+    expect(snapshot.intrinsicPermission).toBeNull();
+    expect(snapshot.toolDefinitionVersion).toBeNull();
+    expect(snapshot.agentConfiguredTier).toBeNull();
+    expect(snapshot.decision).toBe("deny");
+    expect(snapshot.reason).toBe("tool 'ghost' is not registered");
+  });
+
+  it("a 'deny' decision carries no resolvedTier — mirrors PolicyDecision's own shape rather than inventing one", () => {
+    const agent = makeAgent({ status: "paused" });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE" });
+    const decision = evaluateToolCall(agent, tool);
+    const snapshot = buildPolicySnapshot(agent, tool, "ping", "execute", decision);
+    expect(snapshot.resolvedTier).toBeNull();
+    expect(snapshot.reason).toMatch(/not 'active'/);
+  });
+
+  it("scenario 16: a historical snapshot remains reconstructable after the agent's CURRENT configuration is later mutated", () => {
+    const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, readScopes: ["leads"] });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });
+    const decisionAtTheTime = evaluateToolCall(agent, tool);
+    const snapshot = buildPolicySnapshot(agent, tool, "ping", "execute", decisionAtTheTime);
+
+    expect(snapshot.decision).toBe("allow");
+    expect(snapshot.resolvedTier).toBe("AUTO_EXECUTE");
+    expect(snapshot.agentReadScopes).toEqual(["leads"]);
+
+    // Mutate the agent's CURRENT configuration in place, as a real
+    // agentStore.update() would — the snapshot must be entirely unaffected,
+    // since it was copied by value, not by reference.
+    agent.approvalPolicy = { ping: "HUMAN_ONLY" };
+    agent.readScopes = [];
+    agent.instructionsVersion = 99;
+
+    expect(snapshot.decision).toBe("allow");
+    expect(snapshot.resolvedTier).toBe("AUTO_EXECUTE");
+    expect(snapshot.agentReadScopes).toEqual(["leads"]);
+    expect(snapshot.agentInstructionsVersion).toBe(1);
+
+    // Re-evaluating NOW, against the mutated agent, correctly produces a
+    // DIFFERENT decision — proving the snapshot isn't just stale by
+    // accident, it's a deliberately preserved historical record distinct
+    // from "what would happen if evaluated again today."
+    const decisionNow = evaluateToolCall(agent, tool);
+    expect(decisionNow.decision).toBe("deny");
   });
 });
 

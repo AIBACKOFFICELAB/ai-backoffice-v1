@@ -2,7 +2,8 @@ import { Agent } from "./types";
 import { AgentStore, SupabaseAgentStore } from "./agentStore";
 import { AgentRun, AgentRunStore, SupabaseAgentRunStore } from "./runStore";
 import { ToolCall, ToolCallStore, SupabaseToolCallStore } from "./toolCallStore";
-import { evaluateToolCall } from "./permissions";
+import { evaluateToolCall, buildPolicySnapshot, PolicyDecision } from "./permissions";
+import { computeRunStatus } from "./runStatus";
 import { DEFAULT_TOOL_REGISTRY, AnyToolDefinition } from "./toolRegistry";
 import { AiGateway, ai as defaultGateway } from "@/lib/ai/gateway";
 import { ApprovalStore, SupabaseApprovalStore } from "@/lib/approvals/store";
@@ -124,12 +125,16 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
   //    input) + mock/safe tool called, per planned call.
   const outcomes: ToolCallOutcome[] = [];
   let anyAwaitingApproval = false;
-  let anyFailed = false;
 
   for (const planned of input.toolPlan) {
     const tool = tools[planned.toolName];
 
     if (!tool) {
+      // No ToolDefinition exists to evaluate — build the deny decision by
+      // hand (evaluateToolCall requires a registered tool) so this call
+      // still gets an immutable policy snapshot like every other tool_call
+      // (P0.9 Slice B, finding B-08).
+      const decision: PolicyDecision = { decision: "deny", reason: `tool '${planned.toolName}' is not registered` };
       const toolCall = await toolCallStore.create({
         tenantId: input.tenantId,
         agentRunId: agentRun.id,
@@ -137,14 +142,14 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
         action: planned.action,
         requestSummary: planned.input,
         requiresApproval: false,
+        policySnapshot: buildPolicySnapshot(agent, null, planned.toolName, planned.action, decision),
       });
       const updated = await toolCallStore.update(input.tenantId, toolCall.id, {
         status: "failed",
-        error: `tool '${planned.toolName}' is not registered`,
+        error: decision.reason,
         completedAt: new Date().toISOString(),
       });
       outcomes.push({ toolCall: updated, approval: null });
-      anyFailed = true;
       continue;
     }
 
@@ -157,6 +162,7 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
       action: planned.action,
       requestSummary: planned.input,
       requiresApproval: decision.decision === "require_approval",
+      policySnapshot: buildPolicySnapshot(agent, tool, tool.name, planned.action, decision),
     });
 
     if (decision.decision === "deny") {
@@ -180,7 +186,6 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
         completedAt: new Date().toISOString(),
       });
       outcomes.push({ toolCall: updated, approval: null });
-      anyFailed = true;
       continue;
     }
 
@@ -216,10 +221,14 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
     // decision.decision === "allow"
     const outcome = await executeToolDefinition(tool, validation.value, toolCall, input.tenantId, agentRun.id, toolCallStore);
     outcomes.push({ toolCall: outcome, approval: null });
-    if (outcome.status === "failed") anyFailed = true;
   }
 
-  const finalStatus = anyAwaitingApproval ? "awaiting_approval" : anyFailed ? "failed" : "succeeded";
+  // P0.9 Slice B, finding B-07: truthful terminal status, computed by the
+  // single centralized rule in lib/agents/runStatus.ts — never scattered
+  // ad hoc booleans. 'awaiting_approval' still short-circuits everything
+  // else, same as before Slice B: computeRunStatus is only meaningful once
+  // no tool call is still pending a human decision.
+  const finalStatus = anyAwaitingApproval ? "awaiting_approval" : computeRunStatus(outcomes.map((o) => o.toolCall.status));
   agentRun = await runStore.update(input.tenantId, agentRun.id, {
     status: finalStatus,
     completedAt: finalStatus === "awaiting_approval" ? null : new Date().toISOString(),
@@ -238,10 +247,35 @@ async function executeToolDefinition(
 ): Promise<ToolCall> {
   try {
     const result = await tool.execute(input, { tenantId, agentRunId });
+    if (!result.ok) {
+      return toolCallStore.update(tenantId, toolCall.id, {
+        status: "failed",
+        responseSummary: result.summary,
+        error: result.error ?? null,
+        completedAt: new Date().toISOString(),
+      });
+    }
+
+    // P0.9 Slice B, finding B-09: the tool's own declared validateOutput
+    // contract, where present, is enforced here — a malformed response is
+    // never recorded as an ordinary success just because the tool itself
+    // claimed result.ok === true.
+    if (tool.validateOutput) {
+      const outputValidation = tool.validateOutput(result.summary);
+      if (!outputValidation.ok) {
+        return toolCallStore.update(tenantId, toolCall.id, {
+          status: "failed",
+          responseSummary: result.summary,
+          error: `output validation failed: ${outputValidation.errors.join("; ")}`,
+          completedAt: new Date().toISOString(),
+        });
+      }
+    }
+
     return toolCallStore.update(tenantId, toolCall.id, {
-      status: result.ok ? "succeeded" : "failed",
+      status: "succeeded",
       responseSummary: result.summary,
-      error: result.error ?? null,
+      error: null,
       completedAt: new Date().toISOString(),
     });
   } catch (error) {
@@ -315,9 +349,11 @@ export async function resumeAfterApprovalDecision(tenantId: string, approvalId: 
   const remaining = await toolCallStore.listByAgentRun(tenantId, approval.agentRunId);
   const stillWaiting = remaining.some((tc) => tc.status === "requires_approval" || tc.status === "pending");
   if (!stillWaiting) {
-    const anyFailed = remaining.some((tc) => tc.status === "failed");
+    // P0.9 Slice B, finding B-07: same centralized rule as runAgent() — a
+    // run resumed after a rejected approval must never silently resolve to
+    // 'succeeded'. See lib/agents/runStatus.ts.
     await runStore.update(tenantId, approval.agentRunId, {
-      status: anyFailed ? "failed" : "succeeded",
+      status: computeRunStatus(remaining.map((tc) => tc.status)),
       completedAt: new Date().toISOString(),
     });
   }

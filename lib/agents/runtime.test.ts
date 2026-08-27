@@ -149,7 +149,183 @@ describe("P0 end-to-end: business event -> agent run -> outcome", () => {
 
     expect(toolCallOutcomes[0].toolCall.status).toBe("denied");
     expect(toolCallOutcomes[0].approval).toBeNull();
-    expect(agentRun.status).toBe("succeeded"); // nothing left pending — a denial isn't a failure of the run itself
+    // P0.9 Slice B, finding H-04/B-07: before Slice B this asserted
+    // 'succeeded' — an all-denied run silently reported success, exactly
+    // the bug the truthful-status rework fixes. See lib/agents/runStatus.ts.
+    expect(agentRun.status).toBe("denied");
+  });
+
+  it("scenario 13: a mixture of an allowed success and a policy denial reports a truthful 'partial' status", async () => {
+    const tenantId = "tenant-e2e-partial";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Mixed-outcome agent",
+      status: "active",
+      allowedTools: ["ping", "locked"],
+      approvalPolicy: { ping: "AUTO_EXECUTE", locked: "HUMAN_ONLY" },
+    });
+    const lockedTool: AnyToolDefinition = {
+      ...DEFAULT_TOOL_REGISTRY.ping,
+      name: "locked",
+      minimumAutonomyTier: "HUMAN_ONLY",
+    };
+    const tools = { ...DEFAULT_TOOL_REGISTRY, [lockedTool.name]: lockedTool };
+
+    const { toolCallOutcomes, agentRun } = await runAgent(
+      {
+        tenantId,
+        agentId: agent.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [
+          { toolName: "ping", action: "execute", input: {} },
+          { toolName: "locked", action: "execute", input: {} },
+        ],
+      },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("succeeded");
+    expect(toolCallOutcomes[1].toolCall.status).toBe("denied");
+    expect(agentRun.status).toBe("partial");
+  });
+
+  it("scenario 15: a genuine execution failure alongside a success reports 'failed', not 'partial'", async () => {
+    const tenantId = "tenant-e2e-failed";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Failing-tool agent",
+      status: "active",
+      allowedTools: ["ping"],
+      approvalPolicy: { ping: "AUTO_EXECUTE" },
+    });
+
+    const { agentRun } = await runAgent(
+      {
+        tenantId,
+        agentId: agent.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [
+          { toolName: "ping", action: "execute", input: {} },
+          { toolName: "nonexistent_tool", action: "execute", input: {} },
+        ],
+      },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    expect(agentRun.status).toBe("failed");
+  });
+
+  it("scenario 17: a tool output failing its own validateOutput contract is recorded as failed, never succeeded", async () => {
+    const tenantId = "tenant-e2e-badoutput";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Malformed-output agent",
+      status: "active",
+      allowedTools: ["ping"],
+      approvalPolicy: { ping: "AUTO_EXECUTE" },
+    });
+
+    // A deliberately malformed tool: claims ok:true but its summary fails
+    // the same validateOutput contract as the real pingTool (missing
+    // pong: true).
+    const malformedTool: AnyToolDefinition = {
+      ...DEFAULT_TOOL_REGISTRY.ping,
+      async execute() {
+        return { ok: true, summary: { pong: "not-a-boolean" } };
+      },
+    };
+
+    const { toolCallOutcomes, agentRun } = await runAgent(
+      { tenantId, agentId: agent.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "ping", action: "execute", input: {} }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: { ping: malformedTool } }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("failed");
+    expect(toolCallOutcomes[0].toolCall.error).toMatch(/output validation failed/);
+    expect(agentRun.status).toBe("failed");
+  });
+
+  it("B-08: every created tool_call carries an immutable policy snapshot reflecting the decision actually made", async () => {
+    const tenantId = "tenant-e2e-snapshot";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Snapshot agent",
+      status: "active",
+      allowedTools: ["ping"],
+      approvalPolicy: { ping: "AUTO_EXECUTE" },
+      systemInstructions: "v3 instructions",
+    });
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: agent.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "ping", action: "execute", input: {} }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    const snapshot = toolCallOutcomes[0].toolCall.policySnapshot;
+    expect(snapshot.toolName).toBe("ping");
+    expect(snapshot.decision).toBe("allow");
+    expect(snapshot.resolvedTier).toBe("AUTO_EXECUTE");
+    expect(snapshot.intrinsicPermission).toBe("EXECUTE");
+    expect(snapshot.toolDefinitionVersion).toBe(DEFAULT_TOOL_REGISTRY.ping.version);
+    expect(snapshot.agentInstructionsVersion).toBe(agent.instructionsVersion);
+
+    // The historical record must survive a later mutation of the agent's
+    // CURRENT configuration — reconstructing "why" must read the snapshot,
+    // never live config (scenario 16, integration-level companion to the
+    // pure-function test in permissions.test.ts).
+    await agentStore.update(tenantId, agent.id, { approvalPolicy: { ping: "HUMAN_ONLY" } });
+    const stillOnDisk = await toolCallStore.listByAgentRun(tenantId, toolCallOutcomes[0].toolCall.agentRunId);
+    expect(stillOnDisk[0].policySnapshot.decision).toBe("allow");
+    expect(stillOnDisk[0].policySnapshot.resolvedTier).toBe("AUTO_EXECUTE");
+  });
+
+  it("an unregistered tool's tool_call still carries a policy snapshot (tool: null case)", async () => {
+    const tenantId = "tenant-e2e-unregistered";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+    const { devTest } = await seedAgents(tenantId, agentStore);
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "nonexistent_tool", action: "execute", input: {} }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    const snapshot = toolCallOutcomes[0].toolCall.policySnapshot;
+    expect(snapshot.decision).toBe("deny");
+    expect(snapshot.intrinsicPermission).toBeNull();
+    expect(snapshot.toolDefinitionVersion).toBeNull();
+    expect(snapshot.reason).toMatch(/not registered/);
   });
 });
 
@@ -317,7 +493,7 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     expect(approvalAfter?.status).toBe("approved");
   });
 
-  it("rejecting the approval denies the tool call without ever executing it", async () => {
+  it("scenario 14: rejecting the approval denies the tool call without ever executing it, and the run reports a truthful terminal status", async () => {
     // Deliberately its own setup, NOT setupApprovedButUnresolvedCall(): a
     // rejection is only ever legal from 'pending' (decide() is a CAS
     // WHERE status = 'pending' — see Issue 1's fix), so this test rejects
@@ -348,6 +524,11 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
 
     const toolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
     expect(toolCall?.status).toBe("denied");
+
+    // P0.9 Slice B, finding H-04/B-07: a rejected approval must never
+    // silently resolve the run to 'succeeded'.
+    const finalRun = await runStore.getById(tenantId, toolCallOutcomes[0].toolCall.agentRunId);
+    expect(finalRun?.status).toBe("denied");
   });
 
   it("resuming a still-pending approval is a safe no-op (decision not made yet)", async () => {

@@ -52,9 +52,34 @@ describe("tenant isolation", () => {
     await expect(store.update(TENANT_B, runA.id, { status: "failed" })).rejects.toThrow();
   });
 
+  const stubPolicySnapshot = {
+    snapshotVersion: 1 as const,
+    toolName: "ping",
+    action: "execute",
+    intrinsicPermission: "EXECUTE" as const,
+    toolDefinitionVersion: 1,
+    resolvedTier: "AUTO_EXECUTE" as const,
+    decision: "allow" as const,
+    reason: null,
+    agentInstructionsVersion: 1,
+    agentConfiguredTier: "AUTO_EXECUTE" as const,
+    requiredReadScopes: [],
+    requiredWriteScopes: [],
+    agentReadScopes: [],
+    agentWriteScopes: [],
+    evaluatedAt: new Date().toISOString(),
+  };
+
   it("tool_calls: scoped per tenant, including approval-id lookup", async () => {
     const store = new InMemoryToolCallStore();
-    const tcA = await store.create({ tenantId: TENANT_A, agentRunId: "run-a", toolName: "ping", action: "execute", requestSummary: {} });
+    const tcA = await store.create({
+      tenantId: TENANT_A,
+      agentRunId: "run-a",
+      toolName: "ping",
+      action: "execute",
+      requestSummary: {},
+      policySnapshot: stubPolicySnapshot,
+    });
     await store.update(TENANT_A, tcA.id, { approvalId: "approval-a" });
 
     expect(await store.getByApprovalId(TENANT_B, "approval-a")).toBeNull();

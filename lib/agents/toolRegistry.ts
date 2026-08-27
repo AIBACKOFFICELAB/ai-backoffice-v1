@@ -79,6 +79,15 @@ export const pingTool: ToolDefinition<Record<string, unknown>> = {
     // no-op round trip proving the pipeline works.
     return { ok: true, value: isRecord(input) ? input : {} };
   },
+  // P0.9 Slice B, finding B-09: proves validateOutput is actually enforced
+  // by the runtime (lib/agents/runtime.ts::executeToolDefinition), not just
+  // an unused optional field on ToolDefinition.
+  validateOutput(output) {
+    if (!isRecord(output) || output.pong !== true) {
+      return { ok: false, errors: ["ping output must include pong: true"] };
+    }
+    return { ok: true };
+  },
   async execute(input, ctx) {
     return { ok: true, summary: { pong: true, receivedAt: new Date().toISOString(), tenantId: ctx.tenantId, input } };
   },

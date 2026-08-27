@@ -24,6 +24,89 @@ export type PolicyDecision =
   | { decision: "require_approval"; tier: AutonomyTier };
 
 /**
+ * Immutable policy-decision audit record (P0.9 Slice B, finding B-08).
+ * Captured once, at the moment a tool call is evaluated, and stored
+ * unmodified on the tool_call row (tool_calls.policy_snapshot — see
+ * lib/agents/toolCallStore.ts). The whole point is that this snapshot must
+ * remain a truthful record of what was decided and why EVEN AFTER the
+ * agent's configuration or the tool's registered definition later changes —
+ * so every field here is copied by value at evaluation time, never a
+ * reference to the live agent/tool object, and reconstructing "why was this
+ * tool call permitted/denied/gated" must read this snapshot, never current
+ * agent/tool configuration (lib/agents/permissions.test.ts asserts this
+ * directly: mutate the agent after the snapshot is taken and confirm the
+ * snapshot is unaffected).
+ *
+ * Deliberately excludes prompts, raw tool input/output, and any other PII —
+ * only the shape of the authorization decision itself.
+ */
+export type PolicySnapshot = {
+  /** Bump if this shape changes in a way that affects how old snapshots are
+   * interpreted. */
+  snapshotVersion: 1;
+  toolName: string;
+  action: string;
+  /** null only when the tool name was not registered at evaluation time —
+   * the one case where there is no ToolDefinition to read a permission
+   * from. */
+  intrinsicPermission: Permission | null;
+  toolDefinitionVersion: number | null;
+  /** The tier the call actually ran/would run at. null for a 'deny' —
+   * several deny reasons (inactive agent, tool not allowed, missing scope)
+   * occur before a tier is ever resolved, and PolicyDecision's own 'deny'
+   * variant carries no tier for that reason; this snapshot mirrors it
+   * exactly rather than inventing one. */
+  resolvedTier: AutonomyTier | null;
+  decision: PolicyDecision["decision"];
+  reason: string | null;
+  agentInstructionsVersion: number;
+  /** What the agent's approval_policy had configured for this tool at
+   * evaluation time, before the PERMISSION_FLOOR/tool-floor combination in
+   * resolveTier() — null if the tool was unregistered or nothing was
+   * configured (i.e. the REQUIRE_APPROVAL default applied). */
+  agentConfiguredTier: AutonomyTier | null;
+  requiredReadScopes: string[];
+  requiredWriteScopes: string[];
+  agentReadScopes: string[];
+  agentWriteScopes: string[];
+  evaluatedAt: string;
+};
+
+/**
+ * Builds the immutable snapshot for one tool-call policy evaluation. Handles
+ * both the registered-tool case (tool from evaluateToolCall's own registry
+ * lookup) and the unregistered-tool case (tool === null, action never
+ * reaches evaluateToolCall at all) uniformly, so every tool_call — allowed,
+ * denied, gated, or refused outright for not being registered — gets a
+ * snapshot.
+ */
+export function buildPolicySnapshot(
+  agent: Agent,
+  tool: AnyToolDefinition | null,
+  toolName: string,
+  action: string,
+  decision: PolicyDecision
+): PolicySnapshot {
+  return {
+    snapshotVersion: 1,
+    toolName,
+    action,
+    intrinsicPermission: tool?.intrinsicPermission ?? null,
+    toolDefinitionVersion: tool?.version ?? null,
+    resolvedTier: decision.decision === "deny" ? null : decision.tier,
+    decision: decision.decision,
+    reason: decision.decision === "deny" ? decision.reason : null,
+    agentInstructionsVersion: agent.instructionsVersion,
+    agentConfiguredTier: tool ? agent.approvalPolicy[tool.name] ?? null : null,
+    requiredReadScopes: tool?.requiredReadScopes ?? [],
+    requiredWriteScopes: tool?.requiredWriteScopes ?? [],
+    agentReadScopes: [...agent.readScopes],
+    agentWriteScopes: [...agent.writeScopes],
+    evaluatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Permissions that can never be satisfied by a tier lower than the floor
  * here, regardless of what an agent's approval_policy says — a
  * misconfigured AUTO_EXECUTE entry for a financial, destructive, or

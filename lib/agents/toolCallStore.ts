@@ -1,5 +1,6 @@
 import { randomUUID } from "crypto";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { PolicySnapshot } from "./permissions";
 
 export type ToolCallStatus = "pending" | "succeeded" | "failed" | "requires_approval" | "denied";
 
@@ -17,6 +18,13 @@ export type ToolCall = {
   error: string | null;
   requiresApproval: boolean;
   approvalId: string | null;
+  /** Immutable policy-decision audit record (P0.9 Slice B, finding B-08) —
+   * set exactly once, at create(), and structurally excluded from
+   * UpdateToolCallInput below so nothing can mutate it afterward. Lets an
+   * auditor reconstruct WHY this call was permitted/denied/gated even after
+   * the agent's or tool's current configuration has since changed. See
+   * lib/agents/permissions.ts::buildPolicySnapshot. */
+  policySnapshot: PolicySnapshot;
   createdAt: string;
 };
 
@@ -27,8 +35,11 @@ export type CreateToolCallInput = {
   action: string;
   requestSummary: Record<string, unknown>;
   requiresApproval?: boolean;
+  policySnapshot: PolicySnapshot;
 };
 
+/** Deliberately omits policySnapshot (and requestSummary, per Slice A) —
+ * both are immutable-by-construction once a tool_call is created. */
 export type UpdateToolCallInput = Partial<
   Pick<ToolCall, "status" | "responseSummary" | "completedAt" | "error" | "requiresApproval" | "approvalId">
 >;
@@ -55,6 +66,7 @@ function mapRow(row: Record<string, any>): ToolCall {
     error: row.error,
     requiresApproval: row.requires_approval,
     approvalId: row.approval_id,
+    policySnapshot: row.policy_snapshot ?? null,
     createdAt: row.created_at,
   };
 }
@@ -71,6 +83,7 @@ export class SupabaseToolCallStore implements ToolCallStore {
         action: input.action,
         request_summary: input.requestSummary,
         requires_approval: input.requiresApproval ?? false,
+        policy_snapshot: input.policySnapshot,
         status: "pending",
       })
       .select()
@@ -133,6 +146,7 @@ export class InMemoryToolCallStore implements ToolCallStore {
       error: null,
       requiresApproval: input.requiresApproval ?? false,
       approvalId: null,
+      policySnapshot: input.policySnapshot,
       createdAt: now,
     };
     this.rows.push(toolCall);

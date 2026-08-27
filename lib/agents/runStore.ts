@@ -1,7 +1,18 @@
 import { randomUUID } from "crypto";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 
-export type AgentRunStatus = "pending" | "running" | "awaiting_approval" | "succeeded" | "failed" | "cancelled";
+/**
+ * Terminal states (P0.9 Slice B, finding B-07): 'succeeded', 'failed',
+ * 'denied', 'partial'. 'denied' means every tool call that reached a
+ * terminal outcome was denied by policy or rejected by a human approver —
+ * no consequential action of this run's actually happened. 'partial' means
+ * a mix of at least one succeeded and at least one denied/rejected
+ * outcome, with no outright execution failure. A genuine tool execution
+ * failure always reports 'failed', even alongside denials — see the
+ * deterministic rule in lib/agents/runStatus.ts::computeRunStatus, the
+ * single place this decision is made. Never collapse a denied or rejected
+ * outcome into 'succeeded'. */
+export type AgentRunStatus = "pending" | "running" | "awaiting_approval" | "succeeded" | "failed" | "denied" | "partial" | "cancelled";
 
 export type AgentRun = {
   id: string;
