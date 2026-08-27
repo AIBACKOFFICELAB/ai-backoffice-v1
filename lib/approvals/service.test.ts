@@ -59,3 +59,95 @@ describe("approval enforcement (P0.4)", () => {
     expect(after?.status).toBe("expired");
   });
 });
+
+/**
+ * Concurrent human decisions (fix for the independent-review B-03 follow-up
+ * "approval decision is not atomic"). Before this fix, approveApproval/
+ * rejectApproval read-then-wrote non-atomically — two concurrent calls
+ * could both observe 'pending' and the last writer would silently win,
+ * clobbering whichever decision landed first. store.decide() is now itself
+ * a CAS (`WHERE status = 'pending'`), so approveApproval/rejectApproval's
+ * prior getById() is diagnostic-only, never authoritative — see
+ * lib/approvals/service.ts and lib/approvals/store.ts.
+ */
+describe("concurrent human decisions — exactly one CAS wins", () => {
+  it("test 1: concurrent approve + reject — exactly one terminal decision wins", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "t1", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    const results = await Promise.allSettled([
+      approveApproval("t1", approval.id, "owner-1", "owner", store),
+      rejectApproval("t1", approval.id, "owner-1", "owner", "too risky", store),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    // The final, persisted state must match whichever decision actually
+    // won — not silently be overwritten by the loser.
+    const final = await store.getById("t1", approval.id);
+    expect(final?.status === "approved" || final?.status === "rejected").toBe(true);
+    if (fulfilled[0].status === "fulfilled") {
+      expect(final?.status).toBe(fulfilled[0].value.status);
+    }
+  });
+
+  it("test 2: concurrent approve + approve — only one CAS decision succeeds", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "t1", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    const results = await Promise.allSettled([
+      approveApproval("t1", approval.id, "owner-1", "owner", store),
+      approveApproval("t1", approval.id, "owner-2", "owner", store),
+    ]);
+
+    const fulfilled = results.filter((r): r is PromiseFulfilledResult<Awaited<ReturnType<typeof approveApproval>>> => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason.message).toMatch(/not 'pending'/);
+
+    const final = await store.getById("t1", approval.id);
+    expect(final?.status).toBe("approved");
+    // The winner's recorded approver is the one that actually landed.
+    expect(final?.approverUserId).toBe(fulfilled[0].value.approverUserId);
+  });
+
+  it("test 3: concurrent reject + reject — only one CAS decision succeeds", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "t1", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    const results = await Promise.allSettled([
+      rejectApproval("t1", approval.id, "owner-1", "owner", "reason A", store),
+      rejectApproval("t1", approval.id, "owner-2", "owner", "reason B", store),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+
+    const final = await store.getById("t1", approval.id);
+    expect(final?.status).toBe("rejected");
+    // Exactly one of the two reasons landed — never a mix, never both applied.
+    expect(["reason A", "reason B"]).toContain(final?.reason);
+  });
+
+  it("a losing decide() call never overwrites the winner's fields (no last-writer-wins)", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "t1", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    await approveApproval("t1", approval.id, "owner-1", "owner", store);
+    // A second, later decide() attempt against the now-non-pending approval
+    // must be a pure no-op — not a partial field overwrite.
+    const second = await store.decide("t1", approval.id, { status: "rejected", approverUserId: "owner-2", reason: "too late" });
+    expect(second).toBeNull();
+
+    const final = await store.getById("t1", approval.id);
+    expect(final?.status).toBe("approved");
+    expect(final?.approverUserId).toBe("owner-1");
+    expect(final?.reason).toBeNull();
+  });
+});

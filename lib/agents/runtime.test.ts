@@ -3,10 +3,10 @@ import { runAgent, resumeAfterApprovalDecision } from "./runtime";
 import { seedAgents } from "./seed";
 import { InMemoryAgentStore } from "./agentStore";
 import { InMemoryAgentRunStore } from "./runStore";
-import { InMemoryToolCallStore } from "./toolCallStore";
+import { InMemoryToolCallStore, ToolCallStore, UpdateToolCallInput } from "./toolCallStore";
 import { DEFAULT_TOOL_REGISTRY, draftCustomerMessageTool, AnyToolDefinition } from "./toolRegistry";
 import { InMemoryApprovalStore } from "@/lib/approvals/store";
-import { approveApproval } from "@/lib/approvals/service";
+import { approveApproval, rejectApproval } from "@/lib/approvals/service";
 import { InMemoryBusinessEventStore } from "@/lib/events/store";
 import { emitEvent } from "@/lib/events/service";
 import { AiGateway } from "@/lib/ai/gateway";
@@ -179,22 +179,38 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     return { tenantId, deps, agentRun, approval, toolCallStore, approvalStore };
   }
 
-  it("two consumers racing the same approved approval — the tool body runs exactly once", async () => {
-    // Deliberately does NOT compare the two calls' RETURN VALUES against
-    // each other: InMemoryToolCallStore.update mutates and returns the
-    // same shared row object for every caller, so whichever write lands
-    // temporally last determines what BOTH callers' references read —
-    // comparing them would test the in-memory double's aliasing, not the
-    // approval CAS. The real invariant — "only one legitimate execution
-    // may win" — is that the tool's own side-effecting body runs once,
-    // which this counts directly. lib/approvals/execution.test.ts already
-    // proves the store-level CAS returns non-null exactly once; this test
-    // proves that guarantee actually prevents a second real execution when
-    // driven through the full runtime.
+  /** Wraps a ToolCallStore and records every `update()` call's patch, so a
+   * test can assert on exactly what was written (or NOT written) without
+   * relying on comparing returned object references — InMemoryToolCallStore
+   * mutates and returns the same shared row for every caller, so two
+   * "different" returned objects can actually be the same aliased row (see
+   * the comment this replaced, kept in git history). */
+  function spyOnUpdates(inner: ToolCallStore): { store: ToolCallStore; updates: Array<{ id: string; patch: UpdateToolCallInput }> } {
+    const updates: Array<{ id: string; patch: UpdateToolCallInput }> = [];
+    const store: ToolCallStore = {
+      create: (...args) => inner.create(...args),
+      listByAgentRun: (...args) => inner.listByAgentRun(...args),
+      getByApprovalId: (...args) => inner.getByApprovalId(...args),
+      update: (tenantId, id, patch) => {
+        updates.push({ id, patch });
+        return inner.update(tenantId, id, patch);
+      },
+    };
+    return { store, updates };
+  }
+
+  it("test 4: two consumers racing the same approved approval — exactly one executes, the loser never mutates tool_call to failed", async () => {
+    // The real invariant — "only one legitimate execution may win" — is
+    // that the tool's own side-effecting body runs once (checked directly
+    // below) AND that the losing caller never writes status:'failed' to
+    // the shared tool_call (checked via the update spy — this is exactly
+    // the independent-review finding: losing beginExecution() used to
+    // unconditionally mark the tool_call failed, capable of corrupting a
+    // call the winner was legitimately still executing).
     const tenantId = "tenant-race";
     const agentStore = new InMemoryAgentStore();
     const runStore = new InMemoryAgentRunStore();
-    const toolCallStore = new InMemoryToolCallStore();
+    const { store: toolCallStore, updates } = spyOnUpdates(new InMemoryToolCallStore());
     const approvalStore = new InMemoryApprovalStore();
     const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
 
@@ -216,6 +232,7 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     );
     const approval = toolCallOutcomes[0].approval!;
     await approveApproval(tenantId, approval.id, "owner-1", "owner", approvalStore);
+    updates.length = 0; // only care about writes from the race itself, not setup
 
     await Promise.all([
       resumeAfterApprovalDecision(tenantId, approval.id, deps),
@@ -223,11 +240,40 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     ]);
 
     expect(executionCount).toBe(1);
+
+    const spuriousFailures = updates.filter((u) => u.patch.status === "failed" && String(u.patch.error ?? "").match(/execution refused/));
+    expect(spuriousFailures).toHaveLength(0);
+
     const finalApproval = await approvalStore.getById(tenantId, approval.id);
     expect(finalApproval?.status).toBe("executed");
+
+    const finalToolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
+    expect(finalToolCall?.status).toBe("succeeded");
   });
 
-  it("duplicate resume after a successful execution is a safe no-op — never re-executes", async () => {
+  it("test 5: resuming an approval that's already 'executing' (another caller mid-flight) is a safe no-op", async () => {
+    const { tenantId, deps, approval, toolCallStore, approvalStore } = await setupApprovedButUnresolvedCall();
+    const toolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
+
+    // Simulate "another executor already owns it": claim the CAS directly,
+    // WITHOUT completing it — exactly the state a genuinely concurrent,
+    // still-in-flight winner would leave it in.
+    const claimed = await approvalStore.beginExecution(tenantId, approval.id, approval.payloadDigest);
+    expect(claimed?.status).toBe("executing");
+
+    const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+
+    // Safe no-op: the tool_call is returned unchanged, NOT marked failed.
+    expect(result.status).toBe(toolCall?.status);
+    expect(result.error).toBeFalsy();
+
+    // And the approval is still legitimately 'executing' — this caller did
+    // not disturb the in-flight owner's claim.
+    const approvalAfter = await approvalStore.getById(tenantId, approval.id);
+    expect(approvalAfter?.status).toBe("executing");
+  });
+
+  it("test 6: resuming an approval that's already 'executed' (duplicate resume) is a safe no-op", async () => {
     const { tenantId, deps, approval } = await setupApprovedButUnresolvedCall();
 
     const first = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
@@ -239,9 +285,12 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     expect(second.id).toBe(first.id);
     expect(second.status).toBe("succeeded");
     expect(second.completedAt).toBe(first.completedAt);
+
+    const approvalAfter = await deps.approvalStore.getById(tenantId, approval.id);
+    expect(approvalAfter?.status).toBe("executed");
   });
 
-  it("refuses execution when the approved payload was mutated after approval (approval UI reviews A, tool must not execute B)", async () => {
+  it("test 7: refuses execution on payload digest mismatch, recorded as an integrity failure — never a benign no-op (approval UI reviews A, tool must not execute B)", async () => {
     const { tenantId, deps, approval, toolCallStore } = await setupApprovedButUnresolvedCall();
 
     // Simulate tampering: something mutates the tool_call's recorded input
@@ -254,8 +303,13 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     toolCall!.requestSummary = { draft: "A completely different, unapproved message" };
 
     const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    // This is the OTHER branch from test 4/5's benign no-op: a digest
+    // mismatch is a genuine integrity problem, so — unlike losing a race —
+    // it DOES mark the tool_call failed, with a distinct reason that never
+    // reads like "another executor already owns it."
     expect(result.status).toBe("failed");
     expect(result.error).toMatch(/payload binding verification failed/);
+    expect(result.error).not.toMatch(/another executor/);
 
     // And the approval itself was never consumed — it's still 'approved',
     // not silently marked executed.
@@ -264,11 +318,29 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
   });
 
   it("rejecting the approval denies the tool call without ever executing it", async () => {
-    const { tenantId, deps, approval, toolCallStore } = await setupApprovedButUnresolvedCall();
-    // Override the 'approved' decision by rejecting instead (simulating a
-    // reject flow — approve() already ran in setup, so directly exercise
-    // the reject branch of resumeAfterApprovalDecision by forcing status).
-    await deps.approvalStore.decide(tenantId, approval.id, { status: "rejected" });
+    // Deliberately its own setup, NOT setupApprovedButUnresolvedCall(): a
+    // rejection is only ever legal from 'pending' (decide() is a CAS
+    // WHERE status = 'pending' — see Issue 1's fix), so this test rejects
+    // the approval while it's genuinely still pending rather than forcing
+    // an already-approved approval into 'rejected', which the fixed CAS
+    // now correctly refuses to allow.
+    const tenantId = "tenant-reject-flow";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+    const deps = { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY };
+
+    const { devTest } = await seedAgents(tenantId, agentStore);
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "draft_customer_message", action: "execute", input: { draft: "x" } }] },
+      deps
+    );
+    const approval = toolCallOutcomes[0].approval!;
+    expect(approval.status).toBe("pending");
+
+    await rejectApproval(tenantId, approval.id, "owner-1", "owner", "not needed", approvalStore);
 
     const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
     expect(result.status).toBe("denied");

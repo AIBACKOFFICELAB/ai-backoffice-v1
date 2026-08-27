@@ -161,9 +161,15 @@ for, and the scope-enforcement cases.
   mirrors how every other mutation in this codebase makes its authorization
   decision in application code, not in an RLS policy (RLS on `approvals` is
   `SELECT`-only for tenant members — see `docs/constitution/06_DATABASE_PRINCIPLES.md`).
-  Both also refuse a decision on a non-`'pending'` approval (no
-  double-approval) and auto-transition an expired approval to `'expired'`
-  instead of allowing it through.
+  Both call `store.decide()`, which is itself an atomic CAS —
+  `WHERE tenant_id = ? AND id = ? AND status = 'pending'` — so any
+  `getById()` these functions perform first (to build a friendly error, or
+  to check `expiresAt`) is diagnostic-only and never what decides whether
+  the transition happens. Concurrent approve+approve, approve+reject, or
+  reject+reject on the same approval can only ever have one winner; every
+  loser gets a clear "already decided" error, never a silent overwrite. An
+  expired-but-still-pending approval auto-transitions to `'expired'`
+  (itself via the same CAS) instead of allowing an approve through.
 
 ### The execution path (`lib/approvals/store.ts`, `lib/agents/runtime.ts`) — P0.9 Slice A
 
@@ -230,17 +236,29 @@ See `lib/approvals/service.test.ts` (human-decision path) and
 `resumeAfterApprovalDecision()` closes the loop once a human decides a
 pending approval:
 
-- **approved** → attempts the `beginExecution` CAS (above); on success,
-  re-validates input (`tool.validateInput`) and executes; on any refusal
-  (lost the race, wrong state, or payload mismatch), the tool call is
-  marked `failed` with a specific reason and the tool is never invoked.
+- **approved** → attempts the `beginExecution` CAS (above). A failed claim
+  is handled according to *why* it failed, not treated uniformly:
+  - **benign race** — another executor already owns (`executing`) or has
+    already consumed (`executed`) this approval. Expected under
+    concurrency, not a fault: the tool_call is read back fresh and
+    returned **unchanged** — never overwritten with `failed`. This is the
+    fix for a real defect an independent review caught: the original
+    implementation marked the tool_call `failed` unconditionally on any
+    lost claim, which could corrupt a call the legitimate winner was still
+    executing (or had already completed successfully).
+  - **integrity failure** — the payload no longer matches what was
+    approved, or the tool is no longer registered. This *does* mark the
+    tool_call `failed`, with a reason that never reads like "another
+    executor" — `lib/agents/runtime.ts::diagnoseExecutionRefusal` returns
+    a `{kind: "benign_race" | "integrity_failure", reason}` and the caller
+    branches on `kind`, not on the presence of a reason string.
 - **rejected/expired** → marks the tool call `denied`, but only if it
   isn't already in a terminal state — a duplicate resume call on an
   already-resolved tool call is a safe no-op, not a re-mutation.
-- **pending/executing/already-executed** → safe no-op: returns the tool
-  call's current state unchanged. This is what makes a duplicate resume
-  call (the same approval resumed twice, by a caller bug or a genuine
-  race) harmless.
+- **pending** → safe no-op: returns the tool call's current state
+  unchanged (the human hasn't decided yet). This, together with the
+  benign-race case above, is what makes a duplicate or premature resume
+  call (a caller bug, or a genuine race) harmless.
 
 The `agent_run` completes once nothing is left outstanding — genuinely
 resuming from durable state, not from in-memory continuation (see

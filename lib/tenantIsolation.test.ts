@@ -67,7 +67,12 @@ describe("tenant isolation", () => {
     await store.create({ tenantId: TENANT_B, requestedAction: "draft_customer_message.execute", payloadDigest: "digest-b" });
 
     expect(await store.listByTenant(TENANT_A, { status: "pending" })).toHaveLength(1);
-    await expect(store.decide(TENANT_B, approvalA.id, { status: "approved" })).rejects.toThrow();
+    // decide() is a CAS (see lib/approvals/store.ts) — it never throws for
+    // "not found under this tenant," it returns null, same as any other
+    // failed claim. Cross-tenant is still fully blocked either way.
+    expect(await store.decide(TENANT_B, approvalA.id, { status: "approved" })).toBeNull();
+    const stillPendingForA = await store.getById(TENANT_A, approvalA.id);
+    expect(stillPendingForA?.status).toBe("pending");
   });
 
   it("outcomes: revenue/attribution rows never leak across tenants", async () => {

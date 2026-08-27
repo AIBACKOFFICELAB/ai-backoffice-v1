@@ -10,10 +10,18 @@ export type DecideApprovalInput = {
 
 export interface ApprovalStore {
   create(input: RequestApprovalInput): Promise<Approval>;
-  /** Human decision path: pending -> approved/rejected/expired only. Never
-   * used for the executing/executed transitions — see beginExecution /
-   * completeExecution below. */
-  decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval>;
+  /**
+   * Atomic CAS: pending -> approved/rejected/expired ONLY. The underlying
+   * update is `WHERE tenant_id = ? AND id = ? AND status = 'pending'` —
+   * two concurrent decisions (approve+approve, approve+reject,
+   * reject+reject, ...) can never both land; whichever call's UPDATE
+   * commits first wins, and every other call sees 0 rows affected and gets
+   * `null` back. Returns `null` rather than throwing so callers can build
+   * an accurate "already decided" message from a fresh read, instead of
+   * this method guessing. Never used for the executing/executed
+   * transitions — see beginExecution / completeExecution below.
+   */
+  decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval | null>;
   getById(tenantId: string, id: string): Promise<Approval | null>;
   listByTenant(tenantId: string, opts?: { status?: ApprovalStatus }): Promise<Approval[]>;
   /**
@@ -85,7 +93,7 @@ export class SupabaseApprovalStore implements ApprovalStore {
     return mapRow(data);
   }
 
-  async decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval> {
+  async decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval | null> {
     const supabase = await createServerSupabaseClient();
     const now = new Date().toISOString();
     const row: Record<string, unknown> = { status: input.status, updated_at: now };
@@ -94,9 +102,16 @@ export class SupabaseApprovalStore implements ApprovalStore {
     if (input.status === "approved") row.approved_at = now;
     if (input.status === "rejected") row.rejected_at = now;
 
-    const { data, error } = await supabase.from("approvals").update(row).eq("tenant_id", tenantId).eq("id", id).select().single();
+    const { data, error } = await supabase
+      .from("approvals")
+      .update(row)
+      .eq("tenant_id", tenantId)
+      .eq("id", id)
+      .eq("status", "pending")
+      .select();
     if (error) throw new Error(`[approvals] decide failed: ${error.message}`);
-    return mapRow(data);
+    if (!data || data.length !== 1) return null;
+    return mapRow(data[0]);
   }
 
   async getById(tenantId: string, id: string): Promise<Approval | null> {
@@ -177,9 +192,15 @@ export class InMemoryApprovalStore implements ApprovalStore {
     return approval;
   }
 
-  async decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval> {
+  /** Synchronous check-then-mutate, deliberately with no `await` between
+   * them (same reasoning as InMemoryAgentStore.create and
+   * beginExecution below) — this is what makes the CAS predicate atomic
+   * within a single microtask turn and lets this store exercise the same
+   * "only one decision wins" contract the real `WHERE status = 'pending'`
+   * UPDATE encodes. */
+  async decide(tenantId: string, id: string, input: DecideApprovalInput): Promise<Approval | null> {
     const existing = this.rows.find((r) => r.tenantId === tenantId && r.id === id);
-    if (!existing) throw new Error(`approval ${id} not found for tenant ${tenantId}`);
+    if (!existing || existing.status !== "pending") return null;
     const now = new Date().toISOString();
     existing.status = input.status;
     existing.updatedAt = now;

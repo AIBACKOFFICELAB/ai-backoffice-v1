@@ -261,11 +261,17 @@ async function executeToolDefinition(
  * digest from the approval's OWN stored tenant/agent/run identity plus the
  * CURRENT tool_calls row, then attempts the atomic
  * approved -> executing compare-and-swap (approvalStore.beginExecution).
- * If that fails for ANY reason — lost a race to a concurrent resume call,
- * the approval is no longer 'approved', or the digest no longer matches
- * because tool_calls.request_summary was mutated after approval — execution
- * is refused and the tool is never invoked. A diagnostic (non-authoritative)
- * read is used only to build a clearer error message.
+ * A failed claim is handled according to WHY it failed (see
+ * diagnoseExecutionRefusal): losing a race to a concurrent resume call
+ * that already owns or has already consumed the approval is a SAFE NO-OP
+ * — the tool_call is read back fresh and returned unchanged, never
+ * overwritten with 'failed', because the legitimate winner may still be
+ * mid-flight or may have already recorded a real success. Only a genuine
+ * integrity problem — the payload no longer matches what was approved, or
+ * the tool is no longer registered — marks the tool_call failed. A
+ * diagnostic (non-authoritative) read is used only to tell these apart and
+ * to build a clearer error message; it is never what decides whether
+ * execution proceeds.
  *
  * Rejected/expired: marks the tool call denied, but only if it hasn't
  * already reached a terminal state — a duplicate resume call on an
@@ -329,6 +335,8 @@ async function executeApprovedToolCall(
 ): Promise<ToolCall> {
   const tool = tools[toolCall.toolName];
   if (!tool) {
+    // Genuine integrity problem — the approval references a tool that no
+    // longer exists in the registry. Not a race; always mark failed.
     return toolCallStore.update(tenantId, toolCall.id, {
       status: "failed",
       error: `tool '${toolCall.toolName}' is not registered`,
@@ -347,10 +355,25 @@ async function executeApprovedToolCall(
 
   const claimed = await approvalStore.beginExecution(tenantId, approval.id, expectedDigest);
   if (!claimed) {
-    const reason = await diagnoseExecutionRefusal(tenantId, approval.id, expectedDigest, approvalStore);
+    const diagnosis = await diagnoseExecutionRefusal(tenantId, approval.id, expectedDigest, approvalStore);
+
+    if (diagnosis.kind === "benign_race") {
+      // Another executor already owns (or has already consumed) this
+      // approval — this caller simply lost the race, which is expected
+      // and correct, not an error. It must NEVER mutate the shared
+      // tool_call: the legitimate winner is either still mid-flight or has
+      // already recorded the real outcome, and overwriting either with
+      // 'failed' would corrupt a call that actually succeeded. Return the
+      // current, freshly-read state instead of the (possibly stale)
+      // reference this function was called with.
+      return (await toolCallStore.getByApprovalId(tenantId, approval.id)) ?? toolCall;
+    }
+
+    // Genuine integrity problem (payload tampered, or an otherwise
+    // unreachable state) — this IS this caller's failure to report.
     return toolCallStore.update(tenantId, toolCall.id, {
       status: "failed",
-      error: `execution refused: ${reason}`,
+      error: `execution refused: ${diagnosis.reason}`,
       completedAt: new Date().toISOString(),
     });
   }
@@ -375,20 +398,55 @@ async function executeApprovedToolCall(
   return updated;
 }
 
-/** Diagnostic-only read to build a clearer error message after a failed
- * beginExecution claim. Never used to decide whether to proceed — that
- * decision was already made atomically by the compare-and-swap itself. */
+type ExecutionRefusalDiagnosis =
+  | { kind: "benign_race"; reason: string }
+  | { kind: "integrity_failure"; reason: string };
+
+/**
+ * Diagnostic-only read to explain a failed beginExecution claim — never
+ * used to decide whether to proceed, that decision was already made
+ * atomically by the compare-and-swap itself. Distinguishes two cases the
+ * caller must treat very differently:
+ *
+ * - `benign_race`: another executor already owns (`executing`) or has
+ *   already consumed (`executed`) this approval. Expected under
+ *   concurrency, not a fault — the caller must NOT mutate the tool_call.
+ * - `integrity_failure`: something is actually wrong (the payload no
+ *   longer matches what was approved, or an approval was somehow claimed
+ *   against before it was even approved) — the caller marks the tool_call
+ *   failed with this reason.
+ */
 async function diagnoseExecutionRefusal(
   tenantId: string,
   approvalId: string,
   expectedDigest: string,
   approvalStore: ApprovalStore
-): Promise<string> {
+): Promise<ExecutionRefusalDiagnosis> {
   const current = await approvalStore.getById(tenantId, approvalId);
-  if (!current) return "approval no longer exists";
-  if (current.status !== "approved") return `approval is '${current.status}' (single-use — already claimed, executed, or not yet approved)`;
-  if (current.payloadDigest !== expectedDigest) {
-    return "payload binding verification failed — the tool call's recorded input no longer matches what was approved";
+  if (!current) {
+    // An approval row disappearing entirely is not a state this codebase
+    // can produce — there is no delete path. Treat as an integrity
+    // problem rather than silently doing nothing.
+    return { kind: "integrity_failure", reason: "approval no longer exists" };
   }
-  return "lost a concurrent claim to execute this approval";
+  if (current.status === "executing" || current.status === "executed") {
+    return { kind: "benign_race", reason: `approval is '${current.status}' — another executor already owns or has consumed it` };
+  }
+  if (current.status !== "approved") {
+    // pending/rejected/expired at claim time — not reachable via the
+    // normal 'approved' routing in resumeAfterApprovalDecision, but
+    // defensively an integrity problem if it ever is.
+    return { kind: "integrity_failure", reason: `approval is '${current.status}', not 'approved'` };
+  }
+  if (current.payloadDigest !== expectedDigest) {
+    return {
+      kind: "integrity_failure",
+      reason: "payload binding verification failed — the tool call's recorded input no longer matches what was approved",
+    };
+  }
+  // Status is 'approved' and the digest matches, yet the CAS still lost —
+  // the only explanation is a race whose resolution hasn't been observed
+  // by this diagnostic read yet. Benign: never mutate the tool_call for
+  // this.
+  return { kind: "benign_race", reason: "lost a concurrent claim to execute this approval" };
 }
