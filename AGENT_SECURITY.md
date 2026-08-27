@@ -1,4 +1,13 @@
-# Agent Security — P0.3 / P0.4
+# Agent Security — P0.3 / P0.4, hardened P0.9 Slice A
+
+*P0.9 Slice A note: this document was updated to match the hardened
+implementation — tool security metadata now lives on the tool definition
+(not a caller-supplied field), approval execution is now a compare-and-
+swap state machine (not a single non-atomic update), and cross-tenant
+relationship integrity is enforced by composite foreign keys in migration
+`017` (written, reviewed, NOT yet applied to production — see that
+migration's header and `docs/adr/` for status). Read this document, not the
+original P0 commit's version of it, as current.*
 
 ## Identity
 
@@ -41,6 +50,40 @@ Fine-grained permissions an action is checked against
 (`lib/agents/types.ts`): `READ`, `WRITE`, `SEND`, `EXECUTE`, `APPROVE`,
 `DELETE`, `FINANCIAL_ACTION`.
 
+## Tool definitions are the security authority (`lib/agents/toolRegistry.ts`)
+
+**A caller never supplies a permission.** Every registered `ToolDefinition`
+owns its own security classification — this is what a tool call is
+actually authorized against:
+
+```ts
+{
+  name, version,
+  intrinsicPermission: Permission,     // the ONE true permission — never caller-supplied
+  effectClass, sideEffectClass,        // audit classification
+  requiredReadScopes: string[],
+  requiredWriteScopes: string[],
+  minimumAutonomyTier: AutonomyTier,   // a per-tool floor, independent of agent.approval_policy
+  validateInput(input): {ok, value} | {ok:false, errors},
+  idempotent: boolean,
+  execute(input, ctx),
+}
+```
+
+The runtime's `PlannedToolCall` (what a caller supplies) is `{toolName,
+action, input}` — nothing else. There is no field anywhere a caller can
+set to declare, omit, forge, or downgrade a permission; `evaluateToolCall`
+reads `tool.intrinsicPermission` from the *registered* definition, looked
+up by `toolName`, never from caller input. See
+`lib/agents/permissions.test.ts` ("caller cannot bypass intrinsic tool
+policy by relabeling the operation") for the enforced proof, including that
+a decoy `permission` key inside a tool's own input payload has no effect —
+`evaluateToolCall` doesn't take a payload parameter at all.
+
+`validateInput` also runs before either execution or an approval request is
+created — a malformed call fails immediately and never reaches a human or
+the tool body.
+
 ## The four-tier autonomy model
 
 Every tool an agent might call is graded, per agent, in
@@ -58,43 +101,61 @@ agent is never silently trusted for something no one rated.
 
 ## The policy engine (`lib/agents/permissions.ts`)
 
-`evaluateToolCall(agent, { toolName, permission })` is the single entry
-point the runtime calls before invoking any tool. Pure function, no I/O —
-every decision is reconstructable from the agent row alone.
+`evaluateToolCall(agent, tool)` is the single entry point the runtime calls
+before invoking any tool — `tool` is the *registered* `ToolDefinition`,
+never a caller-declared shape. Pure function, no I/O — every decision is
+reconstructable from the agent row and the tool definition alone.
 
 ```
-1. agent.status !== 'active'              → deny
-2. toolName not in agent.allowed_tools    → deny
-3. resolve tier = approval_policy[toolName] ?? 'REQUIRE_APPROVAL'
-4. apply the permission floor (below)
-5. tier === 'HUMAN_ONLY'                  → deny (never queued for approval)
-   tier === 'REQUIRE_APPROVAL'            → require_approval
-   else (AUTO_EXECUTE*)                   → allow
+1. agent.status !== 'active'                        → deny
+2. tool.name not in agent.allowed_tools              → deny
+3. agent missing a required read/write scope         → deny (canRead/canWrite, actually enforced)
+4. resolve tier = strictest of:
+     a. approval_policy[tool.name] ?? 'REQUIRE_APPROVAL'
+     b. PERMISSION_FLOOR[tool.intrinsicPermission]
+     c. tool.minimumAutonomyTier
+5. tier === 'HUMAN_ONLY'                             → deny (never queued for approval)
+   tier === 'REQUIRE_APPROVAL'                       → require_approval
+   else (AUTO_EXECUTE*)                               → allow
 ```
 
 **Permission floors** (`PERMISSION_FLOOR` in `permissions.ts`) — a
 misconfigured `approval_policy` cannot silently grant autonomy the
-directive says must be earned:
+directive says must be earned. Keyed by `tool.intrinsicPermission`, never
+by anything a caller supplies:
 
+- `SEND` → never lower than `REQUIRE_APPROVAL`.
 - `DELETE` → never lower than `REQUIRE_APPROVAL`.
 - `FINANCIAL_ACTION` → never lower than `REQUIRE_APPROVAL`.
 - `APPROVE` → always `HUMAN_ONLY`. **An agent can never approve its own or
   another agent's action**, regardless of configuration.
 
+A tool's own `minimumAutonomyTier` is a second, independent floor —
+`draft_customer_message` sets `REQUIRE_APPROVAL` directly on the
+definition, on top of (redundantly with, deliberately — defense in depth)
+its `SEND` permission floor.
+
+`canRead`/`canWrite` check `tool.requiredReadScopes`/`requiredWriteScopes`
+against `agent.readScopes`/`writeScopes` (a `"*"` entry satisfies any
+scope) — these were unused utility functions before Slice A; they are now
+load-bearing in step 3 above.
+
 See `lib/agents/permissions.test.ts` for the full table of enforced cases,
-including the deliberately-misconfigured-policy cases the floor exists for.
+including the deliberately-misconfigured-policy cases the floors exist
+for, and the scope-enforcement cases.
 
 ## Approvals
 
-`approvals` (migration `012`): `requested_action`, `payload`, `risk_level`,
-`status` (`pending`/`approved`/`rejected`/`expired`/`executed`),
+`approvals` (migration `012`, hardened by migration `017`):
+`requested_action`, `payload`, `payload_digest`, `risk_level`, `status`
+(`pending`/`approved`/`rejected`/`expired`/**`executing`**/`executed`),
 `requested_by_type`/`id`, `approver_user_id`, `expires_at`,
 `execution_result`.
 
-`lib/approvals/service.ts` is the only write path:
+### The human-decision path (`lib/approvals/service.ts`)
 
 - `requestApproval` — called by the runtime when `evaluateToolCall` returns
-  `require_approval`.
+  `require_approval`. Requires `payloadDigest` (below) on every call.
 - `approveApproval` / `rejectApproval` — **require the caller to pass the
   approver's tenant role**, and refuse outright if it isn't `'owner'`. This
   mirrors how every other mutation in this codebase makes its authorization
@@ -104,7 +165,53 @@ including the deliberately-misconfigured-policy cases the floor exists for.
   double-approval) and auto-transition an expired approval to `'expired'`
   instead of allowing it through.
 
-See `lib/approvals/service.test.ts`.
+### The execution path (`lib/approvals/store.ts`, `lib/agents/runtime.ts`) — P0.9 Slice A
+
+Approved is not the same as executed. Execution is a separate, atomic,
+single-use claim:
+
+```
+pending → approved → executing → executed
+              ↘ rejected / expired (from pending)
+```
+
+- **`beginExecution(tenantId, id, expectedPayloadDigest)`** — one
+  conditional `UPDATE ... WHERE status = 'approved' AND payload_digest =
+  $digest`. Two concurrent callers can never both succeed (compare-and-
+  swap on `status`); a caller whose recomputed digest doesn't match
+  (payload mutated since approval — see below) can never succeed either.
+  Returns `null` on any failure to claim; the caller must not use a
+  follow-up read to decide whether to proceed — only to build a clearer
+  error message after the fact.
+- **`completeExecution(tenantId, id, executionResult)`** — `executing →
+  executed`, always, whether the underlying tool succeeded or failed (the
+  outcome is in `execution_result`). This is a **terminal, single-use**
+  transition, not a retry loop back to `approved` — retrying a failed
+  action requires a **new** approval request.
+
+**Payload binding** (`lib/approvals/payloadBinding.ts`): `payload_digest`
+is a SHA-256 hex digest over a canonical `{tenantId, agentId, agentRunId,
+toolName, action, payload}`, computed once when the approval is requested
+and recomputed at execution time from the approval's own stored identity
+plus the *current* `tool_calls` row. Any mutation to
+`tool_calls.request_summary` between those two points — or any mismatch in
+tenant/agent/run/tool/action — changes the recomputed digest, and
+`beginExecution`'s predicate simply never matches. This is what stops
+*"approval UI reviews payload A, tool executes modified payload B."*
+
+**The actual guarantee, stated plainly:** at-most-one-concurrent-executor +
+single-use + payload-bound. **Not** exactly-once delivery to the tool
+itself — a tool execution that fails after the CAS is won still lands on
+`executed` (terminal), not a second automatic attempt. This is safe today
+because every registered tool (`lib/agents/toolRegistry.ts`) is mock/safe
+with no external side effect; a future tool with a real external side
+effect must be idempotent on its own terms (`ToolDefinition.idempotent`
+exists for this — P0.9 Slice A does not yet wire retry-with-idempotency-key
+behavior on top of it, that's a P1 concern once a real tool needs it).
+
+See `lib/approvals/service.test.ts` (human-decision path) and
+`lib/approvals/execution.test.ts` + `lib/agents/runtime.test.ts`'s
+"approval safety" suite (CAS/digest/duplicate-resume/wrong-state paths).
 
 ## Runtime + observability (P0.7)
 
@@ -120,11 +227,24 @@ See `lib/approvals/service.test.ts`.
 5. Final `agent_runs.status`: `'awaiting_approval'` if anything is still
    pending approval, else `'failed'` if any tool failed, else `'succeeded'`.
 
-`resumeAfterApprovalDecision()` closes the loop: once a human decides a
-pending approval, it executes the originally-requested tool call (if
-approved) or marks it denied (if rejected), and completes the `agent_run`
-once nothing is left outstanding — genuinely resuming from durable state,
-not from in-memory continuation (see `lib/agents/runtime.test.ts`).
+`resumeAfterApprovalDecision()` closes the loop once a human decides a
+pending approval:
+
+- **approved** → attempts the `beginExecution` CAS (above); on success,
+  re-validates input (`tool.validateInput`) and executes; on any refusal
+  (lost the race, wrong state, or payload mismatch), the tool call is
+  marked `failed` with a specific reason and the tool is never invoked.
+- **rejected/expired** → marks the tool call `denied`, but only if it
+  isn't already in a terminal state — a duplicate resume call on an
+  already-resolved tool call is a safe no-op, not a re-mutation.
+- **pending/executing/already-executed** → safe no-op: returns the tool
+  call's current state unchanged. This is what makes a duplicate resume
+  call (the same approval resumed twice, by a caller bug or a genuine
+  race) harmless.
+
+The `agent_run` completes once nothing is left outstanding — genuinely
+resuming from durable state, not from in-memory continuation (see
+`lib/agents/runtime.test.ts`'s "approval safety" suite).
 
 Deliberately **not** an autonomous tool-use loop: the model is asked to
 reason once per run (proving "Model Gateway invoked" in the P0 exit
@@ -141,10 +261,48 @@ deliberately does not have an `input_context` JSONB blob. Populate it with
 a reference (a lead id, a conversation id) once a real agent needs input
 context; never copy full customer records into an audit log.
 
+## Built-in agent identity (P0.9 Slice A — Codex audit finding M-03)
+
+`lib/agents/seed.ts` no longer does list-then-insert (a real race: two
+concurrent seed calls could both pass the "does it exist" check before
+either inserted). `AgentStore.createIfAbsent` relies on a database
+uniqueness constraint — migration `017`'s partial unique index
+`uq_agents_tenant_builtin_type` on `(tenant_id, agent_type) WHERE
+agent_type <> 'custom'` — as the actual guarantee: attempt the insert,
+and on a unique-violation, read back the row that won. `'custom'` is
+excluded from the constraint so a tenant can still have unlimited
+bespoke agents; every named/built-in role (`dev_test`, `supervisor`, and
+the reserved specialist types) is a singleton per tenant. See
+`lib/agents/seed.test.ts`.
+
 ## Tenant isolation
 
-Every table above: `tenant_id NOT NULL`, RLS enabled, `SELECT` policy via
-`is_tenant_member()`. Every store in `lib/agents/*` and `lib/approvals/*`
-filters by `tenant_id` explicitly in every query (service-role bypasses
-RLS — see `docs/constitution/06_DATABASE_PRINCIPLES.md`). Pinned by
-`lib/tenantIsolation.test.ts`.
+Two independent layers, not one:
+
+1. **Application-level filtering** (in production today): every table has
+   `tenant_id NOT NULL`, RLS enabled, `SELECT` policy via
+   `is_tenant_member()`. Every store in `lib/agents/*` and
+   `lib/approvals/*` filters by `tenant_id` explicitly in every query
+   (service-role bypasses RLS — see
+   `docs/constitution/06_DATABASE_PRINCIPLES.md`). Pinned by
+   `lib/tenantIsolation.test.ts`. This layer does **not** protect against a
+   bug in that same application code writing a syntactically valid but
+   cross-tenant row (e.g. `tool_calls.tenant_id = A` while
+   `tool_calls.agent_run_id` actually belongs to tenant B) — the filtering
+   is correct only if the code that constructs the row is correct.
+2. **Database-level structural enforcement** (Codex P0 audit finding B-01;
+   written, reviewed, **NOT yet applied to production** — see migration
+   `017`'s header and `docs/adr/` for status): composite foreign keys
+   `(tenant_id, x) REFERENCES parent (tenant_id, id)` on every
+   agent_runs→agents, agent_runs→business_events, approvals→agents,
+   approvals→agent_runs, tool_calls→agent_runs, tool_calls→approvals,
+   model_invocations→agent_runs, and outcomes→agent_runs relationship.
+   This is the layer that catches the case layer 1 can't: a row is
+   rejected outright if its `tenant_id` doesn't match its parent's, even
+   from service-role code, even from a bug nobody anticipated. **This
+   layer is designed and migration-ready but not yet live** — do not claim
+   tenant integrity is structurally guaranteed until migration `017` is
+   applied; today it is enforced by layer 1 only. See
+   `lib/tenantConsistency.pg.test.ts` for the (currently skipped, not
+   executed) test suite that will prove layer 2 once it's applied
+   somewhere with a real Postgres connection.

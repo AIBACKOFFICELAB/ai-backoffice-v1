@@ -4,7 +4,7 @@ import { seedAgents } from "./seed";
 import { InMemoryAgentStore } from "./agentStore";
 import { InMemoryAgentRunStore } from "./runStore";
 import { InMemoryToolCallStore } from "./toolCallStore";
-import { DEFAULT_TOOL_REGISTRY } from "./toolRegistry";
+import { DEFAULT_TOOL_REGISTRY, draftCustomerMessageTool, AnyToolDefinition } from "./toolRegistry";
 import { InMemoryApprovalStore } from "@/lib/approvals/store";
 import { approveApproval } from "@/lib/approvals/service";
 import { InMemoryBusinessEventStore } from "@/lib/events/store";
@@ -150,5 +150,152 @@ describe("P0 end-to-end: business event -> agent run -> outcome", () => {
     expect(toolCallOutcomes[0].toolCall.status).toBe("denied");
     expect(toolCallOutcomes[0].approval).toBeNull();
     expect(agentRun.status).toBe("succeeded"); // nothing left pending — a denial isn't a failure of the run itself
+  });
+});
+
+describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit finding B-03)", () => {
+  async function setupApprovedButUnresolvedCall() {
+    const tenantId = "tenant-approval-safety";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+    const deps = { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY };
+
+    const { devTest } = await seedAgents(tenantId, agentStore);
+    const { agentRun, toolCallOutcomes } = await runAgent(
+      {
+        tenantId,
+        agentId: devTest.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [{ toolName: "draft_customer_message", action: "execute", input: { draft: "Original approved draft" } }],
+      },
+      deps
+    );
+    const approval = toolCallOutcomes[0].approval!;
+    await approveApproval(tenantId, approval.id, "owner-1", "owner", approvalStore);
+
+    return { tenantId, deps, agentRun, approval, toolCallStore, approvalStore };
+  }
+
+  it("two consumers racing the same approved approval — the tool body runs exactly once", async () => {
+    // Deliberately does NOT compare the two calls' RETURN VALUES against
+    // each other: InMemoryToolCallStore.update mutates and returns the
+    // same shared row object for every caller, so whichever write lands
+    // temporally last determines what BOTH callers' references read —
+    // comparing them would test the in-memory double's aliasing, not the
+    // approval CAS. The real invariant — "only one legitimate execution
+    // may win" — is that the tool's own side-effecting body runs once,
+    // which this counts directly. lib/approvals/execution.test.ts already
+    // proves the store-level CAS returns non-null exactly once; this test
+    // proves that guarantee actually prevents a second real execution when
+    // driven through the full runtime.
+    const tenantId = "tenant-race";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    let executionCount = 0;
+    const countingDraftTool: AnyToolDefinition = {
+      ...draftCustomerMessageTool,
+      async execute(input, ctx) {
+        executionCount += 1;
+        return draftCustomerMessageTool.execute(input, ctx);
+      },
+    };
+    const tools = { ...DEFAULT_TOOL_REGISTRY, [countingDraftTool.name]: countingDraftTool };
+    const deps = { agentStore, runStore, toolCallStore, approvalStore, gateway, tools };
+
+    const { devTest } = await seedAgents(tenantId, agentStore);
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "draft_customer_message", action: "execute", input: { draft: "Race me" } }] },
+      deps
+    );
+    const approval = toolCallOutcomes[0].approval!;
+    await approveApproval(tenantId, approval.id, "owner-1", "owner", approvalStore);
+
+    await Promise.all([
+      resumeAfterApprovalDecision(tenantId, approval.id, deps),
+      resumeAfterApprovalDecision(tenantId, approval.id, deps),
+    ]);
+
+    expect(executionCount).toBe(1);
+    const finalApproval = await approvalStore.getById(tenantId, approval.id);
+    expect(finalApproval?.status).toBe("executed");
+  });
+
+  it("duplicate resume after a successful execution is a safe no-op — never re-executes", async () => {
+    const { tenantId, deps, approval } = await setupApprovedButUnresolvedCall();
+
+    const first = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    expect(first.status).toBe("succeeded");
+
+    const second = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    // Safe no-op: returns the already-resolved tool call unchanged, not a
+    // second execution and not an error.
+    expect(second.id).toBe(first.id);
+    expect(second.status).toBe("succeeded");
+    expect(second.completedAt).toBe(first.completedAt);
+  });
+
+  it("refuses execution when the approved payload was mutated after approval (approval UI reviews A, tool must not execute B)", async () => {
+    const { tenantId, deps, approval, toolCallStore } = await setupApprovedButUnresolvedCall();
+
+    // Simulate tampering: something mutates the tool_call's recorded input
+    // after the human approved the original draft. request_summary is
+    // deliberately not part of the public UpdateToolCallInput surface (see
+    // toolCallStore.ts) — mutating it directly here is the point: this is
+    // the anomaly the payload digest exists to catch, not a supported
+    // operation.
+    const toolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
+    toolCall!.requestSummary = { draft: "A completely different, unapproved message" };
+
+    const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/payload binding verification failed/);
+
+    // And the approval itself was never consumed — it's still 'approved',
+    // not silently marked executed.
+    const approvalAfter = await deps.approvalStore.getById(tenantId, approval.id);
+    expect(approvalAfter?.status).toBe("approved");
+  });
+
+  it("rejecting the approval denies the tool call without ever executing it", async () => {
+    const { tenantId, deps, approval, toolCallStore } = await setupApprovedButUnresolvedCall();
+    // Override the 'approved' decision by rejecting instead (simulating a
+    // reject flow — approve() already ran in setup, so directly exercise
+    // the reject branch of resumeAfterApprovalDecision by forcing status).
+    await deps.approvalStore.decide(tenantId, approval.id, { status: "rejected" });
+
+    const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    expect(result.status).toBe("denied");
+    expect(result.error).toMatch(/rejected/);
+
+    const toolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
+    expect(toolCall?.status).toBe("denied");
+  });
+
+  it("resuming a still-pending approval is a safe no-op (decision not made yet)", async () => {
+    const tenantId = "tenant-approval-safety-pending";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+    const deps = { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY };
+
+    const { devTest } = await seedAgents(tenantId, agentStore);
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "draft_customer_message", action: "execute", input: { draft: "x" } }] },
+      deps
+    );
+    const approval = toolCallOutcomes[0].approval!;
+    expect(approval.status).toBe("pending");
+
+    const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    expect(result.status).toBe("requires_approval"); // unchanged — still waiting on a real decision
   });
 });

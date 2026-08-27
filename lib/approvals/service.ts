@@ -6,6 +6,7 @@ const defaultStore = new SupabaseApprovalStore();
 export async function requestApproval(input: RequestApprovalInput, store: ApprovalStore = defaultStore): Promise<Approval> {
   if (!input.tenantId) throw new Error("requestApproval requires tenantId");
   if (!input.requestedAction) throw new Error("requestApproval requires requestedAction");
+  if (!input.payloadDigest) throw new Error("requestApproval requires payloadDigest (see lib/approvals/payloadBinding.ts)");
   return store.create(input);
 }
 

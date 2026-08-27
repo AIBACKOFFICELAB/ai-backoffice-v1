@@ -116,6 +116,23 @@ P0 amendment below).
 | `outcomes` | Business-outcome attribution | `OUTCOME_ATTRIBUTION.md` |
 | `durable_jobs` | Execution queue (retries/backoff/dead-letter) | `docs/adr/0001-durable-execution-layer.md` |
 
+### P0.9 Slice A hardening (migration 017 — written, reviewed, NOT applied to production)
+
+`db/migrations/017_p0_agentic_foundation_hardening.sql` remediates the
+independent Codex P0 acceptance audit (findings B-01, B-03, M-03):
+composite `(tenant_id, x) REFERENCES parent (tenant_id, id)` foreign keys
+on every cross-table relationship among the tables above (replacing the
+single-column FKs from migrations `010`–`016`), a `payload_digest` column
+and an `'executing'` status on `approvals`, a uniqueness constraint on
+`tool_calls.approval_id`, and a partial unique index on
+`agents (tenant_id, agent_type)` excluding `'custom'`. See that file's
+header for the full verification record (exact constraint names, row
+counts, Postgres version) and `AGENT_SECURITY.md` for what each change
+enforces. **This migration has not been run against the live database** —
+the schema described in the table above (migrations `009`–`016`) is what's
+actually live; migration `017` is reviewed and ready but pending a
+deliberate apply step.
+
 New required environment variable:
 
 ```bash

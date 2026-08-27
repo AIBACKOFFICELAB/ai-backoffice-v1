@@ -63,8 +63,8 @@ describe("tenant isolation", () => {
 
   it("approvals: pending list and decisions are tenant-scoped", async () => {
     const store = new InMemoryApprovalStore();
-    const approvalA = await store.create({ tenantId: TENANT_A, requestedAction: "draft_customer_message.execute" });
-    await store.create({ tenantId: TENANT_B, requestedAction: "draft_customer_message.execute" });
+    const approvalA = await store.create({ tenantId: TENANT_A, requestedAction: "draft_customer_message.execute", payloadDigest: "digest-a" });
+    await store.create({ tenantId: TENANT_B, requestedAction: "draft_customer_message.execute", payloadDigest: "digest-b" });
 
     expect(await store.listByTenant(TENANT_A, { status: "pending" })).toHaveLength(1);
     await expect(store.decide(TENANT_B, approvalA.id, { status: "approved" })).rejects.toThrow();

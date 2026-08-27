@@ -2,11 +2,30 @@ import { randomUUID } from "crypto";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { Agent, AgentType, CreateAgentInput, UpdateAgentInput } from "./types";
 
+const UNIQUE_VIOLATION = "23505";
+
 export interface AgentStore {
   getById(tenantId: string, id: string): Promise<Agent | null>;
   listByTenant(tenantId: string, opts?: { agentType?: AgentType }): Promise<Agent[]>;
   create(input: CreateAgentInput): Promise<Agent>;
   update(tenantId: string, id: string, patch: UpdateAgentInput): Promise<Agent>;
+  /** The one row for this tenant + built-in agent_type, if any. Meaningful
+   * only for non-'custom' types — see migration 017's
+   * uq_agents_tenant_builtin_type partial unique index, which is the
+   * actual guarantee at most one such row can ever exist. */
+  findByBuiltinType(tenantId: string, agentType: AgentType): Promise<Agent | null>;
+  /**
+   * Idempotent creation (Codex P0 audit finding M-03): for any
+   * agentType !== 'custom', at most one row is ever created per
+   * (tenantId, agentType) — concurrent callers racing this method will see
+   * exactly one winner; the loser(s) get `created: false` and the winner's
+   * row back, never a duplicate and never an error. Relies on the database
+   * uniqueness constraint (migration 017) as the actual guarantee, not on
+   * an application-level list-then-insert check (which has an inherent
+   * race — the defect this replaces). 'custom' agents always create a new
+   * row, since multiple custom agents per tenant must remain possible.
+   */
+  createIfAbsent(input: CreateAgentInput): Promise<{ agent: Agent; created: boolean }>;
 }
 
 function mapRow(row: Record<string, any>): Agent {
@@ -29,6 +48,22 @@ function mapRow(row: Record<string, any>): Agent {
   };
 }
 
+function toInsertRow(input: CreateAgentInput) {
+  return {
+    tenant_id: input.tenantId,
+    agent_type: input.agentType,
+    name: input.name,
+    purpose: input.purpose ?? null,
+    status: input.status ?? "inactive",
+    allowed_tools: input.allowedTools ?? [],
+    read_scopes: input.readScopes ?? [],
+    write_scopes: input.writeScopes ?? [],
+    approval_policy: input.approvalPolicy ?? {},
+    model_policy: input.modelPolicy ?? {},
+    system_instructions: input.systemInstructions ?? null,
+  };
+}
+
 export class SupabaseAgentStore implements AgentStore {
   async getById(tenantId: string, id: string): Promise<Agent | null> {
     const supabase = await createServerSupabaseClient();
@@ -46,27 +81,32 @@ export class SupabaseAgentStore implements AgentStore {
     return (data ?? []).map(mapRow);
   }
 
+  async findByBuiltinType(tenantId: string, agentType: AgentType): Promise<Agent | null> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase.from("agents").select("*").eq("tenant_id", tenantId).eq("agent_type", agentType).maybeSingle();
+    if (error || !data) return null;
+    return mapRow(data);
+  }
+
   async create(input: CreateAgentInput): Promise<Agent> {
     const supabase = await createServerSupabaseClient();
-    const { data, error } = await supabase
-      .from("agents")
-      .insert({
-        tenant_id: input.tenantId,
-        agent_type: input.agentType,
-        name: input.name,
-        purpose: input.purpose ?? null,
-        status: input.status ?? "inactive",
-        allowed_tools: input.allowedTools ?? [],
-        read_scopes: input.readScopes ?? [],
-        write_scopes: input.writeScopes ?? [],
-        approval_policy: input.approvalPolicy ?? {},
-        model_policy: input.modelPolicy ?? {},
-        system_instructions: input.systemInstructions ?? null,
-      })
-      .select()
-      .single();
+    const { data, error } = await supabase.from("agents").insert(toInsertRow(input)).select().single();
     if (error) throw new Error(`[agents] create failed: ${error.message}`);
     return mapRow(data);
+  }
+
+  async createIfAbsent(input: CreateAgentInput): Promise<{ agent: Agent; created: boolean }> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase.from("agents").insert(toInsertRow(input)).select().single();
+
+    if (error) {
+      if (error.code === UNIQUE_VIOLATION && input.agentType !== "custom") {
+        const existing = await this.findByBuiltinType(input.tenantId, input.agentType);
+        if (existing) return { agent: existing, created: false };
+      }
+      throw new Error(`[agents] createIfAbsent failed: ${error.message}`);
+    }
+    return { agent: mapRow(data), created: true };
   }
 
   async update(tenantId: string, id: string, patch: UpdateAgentInput): Promise<Agent> {
@@ -99,7 +139,28 @@ export class InMemoryAgentStore implements AgentStore {
     return this.rows.filter((r) => r.tenantId === tenantId && (!opts.agentType || r.agentType === opts.agentType));
   }
 
+  async findByBuiltinType(tenantId: string, agentType: AgentType): Promise<Agent | null> {
+    return this.rows.find((r) => r.tenantId === tenantId && r.agentType === agentType) ?? null;
+  }
+
+  /** Enforces the same uniqueness rule migration 017's
+   * uq_agents_tenant_builtin_type partial index enforces in production —
+   * this is what lets tests exercise createIfAbsent's conflict-handling
+   * path without a live database. The check-then-push below is
+   * DELIBERATELY synchronous (no `await` between them, unlike
+   * findByBuiltinType which is only for post-conflict lookups) — an
+   * `await` here would reopen exactly the TOCTOU race this method exists
+   * to close, since two "concurrent" callers could both pass the check
+   * before either pushes. See lib/agents/seed.test.ts. */
   async create(input: CreateAgentInput): Promise<Agent> {
+    const conflicts = input.agentType !== "custom" && this.rows.some((r) => r.tenantId === input.tenantId && r.agentType === input.agentType);
+    if (conflicts) {
+      const conflict: Error & { code?: string } = new Error(
+        `duplicate key value violates unique constraint "uq_agents_tenant_builtin_type"`
+      );
+      conflict.code = UNIQUE_VIOLATION;
+      throw conflict;
+    }
     const now = new Date().toISOString();
     const agent: Agent = {
       id: randomUUID(),
@@ -120,6 +181,19 @@ export class InMemoryAgentStore implements AgentStore {
     };
     this.rows.push(agent);
     return agent;
+  }
+
+  async createIfAbsent(input: CreateAgentInput): Promise<{ agent: Agent; created: boolean }> {
+    try {
+      return { agent: await this.create(input), created: true };
+    } catch (error) {
+      const code = (error as { code?: string } | undefined)?.code;
+      if (code === UNIQUE_VIOLATION && input.agentType !== "custom") {
+        const existing = await this.findByBuiltinType(input.tenantId, input.agentType);
+        if (existing) return { agent: existing, created: false };
+      }
+      throw error;
+    }
   }
 
   async update(tenantId: string, id: string, patch: UpdateAgentInput): Promise<Agent> {

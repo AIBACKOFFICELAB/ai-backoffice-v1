@@ -1,6 +1,18 @@
-/** Approvals (P0.4). See docs/AGENT_SECURITY.md. */
+/** Approvals (P0.4, hardened P0.9 Slice A). See docs/AGENT_SECURITY.md. */
 
-export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "executed";
+/**
+ * pending -> approved -> executing -> executed, with rejected/expired as
+ * the other terminal states reachable from pending. 'executing' is new in
+ * Slice A: a durable marker that exactly one caller has won the
+ * compare-and-swap claim to execute this approval (see
+ * lib/approvals/store.ts::beginExecution). Once 'executing' is entered the
+ * approval always ends at 'executed' — success or failure of the
+ * underlying tool is recorded in execution_result, not represented by a
+ * different terminal status. Retrying a failed action requires a NEW
+ * approval request, not reusing this one — see AGENT_SECURITY.md for the
+ * documented guarantee this is (and isn't).
+ */
+export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "executing" | "executed";
 export type ApprovalRiskLevel = "low" | "medium" | "high" | "critical";
 
 export type Approval = {
@@ -16,6 +28,11 @@ export type Approval = {
   requestedById: string | null;
   approverUserId: string | null;
   reason: string | null;
+  /** SHA-256 hex digest binding this approval to the exact tenant/agent/
+   * run/tool/action/payload it was requested for — see
+   * lib/approvals/payloadBinding.ts. Required; every approval is created
+   * from a specific tool call in this codebase. */
+  payloadDigest: string;
   approvedAt: string | null;
   rejectedAt: string | null;
   expiresAt: string | null;
@@ -34,4 +51,5 @@ export type RequestApprovalInput = {
   requestedByType?: "agent" | "system";
   requestedById?: string | null;
   expiresAt?: string | null;
+  payloadDigest: string;
 };

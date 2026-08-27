@@ -83,6 +83,13 @@ same "service-role client + explicit `tenant_id` filter in every query"
 pattern already used by every existing table — see
 `docs/constitution/06_DATABASE_PRINCIPLES.md` and its P0 amendment.
 
+**P0.9 Slice A** (independent Codex acceptance audit remediation) hardened
+cross-table tenant consistency, tool authorization, and approval execution
+on top of this foundation — see `AGENT_SECURITY.md` for the current,
+accurate description of all three, and `db/migrations/017_p0_agentic_foundation_hardening.sql`
+for the schema change (written and reviewed; **not yet applied to
+production** — see that file's header for status).
+
 ## The compatibility-adapter pattern
 
 Per the P0 directive: *"existing workflow → compatibility adapter → new
