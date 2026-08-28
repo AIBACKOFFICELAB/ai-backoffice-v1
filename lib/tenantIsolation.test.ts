@@ -62,6 +62,7 @@ describe("tenant isolation", () => {
     decision: "allow" as const,
     reason: null,
     agentInstructionsVersion: 1,
+    agentInstructionsHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     agentConfiguredTier: "AUTO_EXECUTE" as const,
     requiredReadScopes: [],
     requiredWriteScopes: [],

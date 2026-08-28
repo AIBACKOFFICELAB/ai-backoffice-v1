@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { DurableJob, EnqueueJobInput, JobOutcome, JobHandlerDefinition, JobHandlerContext, DEFAULT_LEASE_DURATION_SECONDS } from "./types";
+import { DurableJob, EnqueueJobInput, JobOutcome, JobHandlerDefinition, JobHandlerContext, DEFAULT_LEASE_DURATION_SECONDS, computeEffectKey } from "./types";
 import { DurableJobStore, SupabaseDurableJobStore } from "./store";
 
 const defaultStore = new SupabaseDurableJobStore();
@@ -11,28 +11,22 @@ export async function enqueueJob(input: EnqueueJobInput, store: DurableJobStore 
 }
 
 /**
- * Registers a job handler, enforcing the declaration half of the
- * effect-idempotency contract at registration time (P0.9 Slice B, finding
- * B-05): a `consequential: true` handler that declares no
- * `deriveEffectKey` is rejected outright. This is the mechanism that keeps
- * a future non-idempotent, customer-facing/financial handler from being
- * silently wired up for automatic durable retry without having committed
- * to a stable effect key. See the full contract in
- * lib/execution/types.ts::JobHandlerDefinition.
+ * Registers a job handler. Light structural validation only (P0.9 Slice B
+ * correction 2): the effect-key stability guarantee no longer depends on
+ * anything a handler declares — see computeEffectKey() in types.ts, which
+ * the runtime computes unconditionally for every handler. This function
+ * still exists as the single registration entry point (so a future,
+ * stronger check has one place to live) and to catch an obviously
+ * malformed definition early rather than at first invocation.
  */
 export function registerJobHandler(def: JobHandlerDefinition): JobHandlerDefinition {
-  if (def.consequential && !def.deriveEffectKey) {
-    throw new Error(
-      `[durable_jobs] handler '${def.jobType}' is marked consequential but declares no deriveEffectKey — a ` +
-        "non-idempotent, customer-facing/financial effect must declare a stable effect-key derivation before it " +
-        "can be registered for automatic durable retry (see lib/execution/types.ts::JobHandlerDefinition)"
-    );
+  if (!def.jobType) {
+    throw new Error("[durable_jobs] a job handler must declare a non-empty jobType");
+  }
+  if (!Number.isInteger(def.version) || def.version < 1) {
+    throw new Error(`[durable_jobs] handler '${def.jobType}' must declare an integer version >= 1`);
   }
   return def;
-}
-
-function defaultEffectKey(job: DurableJob): string {
-  return `${job.jobType}:${job.id}`;
 }
 
 /**
@@ -80,9 +74,14 @@ export async function processDueJobs(
     // CLAIMED job row (job.tenantId) — a global worker may discover jobs
     // across tenants, but the handler's context can never be pointed at a
     // caller-supplied tenant; it is always the claimed row's own tenant.
+    //
+    // P0.9 Slice B correction 2: effectKey is ALWAYS computeEffectKey(job)
+    // — runtime-owned, derived only from immutable job identity. No
+    // handler-supplied function is consulted; a handler has no way to
+    // change this value from one attempt to another.
     const ctx: JobHandlerContext = {
       tenantId: job.tenantId,
-      effectKey: handler.deriveEffectKey ? handler.deriveEffectKey(job) : defaultEffectKey(job),
+      effectKey: computeEffectKey(job),
       heartbeat: async () => (await store.renewLease(job.tenantId, job.id, leaseToken, leaseDurationSeconds)) !== null,
     };
 

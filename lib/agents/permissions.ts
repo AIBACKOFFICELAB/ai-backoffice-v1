@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { Agent, AutonomyTier, Permission } from "./types";
 import { AnyToolDefinition } from "./toolRegistry";
 
@@ -59,7 +60,22 @@ export type PolicySnapshot = {
   resolvedTier: AutonomyTier | null;
   decision: PolicyDecision["decision"];
   reason: string | null;
+  /** Human-readable metadata only (P0.9 Slice B correction 3) — NOT the
+   * authoritative historical identity. AgentStore.update() advances this
+   * on a best-effort, non-atomic basis when systemInstructions actually
+   * changes value (see lib/agents/agentStore.ts); a race between two
+   * concurrent updates to the same agent's instructions could under-count
+   * it by one. Use agentInstructionsHash below to reconstruct exactly
+   * which instructions were evaluated. */
   agentInstructionsVersion: number;
+  /** SHA-256 hex digest of the EXACT system instructions text evaluated
+   * for this decision — `SHA-256(systemInstructions ?? "")`, computed at
+   * evaluation time and copied by value into this immutable snapshot. This
+   * is the authoritative historical identity: it stays correct even if
+   * instructionsVersion was never bumped for a given edit, and a mutation
+   * to the agent's CURRENT systemInstructions after this snapshot was
+   * taken can never change it. See hashInstructions() below. */
+  agentInstructionsHash: string;
   /** What the agent's approval_policy had configured for this tool at
    * evaluation time, before the PERMISSION_FLOOR/tool-floor combination in
    * resolveTier() — null if the tool was unregistered or nothing was
@@ -71,6 +87,17 @@ export type PolicySnapshot = {
   agentWriteScopes: string[];
   evaluatedAt: string;
 };
+
+/**
+ * SHA-256 hex digest of an agent's system instructions text, normalized so
+ * null/undefined hash identically to the empty string (P0.9 Slice B
+ * correction 3): `SHA-256(systemInstructions ?? "")`. Deterministic and
+ * pure — the sole source of truth buildPolicySnapshot uses for
+ * agentInstructionsHash below.
+ */
+export function hashInstructions(systemInstructions: string | null | undefined): string {
+  return createHash("sha256").update(systemInstructions ?? "", "utf8").digest("hex");
+}
 
 /**
  * Builds the immutable snapshot for one tool-call policy evaluation. Handles
@@ -97,6 +124,7 @@ export function buildPolicySnapshot(
     decision: decision.decision,
     reason: decision.decision === "deny" ? decision.reason : null,
     agentInstructionsVersion: agent.instructionsVersion,
+    agentInstructionsHash: hashInstructions(agent.systemInstructions),
     agentConfiguredTier: tool ? agent.approvalPolicy[tool.name] ?? null : null,
     requiredReadScopes: tool?.requiredReadScopes ?? [],
     requiredWriteScopes: tool?.requiredWriteScopes ?? [],

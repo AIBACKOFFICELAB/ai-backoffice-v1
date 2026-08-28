@@ -75,8 +75,8 @@ export type JobOutcome =
   | { jobId: string; status: "stale"; reason: string };
 
 /**
- * Effect-idempotency contract (P0.9 Slice B, finding B-05). A registered
- * job handler.
+ * Effect-idempotency contract (P0.6 finding B-05, hardened P0.9 Slice B
+ * correction 2). A registered job handler.
  *
  * EXPLICIT GUARANTEE — read before registering a consequential handler:
  * the durable-jobs layer guarantees AT-LEAST-ONCE execution with a STABLE,
@@ -92,10 +92,18 @@ export type JobOutcome =
  * afterward is sufficient, and never assume calling the same job twice is
  * safe just because the job id is the same.
  *
- * `registerJobHandler` enforces the declaration half of this contract at
- * registration time: a consequential handler without a `deriveEffectKey`
- * is rejected outright (see queue.ts) rather than silently defaulting to
- * "probably fine."
+ * AUTHORITY (P0.9 Slice B correction 2): the runtime, not handler code, is
+ * exclusively responsible for computing ctx.effectKey — see
+ * computeEffectKey() below. Earlier this interface exposed an optional
+ * `deriveEffectKey(job)` callback a handler could supply; that was removed
+ * because it could not actually guarantee retry-invariance (a handler is
+ * free to read mutable DurableJob fields like `attempts`, lease state, or
+ * timestamps, or use randomness/current time, none of which the runtime
+ * could police). A handler has NO way to influence ctx.effectKey — it is
+ * always `computeEffectKey(job)`, derived exclusively from identity that is
+ * set once at enqueue() and never changes across claims/reclaims/retries.
+ * `registerJobHandler` performs light structural validation only; the
+ * effect-key guarantee no longer depends on anything a handler declares.
  */
 export interface JobHandlerDefinition {
   jobType: string;
@@ -104,31 +112,48 @@ export interface JobHandlerDefinition {
   /** true if invoking this handler can cause a real external or
    * customer-facing/financial effect that must not be blindly repeated.
    * P0 ships no such handler — every P0 handler is `consequential: false`
-   * (see handlers.ts) — this field exists so a FUTURE handler cannot be
-   * silently wired up as "durable and retried" without declaring how it
-   * stays idempotent across retries. */
+   * (see handlers.ts) — this field exists as an explicit, auditable
+   * declaration that a FUTURE handler's author must make: acknowledging
+   * that ctx.effectKey (runtime-owned, see above) must be used via
+   * provider-supported idempotency or an effect ledger to get real
+   * exactly-once behavior for that effect. This is documentation/audit
+   * metadata — see computeEffectKey() for the actual stability guarantee,
+   * which holds for every handler regardless of this flag. */
   consequential: boolean;
-  /** Required when consequential is true (enforced by registerJobHandler).
-   * Must return the SAME key for the same logical job across every
-   * claim/reclaim/retry — the default (job.id-derived) key already
-   * satisfies this, so most handlers can omit it; override only when a
-   * different stable identity (e.g. a caller-supplied idempotencyKey) is
-   * more appropriate for the downstream provider. */
-  deriveEffectKey?: (job: DurableJob) => string;
   run(job: DurableJob, ctx: JobHandlerContext): Promise<void>;
+}
+
+/**
+ * The runtime-owned, authoritative effect-key derivation (P0.9 Slice B
+ * correction 2). Computed EXCLUSIVELY from immutable durable-job identity:
+ *
+ *   - job.idempotencyKey, if the enqueue() caller supplied one — it is set
+ *     once at enqueue and never changes; or otherwise
+ *   - `${job.jobType}:${job.id}` — job.id is assigned once at enqueue and
+ *     never changes either.
+ *
+ * Neither input is affected by attempts, lease_token, locked_by, timestamps,
+ * or any other field that changes across a claim/reclaim/retry — so the
+ * result is stable BY CONSTRUCTION, not by convention or handler
+ * cooperation. No handler input is read; a handler has no way to override
+ * this value (see JobHandlerDefinition's doc comment above).
+ */
+export function computeEffectKey(job: Pick<DurableJob, "jobType" | "id" | "idempotencyKey">): string {
+  return job.idempotencyKey ? `idempotency:${job.idempotencyKey}` : `${job.jobType}:${job.id}`;
 }
 
 export type JobHandlerContext = {
   /** Derived from the CLAIMED job row itself, never from caller-supplied
    * context (B.6) — the authoritative tenant for this execution. */
   tenantId: string;
-  /** Stable across every retry of this logical job — see
-   * JobHandlerDefinition's doc comment above for the full contract. */
+  /** Always `computeEffectKey(job)` — stable across every retry of this
+   * logical job. See JobHandlerDefinition's and computeEffectKey's doc
+   * comments above for the full contract and authority model. */
   effectKey: string;
   /** Renews this job's lease. Requires this handler to still hold the
-   * active lease it was invoked under (B.4) — returns false, rather than
-   * throwing, if the lease has already been lost/superseded, so a
-   * long-running handler can check it and abort cleanly instead of
-   * continuing to do work nobody will record. */
+   * active, UNEXPIRED lease it was invoked under (B.4) — returns false,
+   * rather than throwing, if the lease has already been lost, superseded,
+   * or expired, so a long-running handler can check it and abort cleanly
+   * instead of continuing to do work nobody will record. */
   heartbeat(): Promise<boolean>;
 };

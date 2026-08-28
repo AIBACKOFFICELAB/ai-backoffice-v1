@@ -120,7 +120,23 @@ export class SupabaseAgentStore implements AgentStore {
     if (patch.writeScopes !== undefined) row.write_scopes = patch.writeScopes;
     if (patch.approvalPolicy !== undefined) row.approval_policy = patch.approvalPolicy;
     if (patch.modelPolicy !== undefined) row.model_policy = patch.modelPolicy;
-    if (patch.systemInstructions !== undefined) row.system_instructions = patch.systemInstructions;
+    if (patch.systemInstructions !== undefined) {
+      row.system_instructions = patch.systemInstructions;
+      // P0.9 Slice B correction 3: advance the human-readable version
+      // counter only when systemInstructions actually CHANGES VALUE — not
+      // merely because it's present in the patch, and never for an
+      // unrelated-field update. Best-effort / non-atomic: this is a
+      // read-then-write, so two concurrent updates to the SAME agent's
+      // instructions could under-count by one. That's an accepted,
+      // documented limitation for P0.9 — the immutable, per-decision
+      // agentInstructionsHash on PolicySnapshot (see
+      // lib/agents/permissions.ts::hashInstructions) is the authoritative
+      // historical identity, not this counter.
+      const current = await this.getById(tenantId, id);
+      if (current && current.systemInstructions !== patch.systemInstructions) {
+        row.instructions_version = current.instructionsVersion + 1;
+      }
+    }
 
     const { data, error } = await supabase.from("agents").update(row).eq("tenant_id", tenantId).eq("id", id).select().single();
     if (error) throw new Error(`[agents] update failed: ${error.message}`);
@@ -199,6 +215,13 @@ export class InMemoryAgentStore implements AgentStore {
   async update(tenantId: string, id: string, patch: UpdateAgentInput): Promise<Agent> {
     const existing = await this.getById(tenantId, id);
     if (!existing) throw new Error(`agent ${id} not found for tenant ${tenantId}`);
+    // P0.9 Slice B correction 3: mirror the Supabase store's rule exactly —
+    // advance instructionsVersion only when systemInstructions is present
+    // in the patch AND actually differs from the current value. Read the
+    // pre-patch value BEFORE Object.assign below overwrites it.
+    if (patch.systemInstructions !== undefined && patch.systemInstructions !== existing.systemInstructions) {
+      existing.instructionsVersion += 1;
+    }
     Object.assign(existing, patch, { updatedAt: new Date().toISOString() });
     return existing;
   }

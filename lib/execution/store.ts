@@ -27,14 +27,19 @@ export interface DurableJobStore {
    * `max_attempts`).
    */
   claimBatch(workerId: string, limit?: number): Promise<DurableJob[]>;
-  /** Requires proof of ownership: tenant, job id, status='running', AND the
-   * exact lease token this worker was issued at claim time (B.3). Returns
-   * null — never throws — if that lease is no longer the active one. */
+  /** Requires proof of ownership: tenant, job id, status='running', the
+   * exact lease token this worker was issued at claim time (B.3), AND an
+   * UNEXPIRED lease (lock_expires_at > now — P0.9 Slice B correction 1: a
+   * matching token alone is not enough once the lease has expired, since
+   * another worker may already be entitled to reclaim). Returns null —
+   * never throws — if that lease is no longer active. */
   complete(tenantId: string, id: string, leaseToken: string): Promise<DurableJob | null>;
   fail(tenantId: string, id: string, errorMessage: string, leaseToken: string): Promise<DurableJob | null>;
-  /** Extends an active lease. Requires the same ownership proof as
-   * complete/fail (B.4) — a stale or incorrect worker's heartbeat is
-   * refused (returns null), it can never extend someone else's lease. */
+  /** Extends an active, UNEXPIRED lease. Requires the same ownership proof
+   * as complete/fail (B.4) — a stale or incorrect worker's heartbeat is
+   * refused (returns null); an already-expired lease cannot be
+   * resurrected by a late heartbeat, it can only be reclaimed by a new
+   * worker through claimBatch. */
   renewLease(tenantId: string, id: string, leaseToken: string, extendBySeconds?: number): Promise<DurableJob | null>;
   getById(tenantId: string, id: string): Promise<DurableJob | null>;
   listByTenant(tenantId: string, opts?: { status?: DurableJob["status"] }): Promise<DurableJob[]>;
@@ -188,31 +193,54 @@ export class SupabaseDurableJobStore implements DurableJobStore {
     const now = new Date().toISOString();
     const { data, error } = await supabase
       .from("durable_jobs")
-      .update({ status: "succeeded", completed_at: now, updated_at: now, locked_by: null, locked_at: null, lock_expires_at: null })
+      .update({
+        status: "succeeded",
+        completed_at: now,
+        updated_at: now,
+        locked_by: null,
+        locked_at: null,
+        lock_expires_at: null,
+        // P0.9 Slice B correction 1: a terminal row keeps no active
+        // ownership credential — historical ownership is reconstructable
+        // from locked_by/locked_at/logs, an expired/consumed lease_token
+        // has no further purpose and must not linger on a succeeded row.
+        lease_token: null,
+      })
       .eq("tenant_id", tenantId)
       .eq("id", id)
       .eq("status", "running")
       .eq("lease_token", leaseToken)
+      // P0.9 Slice B correction 1: a matching token is not sufficient by
+      // itself — the lease must still be ACTIVE. Without this, a worker
+      // whose lease already expired (and who may have already been
+      // superseded by a reclaim) could still complete the job out from
+      // under the new owner.
+      .gt("lock_expires_at", now)
       .select();
     if (error) throw new Error(`[durable_jobs] complete failed: ${error.message}`);
-    if (!data || data.length !== 1) return null; // lease superseded, already terminal, or never owned by this caller
+    if (!data || data.length !== 1) return null; // lease superseded, expired, already terminal, or never owned by this caller
     return mapRow(data[0]);
   }
 
   async fail(tenantId: string, id: string, errorMessage: string, leaseToken: string): Promise<DurableJob | null> {
     // Advisory pre-read only, to compute the backoff/exhaustion decision —
-    // the actual transition below is still a CAS keyed on the lease token,
-    // so a lease lost between this read and the write below correctly
-    // fails the update rather than corrupting state (attempts itself is
-    // never written here — see the attempts field's doc comment in
-    // types.ts; it can only move while this worker holds the very lease
-    // this call's WHERE clause requires, so it cannot have changed unless
-    // the lease already moved on, in which case the CAS below no-ops).
+    // the actual transition below is still a CAS keyed on the lease token
+    // AND lease expiry, so a lease lost (or expired) between this read and
+    // the write below correctly fails the update rather than corrupting
+    // state (attempts itself is never written here — see the attempts
+    // field's doc comment in types.ts; it can only move while this worker
+    // holds the very lease this call's WHERE clause requires, so it cannot
+    // have changed unless the lease already moved on, in which case the
+    // CAS below no-ops).
     const current = await this.getById(tenantId, id);
     if (!current) return null;
 
+    // One captured `now` for both the exhaustion/backoff decision and the
+    // CAS expiry check below, per the correction's guidance.
+    const now = new Date();
+    const nowIso = now.toISOString();
     const exhausted = current.attempts >= current.maxAttempts;
-    const nextAttemptAt = exhausted ? current.nextAttemptAt : new Date(Date.now() + computeBackoffSeconds(current.attempts) * 1000).toISOString();
+    const nextAttemptAt = exhausted ? current.nextAttemptAt : new Date(now.getTime() + computeBackoffSeconds(current.attempts) * 1000).toISOString();
 
     const supabase = await createServerSupabaseClient();
     const { data, error } = await supabase
@@ -225,12 +253,16 @@ export class SupabaseDurableJobStore implements DurableJobStore {
         locked_at: null,
         lock_expires_at: null,
         lease_token: null,
-        updated_at: new Date().toISOString(),
+        updated_at: nowIso,
       })
       .eq("tenant_id", tenantId)
       .eq("id", id)
       .eq("status", "running")
       .eq("lease_token", leaseToken)
+      // P0.9 Slice B correction 1: require an active (unexpired) lease —
+      // a stale worker whose lease already expired must not be able to
+      // report a failure for a job another worker may already own.
+      .gt("lock_expires_at", nowIso)
       .select();
     if (error) throw new Error(`[durable_jobs] fail-transition failed: ${error.message}`);
     if (!data || data.length !== 1) return null;
@@ -239,14 +271,20 @@ export class SupabaseDurableJobStore implements DurableJobStore {
 
   async renewLease(tenantId: string, id: string, leaseToken: string, extendBySeconds = DEFAULT_LEASE_DURATION_SECONDS): Promise<DurableJob | null> {
     const supabase = await createServerSupabaseClient();
-    const now = new Date().toISOString();
+    const now = new Date();
+    const nowIso = now.toISOString();
     const { data, error } = await supabase
       .from("durable_jobs")
-      .update({ lock_expires_at: new Date(Date.now() + extendBySeconds * 1000).toISOString(), updated_at: now })
+      .update({ lock_expires_at: new Date(now.getTime() + extendBySeconds * 1000).toISOString(), updated_at: nowIso })
       .eq("tenant_id", tenantId)
       .eq("id", id)
       .eq("status", "running")
       .eq("lease_token", leaseToken)
+      // P0.9 Slice B correction 1: an already-expired lease cannot be
+      // resurrected by a late heartbeat — only an ACTIVE lease may be
+      // renewed. Once expired, only claimBatch's reclaim path can move
+      // the job forward again, under a brand-new lease_token.
+      .gt("lock_expires_at", nowIso)
       .select();
     if (error) throw new Error(`[durable_jobs] renewLease failed: ${error.message}`);
     if (!data || data.length !== 1) return null;
@@ -361,21 +399,36 @@ export class InMemoryDurableJobStore implements DurableJobStore {
     return claimed;
   }
 
+  /** True iff the job currently holds an ACTIVE (unexpired) lease — mirrors
+   * the `.gt("lock_expires_at", now)` predicate the Supabase store adds to
+   * complete/fail/renewLease (P0.9 Slice B correction 1). A queued job
+   * (lockExpiresAt === null) is never "active" by this check either,
+   * though that path is already excluded by the status==='running'
+   * check every caller performs alongside this one. */
+  private hasActiveLease(job: DurableJob, nowIso: string): boolean {
+    return job.lockExpiresAt !== null && job.lockExpiresAt > nowIso;
+  }
+
   async complete(tenantId: string, id: string, leaseToken: string): Promise<DurableJob | null> {
     const job = this.rows.find((r) => r.tenantId === tenantId && r.id === id);
-    if (!job || job.status !== "running" || job.leaseToken !== leaseToken) return null;
+    const nowIso = new Date().toISOString();
+    if (!job || job.status !== "running" || job.leaseToken !== leaseToken || !this.hasActiveLease(job, nowIso)) return null;
     job.status = "succeeded";
-    job.completedAt = new Date().toISOString();
-    job.updatedAt = job.completedAt;
+    job.completedAt = nowIso;
+    job.updatedAt = nowIso;
     job.lockedBy = null;
     job.lockedAt = null;
     job.lockExpiresAt = null;
+    // P0.9 Slice B correction 1: no active ownership credential remains on
+    // a terminal row.
+    job.leaseToken = null;
     return job;
   }
 
   async fail(tenantId: string, id: string, errorMessage: string, leaseToken: string): Promise<DurableJob | null> {
     const job = this.rows.find((r) => r.tenantId === tenantId && r.id === id);
-    if (!job || job.status !== "running" || job.leaseToken !== leaseToken) return null;
+    const nowIso = new Date().toISOString();
+    if (!job || job.status !== "running" || job.leaseToken !== leaseToken || !this.hasActiveLease(job, nowIso)) return null;
 
     const exhausted = job.attempts >= job.maxAttempts;
     job.status = exhausted ? "dead_letter" : "queued";
@@ -385,15 +438,18 @@ export class InMemoryDurableJobStore implements DurableJobStore {
     job.lockedAt = null;
     job.lockExpiresAt = null;
     job.leaseToken = null;
-    job.updatedAt = new Date().toISOString();
+    job.updatedAt = nowIso;
     return job;
   }
 
   async renewLease(tenantId: string, id: string, leaseToken: string, extendBySeconds = DEFAULT_LEASE_DURATION_SECONDS): Promise<DurableJob | null> {
     const job = this.rows.find((r) => r.tenantId === tenantId && r.id === id);
-    if (!job || job.status !== "running" || job.leaseToken !== leaseToken) return null;
+    const nowIso = new Date().toISOString();
+    // P0.9 Slice B correction 1: an already-expired lease cannot be
+    // resurrected by a late heartbeat, even with the correct token.
+    if (!job || job.status !== "running" || job.leaseToken !== leaseToken || !this.hasActiveLease(job, nowIso)) return null;
     job.lockExpiresAt = new Date(Date.now() + extendBySeconds * 1000).toISOString();
-    job.updatedAt = new Date().toISOString();
+    job.updatedAt = nowIso;
     return job;
   }
 

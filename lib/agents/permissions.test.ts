@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { evaluateToolCall, canRead, canWrite, buildPolicySnapshot, PolicyDecision } from "./permissions";
+import { evaluateToolCall, canRead, canWrite, buildPolicySnapshot, hashInstructions, PolicyDecision } from "./permissions";
+import { createHash } from "crypto";
 import { Agent, AutonomyTier, Permission } from "./types";
 import { AnyToolDefinition, ToolContext, ToolResult } from "./toolRegistry";
 
@@ -277,6 +278,72 @@ describe("buildPolicySnapshot", () => {
     // from "what would happen if evaluated again today."
     const decisionNow = evaluateToolCall(agent, tool);
     expect(decisionNow.decision).toBe("deny");
+  });
+});
+
+/**
+ * Trustworthy instruction identity (P0.9 Slice B correction 3). Before this
+ * correction, PolicySnapshot's only instruction identity was the numeric
+ * agentInstructionsVersion, which AgentStore.update() could leave stale —
+ * two genuinely different system_instructions values could both report
+ * version 1. agentInstructionsHash is a SHA-256 digest of the exact text
+ * evaluated, computed at buildPolicySnapshot() time and copied by value —
+ * it is correct regardless of whether the numeric version was maintained.
+ */
+describe("hashInstructions / agentInstructionsHash (B-07 correction 3)", () => {
+  it("test 1: the snapshot's instruction hash corresponds to the agent's actual instructions", () => {
+    const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, systemInstructions: "Be concise and helpful." });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });
+    const decision = evaluateToolCall(agent, tool);
+    const snapshot = buildPolicySnapshot(agent, tool, "ping", "execute", decision);
+
+    const expected = createHash("sha256").update("Be concise and helpful.", "utf8").digest("hex");
+    expect(snapshot.agentInstructionsHash).toBe(expected);
+    expect(snapshot.agentInstructionsHash).toBe(hashInstructions(agent.systemInstructions));
+  });
+
+  it("test 2: mutating system instructions produces a DIFFERENT snapshot hash on the next evaluation", () => {
+    const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, systemInstructions: "Version A instructions" });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });
+    const snapshotA = buildPolicySnapshot(agent, tool, "ping", "execute", evaluateToolCall(agent, tool));
+
+    agent.systemInstructions = "Version B instructions — completely different";
+    const snapshotB = buildPolicySnapshot(agent, tool, "ping", "execute", evaluateToolCall(agent, tool));
+
+    expect(snapshotA.agentInstructionsHash).not.toBe(snapshotB.agentInstructionsHash);
+  });
+
+  it("test 3: mutating an unrelated agent field does not change the instruction identity", () => {
+    const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, systemInstructions: "Stable instructions" });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });
+    const before = hashInstructions(agent.systemInstructions);
+
+    agent.name = "Renamed Agent";
+    agent.readScopes = ["something-new"];
+    agent.status = "paused";
+
+    expect(hashInstructions(agent.systemInstructions)).toBe(before);
+  });
+
+  it("test 4: a historical snapshot's hash remains unchanged after the agent's current instructions later change", () => {
+    const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, systemInstructions: "Original instructions" });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });
+    const snapshot = buildPolicySnapshot(agent, tool, "ping", "execute", evaluateToolCall(agent, tool));
+    const originalHash = snapshot.agentInstructionsHash;
+
+    agent.systemInstructions = "Instructions rewritten after the fact";
+
+    expect(snapshot.agentInstructionsHash).toBe(originalHash);
+    expect(snapshot.agentInstructionsHash).not.toBe(hashInstructions(agent.systemInstructions));
+  });
+
+  it("test 5: null and undefined instructions hash identically and deterministically to the empty string", () => {
+    const emptyHash = createHash("sha256").update("", "utf8").digest("hex");
+    expect(hashInstructions(null)).toBe(emptyHash);
+    expect(hashInstructions(undefined)).toBe(emptyHash);
+    expect(hashInstructions(null)).toBe(hashInstructions(undefined));
+    // Deterministic across repeated calls.
+    expect(hashInstructions("same text")).toBe(hashInstructions("same text"));
   });
 });
 

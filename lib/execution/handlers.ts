@@ -13,8 +13,10 @@ import { registerJobHandler } from "./queue";
  * or customer-facing/financial effect (see the P0.9 Slice B effect-
  * idempotency contract in lib/execution/types.ts::JobHandlerDefinition). A
  * future handler that DOES have such an effect must set
- * `consequential: true` and declare `deriveEffectKey` — registerJobHandler
- * enforces this at registration time; it is not optional documentation.
+ * `consequential: true` and MUST actually use ctx.effectKey (always
+ * runtime-computed — see types.ts::computeEffectKey) via a
+ * provider-supported idempotency mechanism or its own effect ledger; it is
+ * not optional documentation.
  */
 const diagnosticEchoHandler: JobHandlerDefinition = registerJobHandler({
   jobType: "diagnostic.echo",

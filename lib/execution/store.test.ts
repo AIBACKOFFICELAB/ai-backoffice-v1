@@ -221,3 +221,137 @@ describe("durable job leases (B.1-B.4)", () => {
     expect(tenantIds).toEqual(["tenant-a", "tenant-b"]);
   });
 });
+
+/**
+ * Lease expiry enforcement (P0.9 Slice B correction 1). Independent
+ * verification found that complete()/fail()/renewLease() validated
+ * tenant_id + job id + status='running' + lease_token, but NOT that the
+ * lease was still unexpired — so an expired worker could still complete,
+ * fail, or heartbeat a job before any other worker happened to reclaim it.
+ * These tests exercise refusal from EXPIRY ALONE, distinct from the
+ * "durable job leases (B.1-B.4)" describe block above, which mostly tests
+ * refusal AFTER a second worker has already reclaimed.
+ */
+describe("lease expiry enforcement (correction 1)", () => {
+  async function claimAndExpire(store: InMemoryDurableJobStore, tenantId = "t1") {
+    const { job } = await store.enqueue({ tenantId, jobType: "demo", maxAttempts: 5 });
+    const [claimed] = await store.claimBatch("worker-a", 1);
+    // InMemoryDurableJobStore returns/mutates the SAME underlying row
+    // object for every caller (see lib/execution/store.ts) — `claimed` and
+    // `stuck` below are literally the same reference, and a later reclaim
+    // (e.g. by worker-b in test 5) would mutate `claimed` too. Capture the
+    // lease token as a primitive string NOW, before any such mutation, so
+    // callers testing "old worker's stale token" always use the value that
+    // was genuinely issued to worker-a, not whatever the row currently
+    // holds.
+    const staleLeaseToken = claimed.leaseToken!;
+    const stuck = await store.getById(tenantId, job.id);
+    stuck!.lockExpiresAt = new Date(Date.now() - 1000).toISOString();
+    return { job, claimed, staleLeaseToken };
+  }
+
+  it("test 1: expired lease — old worker's renewLease before any reclaim is refused", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job, staleLeaseToken } = await claimAndExpire(store);
+
+    const result = await store.renewLease("t1", job.id, staleLeaseToken);
+    expect(result).toBeNull();
+
+    // The row is untouched by the refused heartbeat — still expired,
+    // still holding the same (now-unusable) token, ready for reclaim.
+    const after = await store.getById("t1", job.id);
+    expect(after?.leaseToken).toBe(staleLeaseToken);
+    expect(new Date(after!.lockExpiresAt!).getTime()).toBeLessThan(Date.now());
+  });
+
+  it("test 2: expired lease — old worker's complete() before any reclaim is refused", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job, staleLeaseToken } = await claimAndExpire(store);
+
+    const result = await store.complete("t1", job.id, staleLeaseToken);
+    expect(result).toBeNull();
+
+    const after = await store.getById("t1", job.id);
+    expect(after?.status).toBe("running"); // NOT succeeded — the stale completion never landed
+  });
+
+  it("test 3: expired lease — old worker's fail() before any reclaim is refused", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job, staleLeaseToken } = await claimAndExpire(store);
+
+    const result = await store.fail("t1", job.id, "belated failure report", staleLeaseToken);
+    expect(result).toBeNull();
+
+    const after = await store.getById("t1", job.id);
+    expect(after?.status).toBe("running"); // NOT queued/dead_letter — the stale failure never landed
+    expect(after?.lastError).not.toBe("belated failure report");
+  });
+
+  it("test 4: an active lease immediately before expiry still permits heartbeat, complete, and fail", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job: jobForHeartbeat } = await store.enqueue({ tenantId: "t1", jobType: "demo" });
+    const [claim1] = await store.claimBatch("worker-a", 1);
+    // Lease is fresh (DEFAULT_LEASE_DURATION_SECONDS in the future) — well
+    // before expiry, not at the boundary, to keep this deterministic.
+    expect(new Date(claim1.lockExpiresAt!).getTime()).toBeGreaterThan(Date.now() + (DEFAULT_LEASE_DURATION_SECONDS - 10) * 1000);
+
+    const renewed = await store.renewLease("t1", jobForHeartbeat.id, claim1.leaseToken!);
+    expect(renewed).not.toBeNull();
+
+    const { job: jobForComplete } = await store.enqueue({ tenantId: "t1", jobType: "demo" });
+    const [claim2] = await store.claimBatch("worker-b", 1);
+    const completed = await store.complete("t1", jobForComplete.id, claim2.leaseToken!);
+    expect(completed?.status).toBe("succeeded");
+
+    const { job: jobForFail } = await store.enqueue({ tenantId: "t1", jobType: "demo", maxAttempts: 5 });
+    const [claim3] = await store.claimBatch("worker-c", 1);
+    const failed = await store.fail("t1", jobForFail.id, "transient", claim3.leaseToken!);
+    expect(failed?.status).toBe("queued");
+  });
+
+  it("test 5: expired lease reclaimed by worker B — worker A remains refused on every operation", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job, staleLeaseToken } = await claimAndExpire(store);
+    const [claimB] = await store.claimBatch("worker-b", 1);
+    expect(claimB.id).toBe(job.id);
+    // claimB's token must genuinely differ from worker A's original token —
+    // otherwise the refusals below would be trivially true for the wrong
+    // reason (comparing a token against itself).
+    expect(claimB.leaseToken).not.toBe(staleLeaseToken);
+
+    expect(await store.renewLease("t1", job.id, staleLeaseToken)).toBeNull();
+    expect(await store.complete("t1", job.id, staleLeaseToken)).toBeNull();
+    expect(await store.fail("t1", job.id, "worker A's stale report", staleLeaseToken)).toBeNull();
+
+    // Worker B's ownership is intact throughout.
+    const after = await store.getById("t1", job.id);
+    expect(after?.leaseToken).toBe(claimB.leaseToken);
+    expect(after?.status).toBe("running");
+  });
+
+  it("test 6: a heartbeat before expiry extends the lease so the old expiry no longer makes it reclaimable", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job } = await store.enqueue({ tenantId: "t1", jobType: "demo" });
+    const [claimed] = await store.claimBatch("worker-a", 1);
+
+    // Simulate time passing to just past the ORIGINAL expiry, but renew
+    // BEFORE that — i.e. heartbeat while still active — then verify a
+    // claimBatch sweep at the (now-stale) original expiry moment does not
+    // reclaim it, because the lease was genuinely extended past it.
+    const renewed = await store.renewLease("t1", job.id, claimed.leaseToken!, 300);
+    expect(renewed).not.toBeNull();
+    const newExpiry = new Date(renewed!.lockExpiresAt!).getTime();
+    const originalExpiry = new Date(claimed.lockExpiresAt!).getTime();
+    expect(newExpiry).toBeGreaterThanOrEqual(originalExpiry);
+
+    // A worker attempting to reclaim "as of now" must find nothing due —
+    // the lease is genuinely active, not just optimistically not-yet-swept.
+    const batch = await store.claimBatch("worker-b", 10);
+    expect(batch.find((j) => j.id === job.id)).toBeUndefined();
+
+    // And the original owner's token is still honored, proving the lease
+    // truly was extended rather than merely left alone.
+    const completed = await store.complete("t1", job.id, claimed.leaseToken!);
+    expect(completed?.status).toBe("succeeded");
+  });
+});
