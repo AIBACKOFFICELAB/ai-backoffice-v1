@@ -245,8 +245,14 @@ describe("AiGateway.generateStructured — minimal structured output validation 
     expect(invocationStore.all()[0].status).toBe("succeeded");
   });
 
-  it("scenario: malformed structure -> normalized 'invalid_response' failure, never silently trusted as structured data", async () => {
-    const provider = new FakeChatProvider({ text: "not json at all" });
+  it("scenario (correction 4): malformed structure -> exactly ONE invocation record, not two, for the one physical provider call", async () => {
+    // Before Slice C correction 4, this asserted TWO records — the raw
+    // completion (recorded succeeded by the old invokeText call) plus a
+    // second, separately-id'd 'failed' record for the structured-contract
+    // violation. That double-counted one physical provider call and was
+    // itself the defect: exactly one physical call must produce exactly
+    // one model_invocations row, whichever way it resolves.
+    const provider = new FakeChatProvider({ text: "not json at all", inputTokens: 11, outputTokens: 3 });
     const invocationStore = new InMemoryModelInvocationStore();
     const gateway = new AiGateway({ chatProviders: { fake: provider }, invocationStore });
 
@@ -264,12 +270,67 @@ describe("AiGateway.generateStructured — minimal structured output validation 
       })
     ).rejects.toMatchObject({ category: "invalid_response" });
 
-    // Two invocation records: the raw completion (succeeded — the provider
-    // DID respond) and the structured-contract failure (failed) — the
-    // successful raw completion is never retroactively rewritten.
     const recorded = invocationStore.all();
-    expect(recorded).toHaveLength(2);
-    expect(recorded.filter((r) => r.status === "succeeded")).toHaveLength(1);
-    expect(recorded.filter((r) => r.status === "failed" && r.errorCategory === "invalid_response")).toHaveLength(1);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].status).toBe("failed");
+    expect(recorded[0].errorCategory).toBe("invalid_response");
+    // The real provider/model/token/latency metadata from that one
+    // physical call must still be preserved on the failed row.
+    expect(recorded[0].provider).toBe("fake");
+    expect(recorded[0].inputTokens).toBe(11);
+    expect(recorded[0].outputTokens).toBe(3);
+    expect(recorded[0].latencyMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("scenario (correction 4): a validator error containing test PII never leaks into the thrown or persisted message", async () => {
+    // A caller-supplied `validate` could echo back model output (and
+    // therefore customer PII) in its own error strings — those must never
+    // be interpolated into the normalized message.
+    const provider = new FakeChatProvider({ text: "call me at +15550001111 or private@example.test" });
+    const invocationStore = new InMemoryModelInvocationStore();
+    const gateway = new AiGateway({ chatProviders: { fake: provider }, invocationStore });
+
+    let thrown: unknown;
+    try {
+      await gateway.generateStructured({
+        tenantId: "t1",
+        prompt: "return json",
+        validate: (raw) => ({ ok: false, errors: [`could not parse: ${raw}`] }),
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(AiGatewayError);
+    expect((thrown as AiGatewayError).message).not.toContain("+15550001111");
+    expect((thrown as AiGatewayError).message).not.toContain("private@example.test");
+
+    const recorded = invocationStore.all();
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].error).not.toContain("+15550001111");
+    expect(recorded[0].error).not.toContain("private@example.test");
+  });
+
+  it("scenario (correction 4): a valid structured response never creates a second synthetic invocation id", async () => {
+    const provider = new FakeChatProvider({ text: '{"ok":true,"n":1}' });
+    const invocationStore = new InMemoryModelInvocationStore();
+    const gateway = new AiGateway({ chatProviders: { fake: provider }, invocationStore });
+
+    const result = await gateway.generateStructured<{ ok: boolean; n: number }>({
+      tenantId: "t1",
+      prompt: "return json",
+      validate: (raw) => {
+        try {
+          return { ok: true, value: JSON.parse(raw) };
+        } catch {
+          return { ok: false, errors: ["not valid JSON"] };
+        }
+      },
+    });
+
+    const recorded = invocationStore.all();
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0].id).toBe(result.invocationId);
+    expect(recorded[0].status).toBe("succeeded");
   });
 });

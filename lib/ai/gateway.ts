@@ -64,50 +64,52 @@ export class AiGateway {
 
   /**
    * Minimal, provider-independent structured-output primitive (P0.9 Slice
-   * C, finding M-05/C.9). NOT an autonomous tool-selection loop — the
-   * caller supplies its own `validate`. A malformed response is a
-   * normalized `invalid_response` AiGatewayError, recorded as a failed
-   * invocation, never silently trusted as parsed data.
+   * C, finding M-05/C.9; hardened by Slice C correction 4). NOT an
+   * autonomous tool-selection loop — the caller supplies its own
+   * `validate`. Uses callChatProvider (see below) directly, NOT
+   * invokeText, specifically so this method controls recording itself:
+   * exactly ONE model_invocations row is ever written for the one
+   * physical provider call this method makes, whichever way it resolves.
+   * A malformed response is recorded as that single row with
+   * status='failed', errorCategory='invalid_response', and a FIXED,
+   * sanitized message — the caller-supplied validator's own `errors`
+   * strings are deliberately NEVER interpolated into the persisted or
+   * thrown message, since a validator can echo back text from the model's
+   * response (and therefore customer PII) in its own error output. The
+   * row still preserves the real provider/model/token/latency metadata
+   * from that one physical call.
    */
   async generateStructured<T>(request: AiStructuredRequestInput<T>): Promise<AiStructuredResponse<T>> {
     const { validate, ...textRequest } = request;
-    const response = await this.invokeText({ ...textRequest, taskType: "generate" });
-    const validation = validate(response.text);
+    const { route, invocationId, outcome } = await this.callChatProvider({ ...textRequest, taskType: "generate" });
+
+    if (!outcome.ok) {
+      await this.recordFailure(invocationId, request, "generate", route, outcome.error, outcome.latencyMs);
+      throw outcome.error;
+    }
+
+    const validation = validate(outcome.text);
 
     if (!validation.ok) {
-      // The raw completion itself was already recorded as a succeeded
-      // invocation by invokeText above — that's still true (the provider
-      // did respond). This is a SEPARATE, additional failed-invocation
-      // record reflecting the true caller-facing outcome: the structured
-      // contract was violated. Never rewritten retroactively.
-      await this.invocationStore.record({
-        id: randomUUID(),
-        tenantId: request.tenantId,
-        agentRunId: request.agentRunId ?? null,
-        taskType: "generate",
-        provider: response.provider,
-        model: response.model,
-        complexity: request.complexity ?? null,
-        latencyPreference: request.latencyPreference ?? null,
-        costPreference: request.costPreference ?? null,
-        inputTokens: response.usage.inputTokens ?? null,
-        outputTokens: response.usage.outputTokens ?? null,
-        latencyMs: response.latencyMs,
-        estimatedCostUsd: null,
-        status: "failed",
-        error: "structured output validation failed",
-        errorCategory: "invalid_response",
+      const validationError = new AiGatewayError("structured output failed validation", "invalid_response");
+      // The provider DID respond (outcome.ok === true) — preserve its real
+      // token counts on this single failed row rather than losing them.
+      await this.recordFailure(invocationId, request, "generate", route, validationError, outcome.latencyMs, {
+        inputTokens: outcome.inputTokens,
+        outputTokens: outcome.outputTokens,
       });
-      throw new AiGatewayError(`structured output validation failed: ${validation.errors.join("; ")}`, "invalid_response");
+      throw validationError;
     }
+
+    await this.recordSuccess(invocationId, request, "generate", route, outcome);
 
     return {
       value: validation.value,
-      provider: response.provider,
-      model: response.model,
-      usage: response.usage,
-      latencyMs: response.latencyMs,
-      invocationId: response.invocationId,
+      provider: route.provider,
+      model: route.model,
+      usage: { inputTokens: outcome.inputTokens ?? undefined, outputTokens: outcome.outputTokens ?? undefined },
+      latencyMs: outcome.latencyMs,
+      invocationId,
     };
   }
 
@@ -157,6 +159,44 @@ export class AiGateway {
   }
 
   private async invokeText(request: AiTextRequestInput & { taskType: AiTaskType }): Promise<AiTextResponse> {
+    const { route, invocationId, outcome } = await this.callChatProvider(request);
+
+    if (!outcome.ok) {
+      await this.recordFailure(invocationId, request, request.taskType, route, outcome.error, outcome.latencyMs);
+      throw outcome.error;
+    }
+
+    await this.recordSuccess(invocationId, request, request.taskType, route, outcome);
+    return {
+      text: outcome.text,
+      provider: route.provider,
+      model: route.model,
+      usage: { inputTokens: outcome.inputTokens ?? undefined, outputTokens: outcome.outputTokens ?? undefined },
+      latencyMs: outcome.latencyMs,
+      invocationId,
+    };
+  }
+
+  /**
+   * Non-recording chat-provider call primitive (P0.9 Slice C correction 4)
+   * factored out of invokeText so generateStructured can also use it: both
+   * need to resolve a route, actually call the provider under the
+   * deadline, and get back either a successful result or a normalized
+   * error — WITHOUT anything being written to model_invocations yet. Each
+   * caller decides for itself exactly what single row to record for the
+   * one physical call this makes (invokeText always records the outcome
+   * as-is; generateStructured additionally may turn an ok=true outcome
+   * into a 'failed'/invalid_response row if the caller's own `validate`
+   * rejects the text). This function itself never records anything, so it
+   * cannot be the source of a double-counted invocation.
+   */
+  private async callChatProvider(request: AiTextRequestInput & { taskType: AiTaskType }): Promise<{
+    route: { provider: string; model: string };
+    invocationId: string;
+    outcome:
+      | { ok: true; text: string; inputTokens: number | null; outputTokens: number | null; latencyMs: number }
+      | { ok: false; error: AiGatewayError; latencyMs: number | null };
+  }> {
     const route = resolveRoute(request, request.taskType, Object.keys(this.chatProviders));
     const provider = this.chatProviders[route.provider];
     const invocationId = randomUUID();
@@ -164,8 +204,7 @@ export class AiGateway {
 
     if (!provider) {
       const configError = noProviderConfiguredError(route.provider, Object.keys(this.chatProviders));
-      await this.recordFailure(invocationId, request, request.taskType, route, configError);
-      throw configError;
+      return { route, invocationId, outcome: { ok: false, error: configError, latencyMs: null } };
     }
 
     const controller = new AbortController();
@@ -178,46 +217,23 @@ export class AiGateway {
         controller
       );
       const latencyMs = Date.now() - startedAt;
-      await this.invocationStore.record({
-        id: invocationId,
-        tenantId: request.tenantId,
-        agentRunId: request.agentRunId ?? null,
-        taskType: request.taskType,
-        provider: route.provider,
-        model: route.model,
-        complexity: request.complexity ?? null,
-        latencyPreference: request.latencyPreference ?? null,
-        costPreference: request.costPreference ?? null,
-        inputTokens: result.inputTokens ?? null,
-        outputTokens: result.outputTokens ?? null,
-        latencyMs,
-        estimatedCostUsd: estimateCostUsd(route.provider, route.model, result.inputTokens, result.outputTokens),
-        status: "succeeded",
-        error: null,
-        errorCategory: null,
-      });
       return {
-        text: result.text,
-        provider: route.provider,
-        model: route.model,
-        usage: { inputTokens: result.inputTokens, outputTokens: result.outputTokens },
-        latencyMs,
+        route,
         invocationId,
+        outcome: { ok: true, text: result.text, inputTokens: result.inputTokens ?? null, outputTokens: result.outputTokens ?? null, latencyMs },
       };
     } catch (error) {
       const normalized = normalizeProviderError(error);
-      await this.recordFailure(invocationId, request, request.taskType, route, normalized, Date.now() - startedAt);
-      throw normalized;
+      return { route, invocationId, outcome: { ok: false, error: normalized, latencyMs: Date.now() - startedAt } };
     }
   }
 
-  private async recordFailure(
+  private async recordSuccess(
     invocationId: string,
     request: { tenantId: string; agentRunId?: string | null; complexity?: string; latencyPreference?: string; costPreference?: string },
     taskType: AiTaskType,
     route: { provider: string; model: string },
-    error: AiGatewayError,
-    latencyMs: number | null = null
+    outcome: { inputTokens: number | null; outputTokens: number | null; latencyMs: number }
   ): Promise<void> {
     await this.invocationStore.record({
       id: invocationId,
@@ -229,8 +245,43 @@ export class AiGateway {
       complexity: request.complexity ?? null,
       latencyPreference: request.latencyPreference ?? null,
       costPreference: request.costPreference ?? null,
-      inputTokens: null,
-      outputTokens: null,
+      inputTokens: outcome.inputTokens,
+      outputTokens: outcome.outputTokens,
+      latencyMs: outcome.latencyMs,
+      estimatedCostUsd: estimateCostUsd(route.provider, route.model, outcome.inputTokens, outcome.outputTokens),
+      status: "succeeded",
+      error: null,
+      errorCategory: null,
+    });
+  }
+
+  private async recordFailure(
+    invocationId: string,
+    request: { tenantId: string; agentRunId?: string | null; complexity?: string; latencyPreference?: string; costPreference?: string },
+    taskType: AiTaskType,
+    route: { provider: string; model: string },
+    error: AiGatewayError,
+    latencyMs: number | null = null,
+    // P0.9 Slice C correction 4: generateStructured's invalid_response case
+    // is a failure where the provider DID respond — real token counts are
+    // known and must be preserved on the single failed row, unlike an
+    // ordinary provider failure (timeout, auth, etc.), where nothing was
+    // ever returned and these stay null (the default every other caller of
+    // recordFailure relies on).
+    tokens: { inputTokens: number | null; outputTokens: number | null } = { inputTokens: null, outputTokens: null }
+  ): Promise<void> {
+    await this.invocationStore.record({
+      id: invocationId,
+      tenantId: request.tenantId,
+      agentRunId: request.agentRunId ?? null,
+      taskType,
+      provider: route.provider,
+      model: route.model,
+      complexity: request.complexity ?? null,
+      latencyPreference: request.latencyPreference ?? null,
+      costPreference: request.costPreference ?? null,
+      inputTokens: tokens.inputTokens,
+      outputTokens: tokens.outputTokens,
       latencyMs,
       estimatedCostUsd: null,
       status: "failed",

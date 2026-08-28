@@ -26,12 +26,11 @@ describe("getDefaultChatProviders / getDefaultEmbeddingProviders — production 
     expect(providers.mock).toBeDefined();
   });
 
-  it("scenario: production + no real provider configured -> fail closed (no mock, no anthropic)", () => {
+  it("scenario 2: production + no real provider configured -> fail closed (empty real chat registry, no mock)", () => {
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("VERCEL_ENV", "production");
     vi.stubEnv("ANTHROPIC_API_KEY", "");
-    vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "");
 
     const providers = getDefaultChatProviders();
     expect(providers.mock).toBeUndefined();
@@ -39,19 +38,20 @@ describe("getDefaultChatProviders / getDefaultEmbeddingProviders — production 
     expect(Object.keys(providers)).toHaveLength(0);
   });
 
-  it("scenario: production + a real provider IS configured -> allowed, mock still absent", () => {
+  it("scenario 3: production + a real provider IS configured -> real provider available, mock absent", () => {
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("VERCEL_ENV", "production");
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-test-key-not-a-real-secret");
-    vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "");
 
     const providers = getDefaultChatProviders();
     expect(providers.anthropic).toBeDefined();
     expect(providers.mock).toBeUndefined();
   });
 
-  it("production + AI_GATEWAY_ALLOW_MOCK=true explicit override -> mock allowed", () => {
+  it("scenario 1 (correction 1): production + AI_GATEWAY_ALLOW_MOCK=true -> mock NOT registered", () => {
+    // The escape hatch that could bypass production fail-closed has been
+    // removed entirely — set here only to prove it has zero effect.
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("VERCEL_ENV", "production");
@@ -59,14 +59,14 @@ describe("getDefaultChatProviders / getDefaultEmbeddingProviders — production 
     vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "true");
 
     const providers = getDefaultChatProviders();
-    expect(providers.mock).toBeDefined();
+    expect(providers.mock).toBeUndefined();
   });
 
-  it("embedding providers follow the identical fail-closed policy", () => {
+  it("embedding providers follow the identical fail-closed policy, including no AI_GATEWAY_ALLOW_MOCK override", () => {
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("VERCEL_ENV", "production");
-    vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "");
+    vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "true");
 
     const providers = getDefaultEmbeddingProviders();
     expect(Object.keys(providers)).toHaveLength(0);

@@ -54,11 +54,15 @@ describe("resolveGatewayEnvironment / isMockProviderAllowed", () => {
     expect(isMockProviderAllowed()).toBe(true);
   });
 
-  it("AI_GATEWAY_ALLOW_MOCK=true overrides production -> mock allowed", () => {
+  it("scenario (correction 1): production + AI_GATEWAY_ALLOW_MOCK=true -> mock NOT allowed — no override exists for production", () => {
+    // Before this correction, this env var could bypass the production
+    // fail-closed policy entirely — that defeated the whole invariant.
+    // isMockProviderAllowed() no longer reads this variable at all; it is
+    // set here only to prove it has zero effect.
     vi.stubEnv("VITEST", "");
     vi.stubEnv("NODE_ENV", "production");
     vi.stubEnv("VERCEL_ENV", "production");
     vi.stubEnv("AI_GATEWAY_ALLOW_MOCK", "true");
-    expect(isMockProviderAllowed()).toBe(true);
+    expect(isMockProviderAllowed()).toBe(false);
   });
 });

@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { pingTool, createInternalNoteTool, draftCustomerMessageTool, DEFAULT_TOOL_REGISTRY } from "./toolRegistry";
+import {
+  pingTool,
+  createInternalNoteTool,
+  draftCustomerMessageTool,
+  DEFAULT_TOOL_REGISTRY,
+  conservativeAuditFallback,
+  summarizeForAudit,
+} from "./toolRegistry";
 
 describe("tool definitions own their security metadata (Codex P0 audit finding B-02)", () => {
   it("ping: EXECUTE, no floor beyond AUTO_EXECUTE, no scopes required", () => {
@@ -72,5 +79,93 @@ describe("validateOutput — a malformed tool response is detectable", () => {
     expect(pingTool.validateOutput!({})).toMatchObject({ ok: false });
     expect(pingTool.validateOutput!({ pong: false })).toMatchObject({ ok: false });
     expect(pingTool.validateOutput!(null)).toMatchObject({ ok: false });
+  });
+});
+
+/**
+ * Tool audit privacy fail-closed (P0.9 Slice C correction 2/2B):
+ * conservativeAuditFallback and summarizeForAudit are the runtime-owned
+ * defaults lib/agents/runtime.ts routes every audit summary through — a
+ * tool that defines no summarizer, or whose summarizer throws/returns
+ * something malformed, must NEVER cause a raw value to be persisted.
+ */
+describe("conservativeAuditFallback — bounded structural metadata only, never values", () => {
+  const SENTINEL_PHONE = "+15550001111";
+  const SENTINEL_EMAIL = "private@example.test";
+  const SENTINEL_MESSAGE = "SUPER-SECRET-MESSAGE";
+
+  it("a plain object -> only top-level key names and a count, no values", () => {
+    const result = conservativeAuditFallback({ phone: SENTINEL_PHONE, email: SENTINEL_EMAIL, note: SENTINEL_MESSAGE });
+    expect(result).toEqual({ redacted: true, keys: ["phone", "email", "note"], fieldCount: 3 });
+    expect(JSON.stringify(result)).not.toContain(SENTINEL_PHONE);
+    expect(JSON.stringify(result)).not.toContain(SENTINEL_EMAIL);
+    expect(JSON.stringify(result)).not.toContain(SENTINEL_MESSAGE);
+  });
+
+  it("non-object input (string, number, array, null, undefined) -> empty, still safe", () => {
+    expect(conservativeAuditFallback(SENTINEL_MESSAGE)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(conservativeAuditFallback(42)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(conservativeAuditFallback([SENTINEL_PHONE, SENTINEL_EMAIL])).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(conservativeAuditFallback(null)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(conservativeAuditFallback(undefined)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+  });
+});
+
+describe("summarizeForAudit — the ONLY path the runtime uses to compute a persisted audit summary", () => {
+  it("no summarizer defined -> falls back to conservativeAuditFallback", () => {
+    expect(summarizeForAudit(undefined, { secret: "value" })).toEqual({ redacted: true, keys: ["secret"], fieldCount: 1 });
+  });
+
+  it("a summarizer that throws -> falls back to conservativeAuditFallback, never crashes", () => {
+    const throwingSummarizer = (): Record<string, unknown> => {
+      throw new Error("boom");
+    };
+    expect(summarizeForAudit(throwingSummarizer, { a: 1, b: 2 })).toEqual({ redacted: true, keys: ["a", "b"], fieldCount: 2 });
+  });
+
+  it("a summarizer that returns something malformed (not a plain object) -> falls back", () => {
+    const badSummarizer = (): any => "not an object";
+    expect(summarizeForAudit(badSummarizer, { x: 1 })).toEqual({ redacted: true, keys: ["x"], fieldCount: 1 });
+  });
+
+  it("a well-behaved summarizer's own return value is used as-is", () => {
+    const goodSummarizer = (value: unknown) => ({ length: typeof value === "string" ? value.length : -1 });
+    expect(summarizeForAudit(goodSummarizer, "hello")).toEqual({ length: 5 });
+  });
+});
+
+describe("per-tool audit summarizers (P0.9 Slice C correction 2) — sentinel values never appear", () => {
+  const SENTINEL_MESSAGE = "SUPER-SECRET-MESSAGE";
+
+  it("create_internal_note: summarizes to a length only, never the note text", () => {
+    const summary = createInternalNoteTool.summarizeInputForAudit!({ note: SENTINEL_MESSAGE });
+    expect(summary).toEqual({ noteLength: SENTINEL_MESSAGE.length });
+    expect(JSON.stringify(summary)).not.toContain(SENTINEL_MESSAGE);
+  });
+
+  it("create_internal_note summarizers are total against malformed/unknown input (correction 2B)", () => {
+    expect(createInternalNoteTool.summarizeInputForAudit!(null)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(createInternalNoteTool.summarizeInputForAudit!({ note: 12345 })).toEqual({ redacted: true, keys: ["note"], fieldCount: 1 });
+    expect(createInternalNoteTool.summarizeOutputForAudit!("not an object" as unknown)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+  });
+
+  it("draft_customer_message: summarizes to hasDraft/draftLength only, never the draft text", () => {
+    const summary = draftCustomerMessageTool.summarizeInputForAudit!({ draft: SENTINEL_MESSAGE });
+    expect(summary).toEqual({ hasDraft: true, draftLength: SENTINEL_MESSAGE.length });
+    expect(JSON.stringify(summary)).not.toContain(SENTINEL_MESSAGE);
+
+    const outputSummary = draftCustomerMessageTool.summarizeOutputForAudit!({ draft: SENTINEL_MESSAGE });
+    expect(outputSummary).toEqual({ hasDraft: true, draftLength: SENTINEL_MESSAGE.length });
+    expect(JSON.stringify(outputSummary)).not.toContain(SENTINEL_MESSAGE);
+  });
+
+  it("draft_customer_message summarizers are total against malformed/unknown input", () => {
+    expect(draftCustomerMessageTool.summarizeInputForAudit!(null)).toEqual({ redacted: true, keys: [], fieldCount: 0 });
+    expect(draftCustomerMessageTool.summarizeInputForAudit!({ draft: 42 })).toEqual({ redacted: true, keys: ["draft"], fieldCount: 1 });
+  });
+
+  it("ping defines no explicit summarizer by design — proves the runtime fallback covers a tool author who forgot", () => {
+    expect(pingTool.summarizeInputForAudit).toBeUndefined();
+    expect(pingTool.summarizeOutputForAudit).toBeUndefined();
   });
 });

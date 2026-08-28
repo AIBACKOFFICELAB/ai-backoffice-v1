@@ -1,10 +1,11 @@
+import { createHash } from "crypto";
 import { Agent } from "./types";
 import { AgentStore, SupabaseAgentStore } from "./agentStore";
 import { AgentRun, AgentRunStore, SupabaseAgentRunStore } from "./runStore";
 import { ToolCall, ToolCallStore, SupabaseToolCallStore } from "./toolCallStore";
 import { evaluateToolCall, buildPolicySnapshot, PolicyDecision } from "./permissions";
 import { computeRunStatus } from "./runStatus";
-import { DEFAULT_TOOL_REGISTRY, AnyToolDefinition } from "./toolRegistry";
+import { DEFAULT_TOOL_REGISTRY, AnyToolDefinition, conservativeAuditFallback, summarizeForAudit } from "./toolRegistry";
 import { AiGateway, ai as defaultGateway } from "@/lib/ai/gateway";
 import { ApprovalStore, SupabaseApprovalStore } from "@/lib/approvals/store";
 import { Approval } from "@/lib/approvals/types";
@@ -84,6 +85,25 @@ function riskLevelFor(tool: AnyToolDefinition): "high" | "medium" {
   return tool.intrinsicPermission === "FINANCIAL_ACTION" || tool.intrinsicPermission === "DELETE" ? "high" : "medium";
 }
 
+/**
+ * Privacy-safe fingerprint of a model response's raw text (P0.9 Slice C
+ * correction 3), persisted into agent_runs.output_summary IN PLACE OF the
+ * raw text itself. The prompt/response text can carry customer PII (a
+ * phone number, an email, message content) — that must never land in a
+ * durable audit column merely because we wanted SOME record that a model
+ * call happened. Same SHA-256 pattern as
+ * lib/agents/permissions.ts::hashInstructions: deterministic, so identical
+ * text always fingerprints identically (useful for detecting duplicate/
+ * cached responses) and any change to the text changes the digest. The
+ * character count is retained (not the text) purely as a coarse, harmless
+ * shape signal. This is NEVER read back as an execution payload — the full
+ * response text lives only in memory for the duration of this one call.
+ */
+function fingerprintModelOutput(text: string): string {
+  const digest = createHash("sha256").update(text, "utf8").digest("hex");
+  return `sha256:${digest};chars:${text.length}`;
+}
+
 export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}): Promise<RunAgentResult> {
   const { agentStore, runStore, toolCallStore, approvalStore, gateway, tools } = resolveDeps(deps);
 
@@ -109,7 +129,10 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
     });
     agentRun = await runStore.update(input.tenantId, agentRun.id, {
       modelStrategy: { provider: response.provider, model: response.model, taskType: "reason" },
-      outputSummary: response.text.slice(0, 2000),
+      // P0.9 Slice C correction 3: a privacy-safe fingerprint, never the
+      // raw response text (which may carry customer PII) — see
+      // fingerprintModelOutput above.
+      outputSummary: fingerprintModelOutput(response.text),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -140,7 +163,11 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
         agentRunId: agentRun.id,
         toolName: planned.toolName,
         action: planned.action,
-        requestSummary: planned.input,
+        // P0.9 Slice C correction 2: no ToolDefinition exists for an
+        // unregistered tool name, so there's no per-tool summarizer to even
+        // consult — always the conservative structural fallback, never the
+        // raw caller-supplied input.
+        requestSummary: conservativeAuditFallback(planned.input),
         requiresApproval: false,
         policySnapshot: buildPolicySnapshot(agent, null, planned.toolName, planned.action, decision),
       });
@@ -162,7 +189,12 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
     // unminimized) is the sole canonical resumable execution payload; for
     // an AUTO_EXECUTE call, execution reads the in-memory validated input
     // directly (see the "allow" branch below), never this summary either.
-    const auditRequestSummary = tool.summarizeInputForAudit ? tool.summarizeInputForAudit(planned.input) : planned.input;
+    // P0.9 Slice C correction 2B: routed through summarizeForAudit, never
+    // the tool's summarizer directly — this runs on the RAW planned input,
+    // BEFORE validateInput below, so a summarizer that throws on a
+    // malformed shape must never crash the run; summarizeForAudit catches
+    // that and falls back to conservativeAuditFallback.
+    const auditRequestSummary = summarizeForAudit(tool.summarizeInputForAudit, planned.input);
 
     const toolCall = await toolCallStore.create({
       tenantId: input.tenantId,
@@ -261,7 +293,7 @@ async function executeToolDefinition(
     // below always evaluate the RAW result.summary, never this audit
     // summary — summarization must never alter actual tool result
     // handling.
-    const auditResponseSummary = tool.summarizeOutputForAudit ? tool.summarizeOutputForAudit(result.summary) : result.summary;
+    const auditResponseSummary = summarizeForAudit(tool.summarizeOutputForAudit, result.summary);
 
     if (!result.ok) {
       return toolCallStore.update(tenantId, toolCall.id, {

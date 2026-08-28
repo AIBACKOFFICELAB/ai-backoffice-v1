@@ -49,24 +49,29 @@ export interface ToolDefinition<TInput = Record<string, unknown>> {
   validateOutput?(output: unknown): { ok: true } | { ok: false; errors: string[] };
   /**
    * Privacy-minimized AUDIT representation of the input actually used
-   * (P0.9 Slice C, finding H-05/C.5). This is what gets persisted to
-   * tool_calls.request_summary — NEVER what the runtime executes from.
-   * Optional: when omitted, the tool's own raw input is persisted as-is,
-   * matching pre-Slice-C behavior — safe only because none of the three
-   * default P0 tools (ping, create_internal_note, draft_customer_message)
-   * handle raw customer-sensitive data. A FUTURE tool whose input carries
-   * real customer PII (a phone number, a message body, an address) MUST
-   * define this to redact/minimize before persisting. Computed from the
-   * RAW planned input, before validateInput runs (a call that fails
-   * validation still gets an audit record).
+   * (P0.9 Slice C, finding H-05/C.5, hardened by Slice C correction 2/2B).
+   * This is what gets persisted to tool_calls.request_summary — NEVER what
+   * the runtime executes from. Optional — but omitting it no longer means
+   * the raw input gets persisted: the runtime (lib/agents/runtime.ts, via
+   * summarizeForAudit below) falls back to conservativeAuditFallback,
+   * bounded structural metadata only (top-level key names + a count),
+   * whenever this is undefined. Takes `unknown`, not `TInput`, and MUST be
+   * a TOTAL (non-throwing) function — it runs on the RAW planned input,
+   * BEFORE validateInput, so a call that will go on to fail validation
+   * still needs a safe audit record. The runtime also wraps every call in
+   * a try/catch as a second line of defense (summarizeForAudit) — a
+   * summarizer that throws or returns something malformed falls back to
+   * the same conservative default rather than crashing the run or
+   * persisting something unsafe.
    */
-  summarizeInputForAudit?(input: TInput): Record<string, unknown>;
+  summarizeInputForAudit?(input: unknown): Record<string, unknown>;
   /** Same contract, for the tool's own execute() result (persisted to
-   * tool_calls.response_summary). Optional; defaults to the tool's raw
-   * result.summary. Never affects validateOutput or the succeeded/failed
-   * decision, which always evaluate the RAW result — see
+   * tool_calls.response_summary). Optional; the same conservative
+   * structural fallback applies when omitted or when it throws/returns
+   * something malformed. Never affects validateOutput or the
+   * succeeded/failed decision, which always evaluate the RAW result — see
    * lib/agents/runtime.ts::executeToolDefinition. */
-  summarizeOutputForAudit?(output: Record<string, unknown>): Record<string, unknown>;
+  summarizeOutputForAudit?(output: unknown): Record<string, unknown>;
   /** Whether calling execute() twice with the same input is safe. None of
    * the P0 tools have external side effects, so all three are technically
    * idempotent; this field exists for the tools that won't be. */
@@ -81,6 +86,42 @@ export type AnyToolDefinition = ToolDefinition<any>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Runtime-owned, conservative, non-throwing default audit representation
+ * (P0.9 Slice C correction 2). Used whenever a tool defines no
+ * summarizeInputForAudit/summarizeOutputForAudit, whenever it's called
+ * against an unregistered tool name (there's no ToolDefinition to consult
+ * at all), and as the fallback whenever a tool's own summarizer throws or
+ * returns something malformed (see summarizeForAudit below). Bounded
+ * STRUCTURAL metadata only — top-level key names and a count — NEVER any
+ * value, so no input/output value is ever persisted raw merely because a
+ * tool forgot (or failed) to define a summarizer.
+ */
+export function conservativeAuditFallback(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return { redacted: true, keys: [], fieldCount: 0 };
+  const keys = Object.keys(value);
+  return { redacted: true, keys, fieldCount: keys.length };
+}
+
+/**
+ * The ONLY path lib/agents/runtime.ts uses to compute a persisted audit
+ * summary — it never calls a tool's summarizeInputForAudit/
+ * summarizeOutputForAudit directly (P0.9 Slice C correction 2B). Runs the
+ * tool's optional summarizer defensively: a thrown error, or a return
+ * value that isn't itself a plain object, falls back to
+ * conservativeAuditFallback rather than ever crashing the run or
+ * persisting something unsafe.
+ */
+export function summarizeForAudit(summarize: ((value: unknown) => Record<string, unknown>) | undefined, value: unknown): Record<string, unknown> {
+  if (!summarize) return conservativeAuditFallback(value);
+  try {
+    const result = summarize(value);
+    return isRecord(result) ? result : conservativeAuditFallback(value);
+  } catch {
+    return conservativeAuditFallback(value);
+  }
 }
 
 /** Pure no-op — proves the pipeline end-to-end with zero side effects. */
@@ -132,16 +173,21 @@ export const createInternalNoteTool: ToolDefinition<{ note: string }> = {
     }
     return { ok: true, value: { note: input.note } };
   },
-  // P0.9 Slice C, finding H-05/C.5: a note's text could carry customer
-  // detail — persist only its length to the audit trail, never the
-  // content. execute() below still receives the FULL, unredacted note
-  // (this only changes what's written to tool_calls.request_summary/
-  // response_summary).
+  // P0.9 Slice C, finding H-05/C.5 (hardened by correction 2B): a note's
+  // text could carry customer detail — persist only its length to the
+  // audit trail, never the content. execute() below still receives the
+  // FULL, unredacted note (this only changes what's written to
+  // tool_calls.request_summary/response_summary). Total/non-throwing:
+  // takes `unknown` and falls back to the conservative structural summary
+  // itself whenever the shape isn't the expected { note: string } — never
+  // assumes validateInput has already run (it hasn't, at audit time).
   summarizeInputForAudit(input) {
-    return { noteLength: input.note.length };
+    if (isRecord(input) && typeof input.note === "string") return { noteLength: input.note.length };
+    return conservativeAuditFallback(input);
   },
   summarizeOutputForAudit(output) {
-    return { noteLength: typeof output.note === "string" ? output.note.length : null };
+    if (isRecord(output) && typeof output.note === "string") return { noteLength: output.note.length };
+    return conservativeAuditFallback(output);
   },
   async execute(input) {
     return { ok: true, summary: { note: input.note } };
@@ -167,6 +213,18 @@ export const draftCustomerMessageTool: ToolDefinition<{ draft: string }> = {
       return { ok: false, errors: ["draft is required and must be a string"] };
     }
     return { ok: true, value: { draft: input.draft } };
+  },
+  // P0.9 Slice C correction 2: the draft is a customer-facing message body
+  // — it MUST NOT be persisted to the audit trail. execute()/approval
+  // execution still see the full draft text (this only changes what's
+  // written to tool_calls.request_summary/response_summary).
+  summarizeInputForAudit(input) {
+    if (isRecord(input) && typeof input.draft === "string") return { hasDraft: true, draftLength: input.draft.length };
+    return conservativeAuditFallback(input);
+  },
+  summarizeOutputForAudit(output) {
+    if (isRecord(output) && typeof output.draft === "string") return { hasDraft: true, draftLength: output.draft.length };
+    return conservativeAuditFallback(output);
   },
   async execute(input) {
     return { ok: true, summary: { draft: input.draft } };

@@ -31,14 +31,17 @@ export function resolveGatewayEnvironment(): GatewayEnvironment {
 
 /**
  * Whether the mock chat/embedding provider may be registered at all.
- * `production` is fail-closed by default: no real provider configured must
- * be a loud configuration error at first use (see
- * lib/ai/providers/registry.ts), never a silent mock fallback. The one
- * escape hatch is an explicit, operator-set override — e.g. for a
- * deliberate staging/demo deployment that intentionally runs on mock
- * output — never an implicit default.
+ *
+ * P0.9 Slice C correction 1: `production` NEVER registers mock — this is
+ * now a HARD boundary, not a policy default something can relax. There is
+ * no override (an earlier draft of this function allowed an
+ * AI_GATEWAY_ALLOW_MOCK=true escape hatch to bypass it even in production;
+ * that defeated the entire fail-closed invariant and has been removed).
+ * `test` and `development` (including a Vercel preview deployment, which
+ * resolveGatewayEnvironment treats as `development`) allow mock — those
+ * are the only environments where AI BackOffice runs without a real
+ * provider configured by design.
  */
 export function isMockProviderAllowed(): boolean {
-  if (process.env.AI_GATEWAY_ALLOW_MOCK === "true") return true;
   return resolveGatewayEnvironment() !== "production";
 }

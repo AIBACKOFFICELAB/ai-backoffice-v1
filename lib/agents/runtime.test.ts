@@ -98,7 +98,11 @@ describe("P0 end-to-end: business event -> agent run -> outcome", () => {
       tools: DEFAULT_TOOL_REGISTRY,
     });
     expect(executed.status).toBe("succeeded");
-    expect(executed.responseSummary).toMatchObject({ draft: "Hi, following up on your estimate." });
+    // P0.9 Slice C correction 2: draft_customer_message's persisted audit
+    // summary no longer carries the raw draft text — see
+    // toolRegistry.ts::draftCustomerMessageTool.summarizeOutputForAudit.
+    expect(executed.responseSummary).toEqual({ hasDraft: true, draftLength: "Hi, following up on your estimate.".length });
+    expect(JSON.stringify(executed.responseSummary)).not.toContain("Hi, following up");
 
     const finalRun = await runStore.getById(tenantId, agentRun.id);
     expect(finalRun?.status).toBe("succeeded");
@@ -500,9 +504,16 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
 
   it("approval executes the exact approval.payload, not a stale or redacted copy", async () => {
     const { tenantId, deps, approval } = await setupApprovedButUnresolvedCall();
+    expect(approval.payload).toEqual({ draft: "Original approved draft" });
+
     const executed = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
     expect(executed.status).toBe("succeeded");
-    expect(executed.responseSummary).toMatchObject({ draft: "Original approved draft" });
+    // P0.9 Slice C correction 2: what's PERSISTED is the redacted audit
+    // summary, never the raw draft text — but its length still proves
+    // execution ran against the exact approved payload ("Original approved
+    // draft", 23 chars), not a stale or substituted one.
+    expect(executed.responseSummary).toEqual({ hasDraft: true, draftLength: "Original approved draft".length });
+    expect(JSON.stringify(executed.responseSummary)).not.toContain("Original approved draft");
   });
 
   it("tool_call audit summary can be redacted without altering approval-gated execution — audit summary carries no prohibited PII", async () => {
@@ -708,5 +719,198 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
 
     const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
     expect(result.status).toBe("requires_approval"); // unchanged — still waiting on a real decision
+  });
+});
+
+/**
+ * P0.9 Slice C correction 2/2B/3 — tool audit privacy fail-closed and the
+ * agent_run model-output fingerprint. Explicit sentinel values, per the
+ * correction's own validation requirement: these exact strings must NEVER
+ * appear in any persisted tool_calls.request_summary,
+ * tool_calls.response_summary, or agent_runs.output_summary.
+ */
+describe("P0.9 Slice C correction 2/2B/3 — audit privacy fail-closed, sentinel-value assertions", () => {
+  const SENTINEL_PHONE = "+15550001111";
+  const SENTINEL_EMAIL = "private@example.test";
+  const SENTINEL_MESSAGE = "SUPER-SECRET-MESSAGE";
+
+  function assertNoSentinels(value: unknown) {
+    const serialized = JSON.stringify(value);
+    expect(serialized).not.toContain(SENTINEL_PHONE);
+    expect(serialized).not.toContain(SENTINEL_EMAIL);
+    expect(serialized).not.toContain(SENTINEL_MESSAGE);
+  }
+
+  async function freshDeps() {
+    const tenantId = `tenant-privacy-${Math.random().toString(36).slice(2)}`;
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+    const { devTest } = await seedAgents(tenantId, agentStore);
+    return { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest };
+  }
+
+  it("correction 2B: malformed create_internal_note input never crashes the run — recorded failed for invalid input", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    // Malformed per createInternalNoteTool.validateInput (note must be a
+    // non-empty string) AND a shape that would have thrown inside the OLD
+    // summarizeInputForAudit (`input.note.length` on a non-string note),
+    // before it was retyped to accept `unknown` and made total.
+    const { toolCallOutcomes, agentRun } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "create_internal_note", action: "execute", input: { note: 12345 } }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("failed");
+    expect(toolCallOutcomes[0].toolCall.error).toMatch(/invalid input/);
+    expect(agentRun.status).toBe("failed");
+    // The audit summary computed BEFORE validation must still be safe —
+    // conservativeAuditFallback, since the raw { note: 12345 } shape isn't
+    // what the tool's own summarizer expects.
+    expect(toolCallOutcomes[0].toolCall.requestSummary).toEqual({ redacted: true, keys: ["note"], fieldCount: 1 });
+  });
+
+  it("correction 2B: a tool summarizer that throws never crashes the run — falls back to the conservative structural summary", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    const throwingTool: AnyToolDefinition = {
+      ...pingTool,
+      summarizeInputForAudit() {
+        throw new Error("summarizer exploded");
+      },
+      summarizeOutputForAudit() {
+        throw new Error("summarizer exploded");
+      },
+    };
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "ping", action: "execute", input: { secret: SENTINEL_MESSAGE } }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: { ping: throwingTool } }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("succeeded");
+    expect(toolCallOutcomes[0].toolCall.requestSummary).toEqual({ redacted: true, keys: ["secret"], fieldCount: 1 });
+    assertNoSentinels(toolCallOutcomes[0].toolCall.requestSummary);
+    assertNoSentinels(toolCallOutcomes[0].toolCall.responseSummary);
+  });
+
+  it("correction 2: draft_customer_message's request_summary and response_summary contain no message text", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    const { toolCallOutcomes } = await runAgent(
+      {
+        tenantId,
+        agentId: devTest.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [{ toolName: "draft_customer_message", action: "execute", input: { draft: SENTINEL_MESSAGE } }],
+      },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+    const pending = toolCallOutcomes[0].toolCall;
+    assertNoSentinels(pending.requestSummary);
+    expect(pending.requestSummary).toEqual({ hasDraft: true, draftLength: SENTINEL_MESSAGE.length });
+
+    const approval = toolCallOutcomes[0].approval!;
+    await approveApproval(tenantId, approval.id, "owner-1", "owner", approvalStore);
+    const executed = await resumeAfterApprovalDecision(tenantId, approval.id, {
+      agentStore,
+      runStore,
+      toolCallStore,
+      approvalStore,
+      gateway,
+      tools: DEFAULT_TOOL_REGISTRY,
+    });
+    expect(executed.status).toBe("succeeded");
+    assertNoSentinels(executed.responseSummary);
+    expect(executed.responseSummary).toEqual({ hasDraft: true, draftLength: SENTINEL_MESSAGE.length });
+  });
+
+  it("correction 2: ping with sentinel phone/email/message input -> persisted summaries contain none of those values", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    const { toolCallOutcomes } = await runAgent(
+      {
+        tenantId,
+        agentId: devTest.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [{ toolName: "ping", action: "execute", input: { phone: SENTINEL_PHONE, email: SENTINEL_EMAIL, message: SENTINEL_MESSAGE } }],
+      },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("succeeded");
+    assertNoSentinels(toolCallOutcomes[0].toolCall.requestSummary);
+    assertNoSentinels(toolCallOutcomes[0].toolCall.responseSummary);
+    // ping's own execute() echoes its input into result.summary.input — the
+    // RAW result is fine to carry it in-memory, but the PERSISTED audit
+    // summary must be the conservative fallback (ping defines no
+    // summarizer by design).
+    expect(toolCallOutcomes[0].toolCall.requestSummary).toEqual({ redacted: true, keys: ["phone", "email", "message"], fieldCount: 3 });
+  });
+
+  it("correction 2: an unregistered tool with an arbitrary sentinel payload -> persisted audit contains no raw values", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    const { toolCallOutcomes } = await runAgent(
+      {
+        tenantId,
+        agentId: devTest.id,
+        reasoning: { prompt: "test" },
+        toolPlan: [{ toolName: "nonexistent_tool", action: "execute", input: { phone: SENTINEL_PHONE, email: SENTINEL_EMAIL, note: SENTINEL_MESSAGE } }],
+      },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("failed");
+    assertNoSentinels(toolCallOutcomes[0].toolCall.requestSummary);
+    expect(toolCallOutcomes[0].toolCall.requestSummary).toEqual({ redacted: true, keys: ["phone", "email", "note"], fieldCount: 3 });
+  });
+
+  it("correction 3: agent_runs.output_summary is a fingerprint, never the raw model response text, even when the response echoes sentinel PII", async () => {
+    const { tenantId, agentStore, runStore, toolCallStore, approvalStore, gateway, devTest } = await freshDeps();
+
+    // MockChatProvider echoes the prompt (truncated to 200 chars) back into
+    // its response text — an easy, deterministic way to prove sentinel
+    // values that make it into the model's OWN response text never survive
+    // into the persisted agent_runs.output_summary.
+    const prompt = `Contact info: ${SENTINEL_PHONE} ${SENTINEL_EMAIL} ${SENTINEL_MESSAGE}`;
+    const { agentRun } = await runAgent(
+      { tenantId, agentId: devTest.id, reasoning: { prompt }, toolPlan: [] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+
+    expect(agentRun.outputSummary).not.toBeNull();
+    assertNoSentinels(agentRun.outputSummary);
+    // Fingerprint shape: sha256:<hex digest>;chars:<length> — never raw text.
+    expect(agentRun.outputSummary).toMatch(/^sha256:[0-9a-f]{64};chars:\d+$/);
+    // provider/model/task metadata is unaffected by the fingerprint switch.
+    expect(agentRun.modelStrategy).toMatchObject({ provider: "mock", taskType: "reason" });
+  });
+
+  it("correction 3: the fingerprint is deterministic for identical text and different for different text", async () => {
+    const depsA = await freshDeps();
+    const depsB = await freshDeps();
+
+    const samePrompt = "identical prompt text for both runs";
+    const { agentRun: runA } = await runAgent(
+      { tenantId: depsA.tenantId, agentId: depsA.devTest.id, reasoning: { prompt: samePrompt }, toolPlan: [] },
+      { agentStore: depsA.agentStore, runStore: depsA.runStore, toolCallStore: depsA.toolCallStore, approvalStore: depsA.approvalStore, gateway: depsA.gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+    const { agentRun: runB } = await runAgent(
+      { tenantId: depsB.tenantId, agentId: depsB.devTest.id, reasoning: { prompt: samePrompt }, toolPlan: [] },
+      { agentStore: depsB.agentStore, runStore: depsB.runStore, toolCallStore: depsB.toolCallStore, approvalStore: depsB.approvalStore, gateway: depsB.gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+    // Same model/prompt -> MockChatProvider produces identical response
+    // text -> identical fingerprint.
+    expect(runA.outputSummary).toBe(runB.outputSummary);
+
+    const { agentRun: runC } = await runAgent(
+      { tenantId: depsA.tenantId, agentId: depsA.devTest.id, reasoning: { prompt: "a completely different prompt" }, toolPlan: [] },
+      { agentStore: depsA.agentStore, runStore: depsA.runStore, toolCallStore: depsA.toolCallStore, approvalStore: depsA.approvalStore, gateway: depsA.gateway, tools: DEFAULT_TOOL_REGISTRY }
+    );
+    expect(runC.outputSummary).not.toBe(runA.outputSummary);
   });
 });
