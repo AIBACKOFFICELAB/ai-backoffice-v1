@@ -39,6 +39,14 @@ export type Outcome = {
   attributionConfidence: AttributionConfidence;
   occurredAt: string;
   metadata: Record<string, unknown>;
+  /** P0.9 Slice C, finding C.3: derived from stable EVIDENCE identity, not
+   * current time — e.g. `lead-recovered:<leadId>:<evidenceType>:<evidenceId>`
+   * for a future real lead_recovered outcome. A repeated webhook, event
+   * replay, retry, or compatibility callback for the SAME logical evidence
+   * must not create a duplicate outcome. Null when no such stable identity
+   * exists yet (the caller isn't required to invent one). See
+   * db/migrations/019_p0_production_compatibility_privacy.sql. */
+  idempotencyKey: string | null;
   createdAt: string;
 };
 
@@ -54,4 +62,7 @@ export type RecordOutcomeInput = {
   attributionConfidence: AttributionConfidence;
   occurredAt?: string;
   metadata?: Record<string, unknown>;
+  /** See Outcome.idempotencyKey above. Omit only when no stable evidence
+   * identity is available — never derive one from the current timestamp. */
+  idempotencyKey?: string | null;
 };

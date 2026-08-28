@@ -3,7 +3,12 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { Outcome, OutcomeType, RecordOutcomeInput } from "./types";
 
 export interface OutcomeStore {
-  insert(input: RecordOutcomeInput): Promise<Outcome>;
+  /** Idempotent when `idempotencyKey` is provided (P0.9 Slice C, finding
+   * C.3): a repeated webhook, event replay, retry, or compatibility
+   * callback for the SAME (tenantId, idempotencyKey) returns the
+   * ORIGINAL outcome (`deduped: true`) rather than creating a duplicate —
+   * mirrors lib/events/store.ts and lib/execution/store.ts exactly. */
+  insert(input: RecordOutcomeInput): Promise<{ outcome: Outcome; deduped: boolean }>;
   listByTenant(tenantId: string, opts?: { outcomeType?: OutcomeType; limit?: number }): Promise<Outcome[]>;
 }
 
@@ -21,12 +26,15 @@ function mapRow(row: Record<string, any>): Outcome {
     attributionConfidence: row.attribution_confidence,
     occurredAt: row.occurred_at,
     metadata: row.metadata ?? {},
+    idempotencyKey: row.idempotency_key ?? null,
     createdAt: row.created_at,
   };
 }
 
+const UNIQUE_VIOLATION = "23505";
+
 export class SupabaseOutcomeStore implements OutcomeStore {
-  async insert(input: RecordOutcomeInput): Promise<Outcome> {
+  async insert(input: RecordOutcomeInput): Promise<{ outcome: Outcome; deduped: boolean }> {
     const supabase = await createServerSupabaseClient();
     const { data, error } = await supabase
       .from("outcomes")
@@ -42,10 +50,30 @@ export class SupabaseOutcomeStore implements OutcomeStore {
         attribution_confidence: input.attributionConfidence,
         occurred_at: input.occurredAt ?? undefined,
         metadata: input.metadata ?? {},
+        idempotency_key: input.idempotencyKey ?? null,
       })
       .select()
       .single();
-    if (error) throw new Error(`[outcomes] insert failed: ${error.message}`);
+
+    if (error) {
+      if (error.code === UNIQUE_VIOLATION && input.idempotencyKey) {
+        const existing = await this.findByIdempotencyKey(input.tenantId, input.idempotencyKey);
+        if (existing) return { outcome: existing, deduped: true };
+      }
+      throw new Error(`[outcomes] insert failed: ${error.message}`);
+    }
+    return { outcome: mapRow(data), deduped: false };
+  }
+
+  private async findByIdempotencyKey(tenantId: string, idempotencyKey: string): Promise<Outcome | null> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase
+      .from("outcomes")
+      .select("*")
+      .eq("tenant_id", tenantId)
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+    if (error || !data) return null;
     return mapRow(data);
   }
 
@@ -63,7 +91,11 @@ export class SupabaseOutcomeStore implements OutcomeStore {
 export class InMemoryOutcomeStore implements OutcomeStore {
   private rows: Outcome[] = [];
 
-  async insert(input: RecordOutcomeInput): Promise<Outcome> {
+  async insert(input: RecordOutcomeInput): Promise<{ outcome: Outcome; deduped: boolean }> {
+    if (input.idempotencyKey) {
+      const existing = this.rows.find((r) => r.tenantId === input.tenantId && r.idempotencyKey === input.idempotencyKey);
+      if (existing) return { outcome: existing, deduped: true };
+    }
     const now = new Date().toISOString();
     const outcome: Outcome = {
       id: randomUUID(),
@@ -78,10 +110,11 @@ export class InMemoryOutcomeStore implements OutcomeStore {
       attributionConfidence: input.attributionConfidence,
       occurredAt: input.occurredAt ?? now,
       metadata: input.metadata ?? {},
+      idempotencyKey: input.idempotencyKey ?? null,
       createdAt: now,
     };
     this.rows.push(outcome);
-    return outcome;
+    return { outcome, deduped: false };
   }
 
   async listByTenant(tenantId: string, opts: { outcomeType?: OutcomeType; limit?: number } = {}): Promise<Outcome[]> {

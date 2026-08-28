@@ -63,6 +63,14 @@ export const KNOWN_EVENT_TYPES = [
   "lead.updated",
   "call.missed",
   "call.recovered",
+  /** P0.9 Slice C (finding H-03): emitted when a recovery SMS is
+   * successfully SENT — an operational fact, never a claim that the
+   * customer re-engaged. "call.recovered" remains reserved for a future
+   * evidence-based recovery signal (an inbound reply, a booked
+   * appointment, ...) once such a path exists — see
+   * lib/modules/missedCallRecovery/service.ts and
+   * docs/OUTCOME_ATTRIBUTION.md. */
+  "recovery.sms_sent",
   "customer.replied",
   "estimate.created",
   "estimate.sent",

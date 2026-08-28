@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { requestApproval, approveApproval, rejectApproval, listPendingApprovals } from "./service";
+import { requestApproval, approveApproval, rejectApproval, listPendingApprovals, approveApprovalAsAuthenticatedActor, rejectApprovalAsAuthenticatedActor, resolveApprovalActor, TenantContextResolver } from "./service";
 import { InMemoryApprovalStore } from "./store";
 
 describe("approval enforcement (P0.4)", () => {
@@ -149,5 +149,97 @@ describe("concurrent human decisions — exactly one CAS wins", () => {
     expect(final?.status).toBe("approved");
     expect(final?.approverUserId).toBe("owner-1");
     expect(final?.reason).toBeNull();
+  });
+});
+
+/**
+ * Authenticated human approval identity (P0.9 Slice C, finding M-02).
+ * Production-facing entrypoints must resolve the acting human from trusted
+ * session context — never trust a caller-supplied approverUserId/
+ * approverRole. `resolveApprovalActor`'s resolveContext is injectable so
+ * these tests never touch real Supabase auth.
+ */
+describe("authenticated approval identity (M-02)", () => {
+  function fakeResolver(context: { tenantId: string; role: "owner" | "staff"; userId: string } | null): TenantContextResolver {
+    return async () => context;
+  }
+
+  it("resolveApprovalActor returns the resolved actor when tenant membership matches", async () => {
+    const actor = await resolveApprovalActor("tenant-a", fakeResolver({ tenantId: "tenant-a", role: "owner", userId: "user-1" }));
+    expect(actor).toEqual({ userId: "user-1", tenantId: "tenant-a", role: "owner" });
+  });
+
+  it("resolveApprovalActor returns null when no session/context resolves at all", async () => {
+    const actor = await resolveApprovalActor("tenant-a", fakeResolver(null));
+    expect(actor).toBeNull();
+  });
+
+  it("resolveApprovalActor refuses a resolved context for a DIFFERENT tenant than the approval's own", async () => {
+    // The caller is a genuine, authenticated owner — just of the WRONG
+    // tenant. Must still be refused; a caller cannot act on an approval
+    // belonging to a tenant they don't actually belong to.
+    const actor = await resolveApprovalActor("tenant-a", fakeResolver({ tenantId: "tenant-b", role: "owner", userId: "user-1" }));
+    expect(actor).toBeNull();
+  });
+
+  it("approveApprovalAsAuthenticatedActor approves using the RESOLVED identity, never a caller-supplied one", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "tenant-a", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    const decided = await approveApprovalAsAuthenticatedActor(
+      "tenant-a",
+      approval.id,
+      store,
+      fakeResolver({ tenantId: "tenant-a", role: "owner", userId: "resolved-user-1" })
+    );
+    expect(decided.status).toBe("approved");
+    expect(decided.approverUserId).toBe("resolved-user-1");
+  });
+
+  it("approveApprovalAsAuthenticatedActor refuses outright when no actor can be resolved — never falls back to trusting anything caller-supplied", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "tenant-a", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    await expect(approveApprovalAsAuthenticatedActor("tenant-a", approval.id, store, fakeResolver(null))).rejects.toThrow(
+      /no authenticated tenant member/
+    );
+    const stillPending = await store.getById("tenant-a", approval.id);
+    expect(stillPending?.status).toBe("pending");
+  });
+
+  it("a resolved STAFF actor still cannot approve — the caller cannot self-declare 'owner' via any path", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "tenant-a", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    await expect(
+      approveApprovalAsAuthenticatedActor("tenant-a", approval.id, store, fakeResolver({ tenantId: "tenant-a", role: "staff", userId: "user-2" }))
+    ).rejects.toThrow(/owner/);
+  });
+
+  it("a cross-tenant authenticated actor cannot approve another tenant's approval, even as a genuine owner of their own tenant", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "tenant-a", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    await expect(
+      approveApprovalAsAuthenticatedActor("tenant-a", approval.id, store, fakeResolver({ tenantId: "tenant-b", role: "owner", userId: "user-3" }))
+    ).rejects.toThrow(/no authenticated tenant member/);
+    const stillPending = await store.getById("tenant-a", approval.id);
+    expect(stillPending?.status).toBe("pending");
+  });
+
+  it("rejectApprovalAsAuthenticatedActor mirrors the same resolved-identity boundary", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "tenant-a", requestedAction: "x", payloadDigest: "digest-1" }, store);
+
+    const decided = await rejectApprovalAsAuthenticatedActor(
+      "tenant-a",
+      approval.id,
+      "not needed",
+      store,
+      fakeResolver({ tenantId: "tenant-a", role: "owner", userId: "resolved-user-1" })
+    );
+    expect(decided.status).toBe("rejected");
+    expect(decided.approverUserId).toBe("resolved-user-1");
+    expect(decided.reason).toBe("not needed");
   });
 });

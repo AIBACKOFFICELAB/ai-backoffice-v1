@@ -4,7 +4,7 @@ import { seedAgents } from "./seed";
 import { InMemoryAgentStore } from "./agentStore";
 import { InMemoryAgentRunStore } from "./runStore";
 import { InMemoryToolCallStore, ToolCallStore, UpdateToolCallInput } from "./toolCallStore";
-import { DEFAULT_TOOL_REGISTRY, draftCustomerMessageTool, AnyToolDefinition } from "./toolRegistry";
+import { DEFAULT_TOOL_REGISTRY, draftCustomerMessageTool, createInternalNoteTool, pingTool, AnyToolDefinition } from "./toolRegistry";
 import { InMemoryApprovalStore } from "@/lib/approvals/store";
 import { approveApproval, rejectApproval } from "@/lib/approvals/service";
 import { InMemoryBusinessEventStore } from "@/lib/events/store";
@@ -105,7 +105,7 @@ describe("P0 end-to-end: business event -> agent run -> outcome", () => {
     expect(finalRun?.completedAt).not.toBeNull();
 
     // 6. Outcome recorded against the completed run.
-    const outcome = await recordOutcome(
+    const { outcome } = await recordOutcome(
       {
         tenantId,
         agentRunId: agentRun.id,
@@ -467,16 +467,21 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
   });
 
   it("test 7: refuses execution on payload digest mismatch, recorded as an integrity failure — never a benign no-op (approval UI reviews A, tool must not execute B)", async () => {
-    const { tenantId, deps, approval, toolCallStore } = await setupApprovedButUnresolvedCall();
+    const { tenantId, deps, approval, approvalStore } = await setupApprovedButUnresolvedCall();
 
-    // Simulate tampering: something mutates the tool_call's recorded input
-    // after the human approved the original draft. request_summary is
-    // deliberately not part of the public UpdateToolCallInput surface (see
-    // toolCallStore.ts) — mutating it directly here is the point: this is
-    // the anomaly the payload digest exists to catch, not a supported
-    // operation.
-    const toolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
-    toolCall!.requestSummary = { draft: "A completely different, unapproved message" };
+    // Simulate tampering: something mutates the APPROVAL's own recorded
+    // payload after the human approved the original draft. P0.9 Slice C,
+    // finding H-05/C.5: execution now sources its input exclusively from
+    // approval.payload (never tool_calls.request_summary, which is a
+    // privacy-minimized AUDIT summary that may not even be shaped like
+    // valid tool input — see runtime.ts::executeApprovedToolCall) — so the
+    // tampering surface this test exercises moved from request_summary to
+    // approval.payload itself. There is no public store method to mutate
+    // an approval's payload post-creation; mutating it directly here is
+    // the point: this is the anomaly the payload digest exists to catch,
+    // not a supported operation.
+    const stored = await approvalStore.getById(tenantId, approval.id);
+    stored!.payload = { draft: "A completely different, unapproved message" };
 
     const result = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
     // This is the OTHER branch from test 4/5's benign no-op: a digest
@@ -491,6 +496,159 @@ describe("resumeAfterApprovalDecision — approval safety (Codex P0 audit findin
     // not silently marked executed.
     const approvalAfter = await deps.approvalStore.getById(tenantId, approval.id);
     expect(approvalAfter?.status).toBe("approved");
+  });
+
+  it("approval executes the exact approval.payload, not a stale or redacted copy", async () => {
+    const { tenantId, deps, approval } = await setupApprovedButUnresolvedCall();
+    const executed = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+    expect(executed.status).toBe("succeeded");
+    expect(executed.responseSummary).toMatchObject({ draft: "Original approved draft" });
+  });
+
+  it("tool_call audit summary can be redacted without altering approval-gated execution — audit summary carries no prohibited PII", async () => {
+    const tenantId = "tenant-redacted-approval";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const sensitiveNote = "Customer SSN 123-45-6789, call back at +1-555-0100";
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Approval-gated note agent",
+      status: "active",
+      allowedTools: ["create_internal_note"],
+      // Forces an otherwise-AUTO_EXECUTE_AND_LOG tool through approval —
+      // agent-configured tier may be STRICTER than the tool's own floor.
+      approvalPolicy: { create_internal_note: "REQUIRE_APPROVAL" },
+    });
+    const deps = { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: DEFAULT_TOOL_REGISTRY };
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: agent.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "create_internal_note", action: "execute", input: { note: sensitiveNote } }] },
+      deps
+    );
+    const approval = toolCallOutcomes[0].approval!;
+
+    // The persisted AUDIT summary is redacted — no raw note text at all —
+    // per createInternalNoteTool.summarizeInputForAudit.
+    const pendingToolCall = toolCallOutcomes[0].toolCall;
+    expect(JSON.stringify(pendingToolCall.requestSummary)).not.toContain("123-45-6789");
+    expect(pendingToolCall.requestSummary).toEqual({ noteLength: sensitiveNote.length });
+    // The canonical, unredacted execution payload lives on the approval.
+    expect(approval.payload).toEqual({ note: sensitiveNote });
+
+    await approveApproval(tenantId, approval.id, "owner-1", "owner", approvalStore);
+    const executed = await resumeAfterApprovalDecision(tenantId, approval.id, deps);
+
+    // createInternalNoteTool.validateInput requires `note` to be a
+    // non-empty STRING — the redacted audit summary ({ noteLength: N })
+    // would fail that check outright (note would be undefined). A
+    // 'succeeded' result here is only reachable if execution actually
+    // validated/ran against approval.payload's real { note: string }, not
+    // the redacted requestSummary — proving execution never sourced from
+    // the redacted audit summary.
+    expect(executed.status).toBe("succeeded");
+
+    // And what's PERSISTED afterward is still redacted — no raw note text.
+    const finalToolCall = await toolCallStore.getByApprovalId(tenantId, approval.id);
+    expect(JSON.stringify(finalToolCall!.responseSummary)).not.toContain("123-45-6789");
+    expect(finalToolCall!.responseSummary).toEqual({ noteLength: sensitiveNote.length });
+  });
+
+  it("auto-execute tool receives the full in-memory input while the stored audit summary is redacted", async () => {
+    const tenantId = "tenant-autoexec-redacted";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const sensitiveNote = "Customer phone +1-555-0199, address 42 Main St";
+    let actualExecuteInput: { note: string } | null = null;
+    const spyingNoteTool: AnyToolDefinition = {
+      ...createInternalNoteTool,
+      async execute(input, ctx) {
+        actualExecuteInput = input;
+        return createInternalNoteTool.execute(input, ctx);
+      },
+    };
+    const tools = { ...DEFAULT_TOOL_REGISTRY, [spyingNoteTool.name]: spyingNoteTool };
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Auto-execute note agent",
+      status: "active",
+      allowedTools: ["create_internal_note"],
+      approvalPolicy: { create_internal_note: "AUTO_EXECUTE_AND_LOG" },
+    });
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: agent.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "create_internal_note", action: "execute", input: { note: sensitiveNote } }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools }
+    );
+
+    expect(toolCallOutcomes[0].toolCall.status).toBe("succeeded");
+    // The tool actually ran on the FULL, unredacted note.
+    expect(actualExecuteInput).toEqual({ note: sensitiveNote });
+    // What's PERSISTED is redacted, on both sides.
+    expect(JSON.stringify(toolCallOutcomes[0].toolCall.requestSummary)).not.toContain("555-0199");
+    expect(toolCallOutcomes[0].toolCall.requestSummary).toEqual({ noteLength: sensitiveNote.length });
+    expect(JSON.stringify(toolCallOutcomes[0].toolCall.responseSummary)).not.toContain("555-0199");
+    expect(toolCallOutcomes[0].toolCall.responseSummary).toEqual({ noteLength: sensitiveNote.length });
+  });
+
+  it("output audit summarization never alters the actual succeeded/failed decision or validateOutput enforcement", async () => {
+    // A tool whose summarizeOutputForAudit would (if wrongly consulted by
+    // the succeeded/failed decision or validateOutput) make a truthful
+    // failure look like a redacted success, or vice versa — proves those
+    // two decisions evaluate the RAW result.summary, never the audit
+    // summary.
+    const tenantId = "tenant-output-audit";
+    const agentStore = new InMemoryAgentStore();
+    const runStore = new InMemoryAgentRunStore();
+    const toolCallStore = new InMemoryToolCallStore();
+    const approvalStore = new InMemoryApprovalStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new MockChatProvider() }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const misleadingAuditTool: AnyToolDefinition = {
+      ...pingTool,
+      summarizeOutputForAudit() {
+        // Deliberately misleading — if this ever influenced validateOutput
+        // or the ok/fail decision, the malformed-output test below would
+        // pass when it must not.
+        return { pong: true, redacted: true };
+      },
+      async execute() {
+        return { ok: true, summary: { pong: "not-a-boolean" } }; // malformed per pingTool.validateOutput
+      },
+    };
+
+    const agent = await agentStore.create({
+      tenantId,
+      agentType: "dev_test",
+      name: "Misleading-audit agent",
+      status: "active",
+      allowedTools: ["ping"],
+      approvalPolicy: { ping: "AUTO_EXECUTE" },
+    });
+
+    const { toolCallOutcomes } = await runAgent(
+      { tenantId, agentId: agent.id, reasoning: { prompt: "test" }, toolPlan: [{ toolName: "ping", action: "execute", input: {} }] },
+      { agentStore, runStore, toolCallStore, approvalStore, gateway, tools: { ping: misleadingAuditTool } }
+    );
+
+    // validateOutput still correctly rejects the malformed raw result,
+    // regardless of what summarizeOutputForAudit would have reported.
+    expect(toolCallOutcomes[0].toolCall.status).toBe("failed");
+    expect(toolCallOutcomes[0].toolCall.error).toMatch(/output validation failed/);
+    // The persisted summary is still the (misleading, by design of this
+    // test) audit summary — proving summarization applies to WHAT'S
+    // PERSISTED only, never to the pass/fail decision itself.
+    expect(toolCallOutcomes[0].toolCall.responseSummary).toEqual({ pong: true, redacted: true });
   });
 
   it("scenario 14: rejecting the approval denies the tool call without ever executing it, and the run reports a truthful terminal status", async () => {

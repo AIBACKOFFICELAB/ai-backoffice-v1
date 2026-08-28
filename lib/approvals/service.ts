@@ -1,5 +1,6 @@
 import { Approval, RequestApprovalInput } from "./types";
 import { ApprovalStore, SupabaseApprovalStore } from "./store";
+import { getTenantContext } from "@/lib/tenant";
 
 const defaultStore = new SupabaseApprovalStore();
 
@@ -88,4 +89,66 @@ async function describeCurrentStatus(tenantId: string, approvalId: string, store
 
 export async function listPendingApprovals(tenantId: string, store: ApprovalStore = defaultStore): Promise<Approval[]> {
   return store.listByTenant(tenantId, { status: "pending" });
+}
+
+/**
+ * A human actor resolved from trusted server-side auth/session context —
+ * never from a caller-supplied claim (P0.9 Slice C, finding M-02).
+ */
+export type ResolvedApprovalActor = { userId: string; tenantId: string; role: "owner" | "staff" };
+
+export type TenantContextResolver = () => Promise<{ tenantId: string; role: "owner" | "staff"; userId: string } | null>;
+
+/**
+ * Resolves the acting human for a SPECIFIC approval's tenant. Verifies the
+ * resolved membership's tenantId matches `expectedTenantId` exactly — a
+ * caller authenticated for a DIFFERENT tenant is refused even though
+ * getTenantContext() itself succeeded, closing the door on a caller who
+ * somehow knows another tenant's approvalId. Returns null (never throws)
+ * on any resolution failure: no session, no membership, or a tenant
+ * mismatch — callers turn that into a clear refusal, not a guess.
+ *
+ * `resolveContext` is injectable so tests can supply a fake authenticated
+ * context without a live Supabase session — production code relies on the
+ * default (getTenantContext, backed by real auth).
+ */
+export async function resolveApprovalActor(expectedTenantId: string, resolveContext: TenantContextResolver = getTenantContext): Promise<ResolvedApprovalActor | null> {
+  const context = await resolveContext();
+  if (!context) return null;
+  if (context.tenantId !== expectedTenantId) return null;
+  return { userId: context.userId, tenantId: context.tenantId, role: context.role };
+}
+
+/**
+ * Production-facing approve entrypoint (P0.9 Slice C, finding M-02):
+ * resolves the acting human from trusted session context instead of
+ * trusting a caller-supplied approverUserId/approverRole. Delegates to
+ * approveApproval — the pure, store-injectable, already-tested CAS core —
+ * once the actor is resolved and verified; that function's own contract
+ * (owner-only, atomic pending->approved) is entirely unchanged. An agent
+ * identity can never reach this path at all: only a resolved HUMAN
+ * tenant-member actor is ever produced by resolveApprovalActor.
+ */
+export async function approveApprovalAsAuthenticatedActor(
+  tenantId: string,
+  approvalId: string,
+  store: ApprovalStore = defaultStore,
+  resolveContext: TenantContextResolver = getTenantContext
+): Promise<Approval> {
+  const actor = await resolveApprovalActor(tenantId, resolveContext);
+  if (!actor) throw new Error("no authenticated tenant member could be resolved for this approval's tenant");
+  return approveApproval(tenantId, approvalId, actor.userId, actor.role, store);
+}
+
+/** See approveApprovalAsAuthenticatedActor above — identical boundary for rejection. */
+export async function rejectApprovalAsAuthenticatedActor(
+  tenantId: string,
+  approvalId: string,
+  reason: string | undefined,
+  store: ApprovalStore = defaultStore,
+  resolveContext: TenantContextResolver = getTenantContext
+): Promise<Approval> {
+  const actor = await resolveApprovalActor(tenantId, resolveContext);
+  if (!actor) throw new Error("no authenticated tenant member could be resolved for this approval's tenant");
+  return rejectApproval(tenantId, approvalId, actor.userId, actor.role, reason, store);
 }

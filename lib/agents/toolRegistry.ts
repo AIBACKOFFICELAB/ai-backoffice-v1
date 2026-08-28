@@ -47,6 +47,26 @@ export interface ToolDefinition<TInput = Record<string, unknown>> {
   /** Optional; best-effort output shape check. Not fatal in P0 — logged by
    * the caller, not enforced as a hard failure. */
   validateOutput?(output: unknown): { ok: true } | { ok: false; errors: string[] };
+  /**
+   * Privacy-minimized AUDIT representation of the input actually used
+   * (P0.9 Slice C, finding H-05/C.5). This is what gets persisted to
+   * tool_calls.request_summary — NEVER what the runtime executes from.
+   * Optional: when omitted, the tool's own raw input is persisted as-is,
+   * matching pre-Slice-C behavior — safe only because none of the three
+   * default P0 tools (ping, create_internal_note, draft_customer_message)
+   * handle raw customer-sensitive data. A FUTURE tool whose input carries
+   * real customer PII (a phone number, a message body, an address) MUST
+   * define this to redact/minimize before persisting. Computed from the
+   * RAW planned input, before validateInput runs (a call that fails
+   * validation still gets an audit record).
+   */
+  summarizeInputForAudit?(input: TInput): Record<string, unknown>;
+  /** Same contract, for the tool's own execute() result (persisted to
+   * tool_calls.response_summary). Optional; defaults to the tool's raw
+   * result.summary. Never affects validateOutput or the succeeded/failed
+   * decision, which always evaluate the RAW result — see
+   * lib/agents/runtime.ts::executeToolDefinition. */
+  summarizeOutputForAudit?(output: Record<string, unknown>): Record<string, unknown>;
   /** Whether calling execute() twice with the same input is safe. None of
    * the P0 tools have external side effects, so all three are technically
    * idempotent; this field exists for the tools that won't be. */
@@ -111,6 +131,17 @@ export const createInternalNoteTool: ToolDefinition<{ note: string }> = {
       return { ok: false, errors: ["note is required and must be a non-empty string"] };
     }
     return { ok: true, value: { note: input.note } };
+  },
+  // P0.9 Slice C, finding H-05/C.5: a note's text could carry customer
+  // detail — persist only its length to the audit trail, never the
+  // content. execute() below still receives the FULL, unredacted note
+  // (this only changes what's written to tool_calls.request_summary/
+  // response_summary).
+  summarizeInputForAudit(input) {
+    return { noteLength: input.note.length };
+  },
+  summarizeOutputForAudit(output) {
+    return { noteLength: typeof output.note === "string" ? output.note.length : null };
   },
   async execute(input) {
     return { ok: true, summary: { note: input.note } };

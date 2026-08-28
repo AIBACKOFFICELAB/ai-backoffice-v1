@@ -25,12 +25,15 @@ export class AnthropicChatProvider implements ChatProvider {
       throw new Error("Anthropic provider not configured: ANTHROPIC_API_KEY is not set");
     }
 
-    const response = await this.client.messages.create({
-      model: params.model,
-      max_tokens: params.maxOutputTokens ?? 1024,
-      ...(params.system ? { system: params.system } : {}),
-      messages: [{ role: "user", content: params.prompt }],
-    });
+    const response = await this.client.messages.create(
+      {
+        model: params.model,
+        max_tokens: params.maxOutputTokens ?? 1024,
+        ...(params.system ? { system: params.system } : {}),
+        messages: [{ role: "user", content: params.prompt }],
+      },
+      params.signal ? { signal: params.signal } : undefined
+    );
 
     const text = response.content
       .filter((block): block is Anthropic.TextBlock => block.type === "text")

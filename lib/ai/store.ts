@@ -17,7 +17,13 @@ export type ModelInvocationRecord = {
   latencyMs: number | null;
   estimatedCostUsd: number | null;
   status: "succeeded" | "failed";
+  /** Sanitized, safe-to-display failure description — never the raw
+   * provider error body (P0.9 Slice C, finding M-05/C.6). See
+   * lib/ai/gateway.ts::normalizeProviderError. */
   error: string | null;
+  /** Normalized failure category; null on success. See
+   * AiGatewayErrorCategory in lib/ai/types.ts. */
+  errorCategory: string | null;
 };
 
 export interface ModelInvocationStore {
@@ -44,6 +50,7 @@ export class SupabaseModelInvocationStore implements ModelInvocationStore {
       estimated_cost_usd: entry.estimatedCostUsd,
       status: entry.status,
       error: entry.error,
+      error_category: entry.errorCategory,
     });
     if (error) throw new Error(`[model_invocations] insert failed: ${error.message}`);
   }
@@ -73,6 +80,7 @@ export class SupabaseModelInvocationStore implements ModelInvocationStore {
       estimatedCostUsd: row.estimated_cost_usd,
       status: row.status,
       error: row.error,
+      errorCategory: row.error_category ?? null,
     }));
   }
 }

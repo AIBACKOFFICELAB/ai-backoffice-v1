@@ -31,6 +31,10 @@ export type AiTextRequestInput = AiRoutingMetadata & {
   prompt: string;
   system?: string;
   maxOutputTokens?: number;
+  /** P0.9 Slice C, finding M-05: overrides the gateway's default finite
+   * deadline for this call. Every provider invocation has SOME deadline —
+   * this only changes which one. */
+  timeoutMs?: number;
 };
 
 export type AiTextRequest = AiTextRequestInput & { taskType: AiTaskType };
@@ -46,6 +50,7 @@ export type AiTextResponse = {
 
 export type AiEmbedRequestInput = AiRoutingMetadata & {
   input: string[];
+  timeoutMs?: number;
 };
 
 export type AiEmbedRequest = AiEmbedRequestInput & { taskType: "embed" };
@@ -59,9 +64,42 @@ export type AiEmbedResponse = {
   invocationId: string;
 };
 
+/**
+ * Normalized failure taxonomy (P0.9 Slice C, finding M-05). Every gateway
+ * failure — timeout, provider outage, rate limit, auth, malformed
+ * structured output, missing configuration, or anything unrecognized — is
+ * reported through exactly one of these categories, never a raw
+ * provider-specific error shape. See lib/ai/gateway.ts::normalizeProviderError.
+ */
+export type AiGatewayErrorCategory = "timeout" | "provider_unavailable" | "rate_limited" | "authentication" | "invalid_response" | "configuration" | "unknown";
+
 export class AiGatewayError extends Error {
-  constructor(message: string, public readonly cause?: unknown) {
+  constructor(message: string, public readonly category: AiGatewayErrorCategory = "unknown", public readonly cause?: unknown) {
     super(message);
     this.name = "AiGatewayError";
   }
 }
+
+/** Minimal, provider-independent structured-output validation primitive
+ * (P0.9 Slice C, finding M-05/C.9). NOT an autonomous tool-selection loop
+ * and NOT tied to any particular schema library — a caller supplies its
+ * own `validate`, which must return { ok: false, errors } rather than
+ * throwing on malformed input, mirroring ToolDefinition.validateInput's
+ * shape (lib/agents/toolRegistry.ts) for consistency across this codebase. */
+export type StructuredOutputValidation<T> = { ok: true; value: T } | { ok: false; errors: string[] };
+
+export type AiStructuredRequestInput<T> = AiTextRequestInput & {
+  /** Runs against the raw completion text. A malformed/unparseable
+   * response MUST return { ok: false }, never be treated as trusted
+   * structured data by returning something ad hoc. */
+  validate(rawText: string): StructuredOutputValidation<T>;
+};
+
+export type AiStructuredResponse<T> = {
+  value: T;
+  provider: string;
+  model: string;
+  usage: { inputTokens?: number; outputTokens?: number };
+  latencyMs: number;
+  invocationId: string;
+};

@@ -155,12 +155,21 @@ export async function runAgent(input: RunAgentInput, deps: AgentRuntimeDeps = {}
 
     const decision = evaluateToolCall(agent, tool);
 
+    // P0.9 Slice C, finding H-05/C.5: tool_calls.request_summary is a
+    // privacy-minimized AUDIT representation, computed from the raw
+    // planned input, before validation — it is NEVER what gets executed.
+    // For an approval-gated call, approvals.payload (set below,
+    // unminimized) is the sole canonical resumable execution payload; for
+    // an AUTO_EXECUTE call, execution reads the in-memory validated input
+    // directly (see the "allow" branch below), never this summary either.
+    const auditRequestSummary = tool.summarizeInputForAudit ? tool.summarizeInputForAudit(planned.input) : planned.input;
+
     const toolCall = await toolCallStore.create({
       tenantId: input.tenantId,
       agentRunId: agentRun.id,
       toolName: tool.name,
       action: planned.action,
-      requestSummary: planned.input,
+      requestSummary: auditRequestSummary,
       requiresApproval: decision.decision === "require_approval",
       policySnapshot: buildPolicySnapshot(agent, tool, tool.name, planned.action, decision),
     });
@@ -247,10 +256,17 @@ async function executeToolDefinition(
 ): Promise<ToolCall> {
   try {
     const result = await tool.execute(input, { tenantId, agentRunId });
+    // P0.9 Slice C, finding H-05/C.5: what gets PERSISTED may be
+    // privacy-minimized; the succeeded/failed decision and validateOutput
+    // below always evaluate the RAW result.summary, never this audit
+    // summary — summarization must never alter actual tool result
+    // handling.
+    const auditResponseSummary = tool.summarizeOutputForAudit ? tool.summarizeOutputForAudit(result.summary) : result.summary;
+
     if (!result.ok) {
       return toolCallStore.update(tenantId, toolCall.id, {
         status: "failed",
-        responseSummary: result.summary,
+        responseSummary: auditResponseSummary,
         error: result.error ?? null,
         completedAt: new Date().toISOString(),
       });
@@ -265,7 +281,7 @@ async function executeToolDefinition(
       if (!outputValidation.ok) {
         return toolCallStore.update(tenantId, toolCall.id, {
           status: "failed",
-          responseSummary: result.summary,
+          responseSummary: auditResponseSummary,
           error: `output validation failed: ${outputValidation.errors.join("; ")}`,
           completedAt: new Date().toISOString(),
         });
@@ -274,7 +290,7 @@ async function executeToolDefinition(
 
     return toolCallStore.update(tenantId, toolCall.id, {
       status: "succeeded",
-      responseSummary: result.summary,
+      responseSummary: auditResponseSummary,
       error: null,
       completedAt: new Date().toISOString(),
     });
@@ -380,13 +396,22 @@ async function executeApprovedToolCall(
     });
   }
 
+  // P0.9 Slice C, finding H-05/C.5: execute from approval.payload — the
+  // canonical, unminimized resumable execution payload — never from
+  // toolCall.requestSummary, which is now a privacy-minimized AUDIT
+  // summary that may not even be shaped like valid tool input (see
+  // ToolDefinition.summarizeInputForAudit). This also means the payload-
+  // binding digest recomputed below detects tampering with approval.payload
+  // itself (the actual execution surface), not tampering with the audit
+  // summary — mutating the audit record can no longer authorize different
+  // execution data, by construction.
   const expectedDigest = computePayloadDigest({
     tenantId: approval.tenantId,
     agentId: approval.agentId,
     agentRunId: approval.agentRunId,
     toolName: toolCall.toolName,
     action: toolCall.action,
-    payload: toolCall.requestSummary,
+    payload: approval.payload,
   });
 
   const claimed = await approvalStore.beginExecution(tenantId, approval.id, expectedDigest);
@@ -414,7 +439,9 @@ async function executeApprovedToolCall(
     });
   }
 
-  const validation = tool.validateInput(toolCall.requestSummary);
+  // Validate and execute from approval.payload (the approved execution
+  // payload), never toolCall.requestSummary — see the doc comment above.
+  const validation = tool.validateInput(approval.payload);
   if (!validation.ok) {
     const updated = await toolCallStore.update(tenantId, toolCall.id, {
       status: "failed",
