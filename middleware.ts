@@ -9,6 +9,7 @@ const protectedRoutes = [
   "/review-requests",
   "/settings",
   "/prospects",
+  "/agentic",
 ];
 
 export async function middleware(request: NextRequest) {

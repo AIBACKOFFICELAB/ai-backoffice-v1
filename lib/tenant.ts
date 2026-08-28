@@ -5,6 +5,11 @@ export type TenantContext = {
   tenantName: string;
   tenantSlug: string;
   role: "owner" | "staff";
+  /** The resolved, AUTHENTICATED Supabase user id (P0.9 Slice C, finding
+   * M-02) — never a caller-supplied claim. See
+   * lib/approvals/service.ts::resolveApprovalActor, the first consumer
+   * that needs this alongside role. */
+  userId: string;
 };
 
 /**
@@ -40,6 +45,7 @@ export async function getTenantContext(): Promise<TenantContext | null> {
     tenantName: tenant?.name ?? "Unknown Business",
     tenantSlug: tenant?.slug ?? "",
     role: data.role as "owner" | "staff",
+    userId: user.id,
   };
 }
 

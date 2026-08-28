@@ -1,6 +1,7 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { sendSms } from "@/lib/sms/twilio";
 import { PlumbingLead } from "@/data/leadModel";
+import { renderTemplate } from "@/lib/templates";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -13,10 +14,6 @@ export type EstimateFollowupSettings = {
   stopOnReply: boolean;
   stopOnStatusChange: boolean;
 };
-
-function renderTemplate(template: string, vars: Record<string, string>): string {
-  return template.replace(/{{\s*(\w+)\s*}}/g, (_, key) => vars[key] ?? "");
-}
 
 export async function getEstimateFollowupSettings(tenantId: string): Promise<EstimateFollowupSettings | null> {
   const supabase = await createServerSupabaseClient();
@@ -52,6 +49,19 @@ export async function updateEstimateFollowupSettings(tenantId: string, update: P
   if (error) throw new Error(error.message);
 }
 
+export type FollowupDueDates = { day1DueAt: string; day3DueAt: string; day7DueAt: string };
+
+/** Pure Day 1 / Day 3 / Day 7 due-date math, extracted from an inline
+ * literal so it's regression-testable (see service.test.ts). Behavior is
+ * unchanged. */
+export function computeFollowupDueDates(sentAt: Date): FollowupDueDates {
+  return {
+    day1DueAt: new Date(sentAt.getTime() + 1 * DAY_MS).toISOString(),
+    day3DueAt: new Date(sentAt.getTime() + 3 * DAY_MS).toISOString(),
+    day7DueAt: new Date(sentAt.getTime() + 7 * DAY_MS).toISOString(),
+  };
+}
+
 /** Trigger layer: enroll a lead the moment its status becomes "Estimate Sent". */
 export async function enrollLeadInFollowup(tenantId: string, lead: PlumbingLead) {
   const supabase = await createServerSupabaseClient();
@@ -68,13 +78,14 @@ export async function enrollLeadInFollowup(tenantId: string, lead: PlumbingLead)
   }
 
   const sentAt = new Date();
+  const dueDates = computeFollowupDueDates(sentAt);
   const { error } = await supabase.from("estimate_followup_sequences").insert({
     tenant_id: tenantId,
     lead_id: lead.id,
     estimate_sent_at: sentAt.toISOString(),
-    day1_due_at: new Date(sentAt.getTime() + 1 * DAY_MS).toISOString(),
-    day3_due_at: new Date(sentAt.getTime() + 3 * DAY_MS).toISOString(),
-    day7_due_at: new Date(sentAt.getTime() + 7 * DAY_MS).toISOString(),
+    day1_due_at: dueDates.day1DueAt,
+    day3_due_at: dueDates.day3DueAt,
+    day7_due_at: dueDates.day7DueAt,
     status: "active",
   });
 
@@ -145,6 +156,15 @@ export async function processDueFollowups() {
   return results;
 }
 
+export type FollowupStep = { key: "day1" | "day3" | "day7"; dueAt: string; sentAt: string | null; template: string };
+
+/** Selects the earliest not-yet-sent step whose due date has passed.
+ * Extracted from an inline `.find()` for regression testing — behavior is
+ * unchanged. */
+export function selectDueStep(steps: FollowupStep[], now: Date): FollowupStep | undefined {
+  return steps.find((s) => !s.sentAt && new Date(s.dueAt) <= now);
+}
+
 async function processSequence(seq: Record<string, any>) {
   const supabase = await createServerSupabaseClient();
   const settings = await getEstimateFollowupSettings(seq.tenant_id);
@@ -167,13 +187,13 @@ async function processSequence(seq: Record<string, any>) {
   }
 
   const now = new Date();
-  const steps: Array<{ key: "day1" | "day3" | "day7"; dueAt: string; sentAt: string | null; template: string }> = [
+  const steps: FollowupStep[] = [
     { key: "day1", dueAt: seq.day1_due_at, sentAt: seq.day1_sent_at, template: settings.day1Template },
     { key: "day3", dueAt: seq.day3_due_at, sentAt: seq.day3_sent_at, template: settings.day3Template },
     { key: "day7", dueAt: seq.day7_due_at, sentAt: seq.day7_sent_at, template: settings.day7Template },
   ];
 
-  const due = steps.find((s) => !s.sentAt && new Date(s.dueAt) <= now);
+  const due = selectDueStep(steps, now);
   if (!due) {
     return { leadId: seq.lead_id, action: "skipped", reason: "nothing-due" };
   }

@@ -1,5 +1,13 @@
 # 10 — Roadmap
 
+*P0 Amendment (per Article VIII of [[02_PRODUCT_CONSTITUTION]]): this
+roadmap covers product/module delivery. A parallel, separate roadmap,
+`../../AGENTIC_ROADMAP.md`, covers the P0 Agentic Foundation and what it
+unlocks (P1 intelligence, P2 execution, P3 scale, per
+`../../ARCHITECTURE.md`). The two are complementary — module delivery here
+is not blocked on agentic work, and agentic work does not replace any
+module in the MVP list below.*
+
 Every milestone below maps back to the seven MVP systems defined in
 [[05_MVP_CONSTITUTION]], obeys [[03_MODULE_ARCHITECTURE]] and
 [[04_SYSTEM_LIFECYCLE]], and is scoped against the Non-goals in

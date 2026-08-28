@@ -7,7 +7,8 @@ import { LeadUpdate } from "@/data/leadModel";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(request: NextRequest, { params }: { params: { id: string } }) {
+export async function GET(request: NextRequest, props: { params: Promise<{ id: string }> }) {
+  const params = await props.params;
   const auth = await checkAuth(request);
   if (!auth.authenticated) {
     return auth.response!;
@@ -27,7 +28,8 @@ export async function GET(request: NextRequest, { params }: { params: { id: stri
   return NextResponse.json({ lead });
 }
 
-export async function PUT(request: NextRequest, { params }: { params: { id: string } }) {
+export async function PUT(request: NextRequest, props: { params: Promise<{ id: string }> }) {
+  const params = await props.params;
   const auth = await checkAuth(request);
   if (!auth.authenticated) {
     return auth.response!;
@@ -68,7 +70,8 @@ export async function PUT(request: NextRequest, { params }: { params: { id: stri
   return NextResponse.json({ lead: updatedLead });
 }
 
-export async function DELETE(request: NextRequest, { params }: { params: { id: string } }) {
+export async function DELETE(request: NextRequest, props: { params: Promise<{ id: string }> }) {
+  const params = await props.params;
   const auth = await checkAuth(request);
   if (!auth.authenticated) {
     return auth.response!;

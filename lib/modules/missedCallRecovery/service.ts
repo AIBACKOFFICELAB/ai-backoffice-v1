@@ -3,6 +3,8 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { createLead } from "@/lib/leads/repository";
 import { sendSms, SendSmsResult } from "@/lib/sms/twilio";
 import { sendEmail, SendEmailResult } from "@/lib/email/resend";
+import { emitEventSafely } from "@/lib/events/service";
+import { renderTemplate } from "@/lib/templates";
 
 const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://aibackoffice.app";
 
@@ -42,10 +44,6 @@ function mapSettingsRow(data: Record<string, any>): MissedCallSettings {
     businessTagline: data.business_tagline,
     emergencyKeywords: data.emergency_keywords ?? [],
   };
-}
-
-function renderTemplate(template: string, vars: Record<string, string>): string {
-  return template.replace(/{{\s*(\w+)\s*}}/g, (_, key) => vars[key] ?? "");
 }
 
 /** Trigger layer: resolves which tenant a missed call belongs to, by the number that was called. */
@@ -92,6 +90,17 @@ export async function updateMissedCallSettings(tenantId: string, update: Partial
 
 type ChannelOutcome = "sent" | "failed" | "skipped";
 
+/** Legacy overall-status vocabulary — extracted from an inline literal for
+ * regression testing, same pattern as
+ * lib/modules/estimateFollowup/service.ts::computeFollowupDueDates.
+ * Behavior is UNCHANGED: "recovered" means "the recovery SMS was
+ * successfully sent" — see executeMissedCallRecovery's doc comment for why
+ * this is deliberately NOT the same claim as the canonical `lead_recovered`
+ * outcome (P0.9 Slice C, finding H-03). */
+export function computeOverallStatus(recoverySmsResult: SendSmsResult): "recovered" | "skipped" | "failed" {
+  return recoverySmsResult.ok ? "recovered" : recoverySmsResult.skipped ? "skipped" : "failed";
+}
+
 function outcomeFromSms(result: SendSmsResult): ChannelOutcome {
   if (result.ok) return "sent";
   if (result.skipped) return "skipped";
@@ -119,6 +128,19 @@ function reasonFromEmail(result: SendEmailResult): string | undefined {
  * notifies the owner by SMS and email, and writes every outcome to History.
  * Idempotent per callSid. No step is allowed to silently fail — every
  * channel's outcome (sent/failed/skipped + reason) is recorded.
+ *
+ * P0.9 Slice C, finding H-03 — attribution correction: a successfully SENT
+ * recovery SMS is recorded in legacy History as status='recovered' (kept
+ * verbatim for backward-compatible analytics/UI — see writeHistory below)
+ * but NO LONGER emits a canonical `lead_recovered` outcome. Sending a
+ * message proves the system ACTED, not that the customer engaged, replied,
+ * booked, or generated revenue — see docs/OUTCOME_ATTRIBUTION.md. The
+ * legacy History string "recovered" and the canonical outcome type
+ * `lead_recovered` are DELIBERATELY DIFFERENT CLAIMS now: the former means
+ * "recovery SMS successfully sent," the latter would mean "the customer
+ * actually re-engaged," which this module cannot currently observe. No
+ * evidence path for real re-engagement exists yet in this repository, so
+ * none is fabricated here — see the P0.9 Slice C directive.
  */
 export async function executeMissedCallRecovery(tenantId: string, settings: MissedCallSettings, payload: MissedCallPayload, tenantName: string) {
   const supabase = await createServerSupabaseClient();
@@ -134,6 +156,39 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
       return { status: "skipped" as const, reason: "already-processed" };
     }
   }
+
+  // P0.9 Slice C, finding M-04: one correlationId minted per logical
+  // execution of this module, chaining every business event this run
+  // emits — independent of whether any individual emission actually
+  // succeeds (emitEventSafely is deadline-bounded and fail-open; the
+  // correlation chain is generated locally so it never depends on a
+  // prior emission having landed). causationId points at the actual
+  // antecedent EVENT's own id when one was successfully recorded, else
+  // null — never fabricated.
+  const correlationId = randomUUID();
+
+  // Compatibility adapter (P0.5): emit a canonical business event alongside
+  // this module's existing execution path, without changing that path's
+  // behavior. See docs/EVENT_SYSTEM.md "Migration strategy." Never allowed
+  // to affect the outcome below — emitEventSafely is fail-open and
+  // deadline-bounded (P0.9 Slice C, finding H-01 — see
+  // lib/telemetry/deadline.ts).
+  //
+  // P0.9 Slice C, finding H-05 (PII minimization): entity identity prefers
+  // callSid over the caller's raw phone number; the payload never
+  // duplicates the raw phone at all — missed_call_recovery_history (the
+  // actual system of record for this call) already has it.
+  const callMissedEvent = await emitEventSafely({
+    tenantId,
+    eventType: "call.missed",
+    actorType: "integration",
+    actorId: "twilio",
+    entityType: "call",
+    entityId: payload.callSid ?? null,
+    correlationId,
+    idempotencyKey: payload.callSid ? `call.missed:${payload.callSid}` : undefined,
+    payload: { callSid: payload.callSid ?? null, triggerSource: payload.triggerSource ?? "twilio_missed_call" },
+  });
 
   if (!settings.enabled) {
     await writeHistory(tenantId, payload, {
@@ -185,6 +240,17 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
       tenantId
     );
     leadId = lead.id;
+    await emitEventSafely({
+      tenantId,
+      eventType: "lead.created",
+      actorType: "system",
+      actorId: "missed-call-recovery",
+      entityType: "lead",
+      entityId: leadId,
+      correlationId,
+      causationId: callMissedEvent?.id ?? null,
+      payload: { source: "missed-call-recovery", status: "New" },
+    });
   } catch (error) {
     console.error("[missed-call-recovery] failed to create lead", error);
   }
@@ -211,7 +277,28 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
     ownerEmailResult = await sendEmail(settings.ownerNotificationEmail, "New Missed Call Lead Recovered", emailBody);
   }
 
-  const overallStatus = recoverySmsResult.ok ? "recovered" : recoverySmsResult.skipped ? "skipped" : "failed";
+  // Legacy status vocabulary — UNCHANGED. "recovered" here means "the
+  // recovery SMS was successfully sent," exactly as before. See the
+  // function doc comment above: this is NOT the same claim as the
+  // canonical `lead_recovered` outcome, which is no longer emitted here.
+  const overallStatus = computeOverallStatus(recoverySmsResult);
+
+  if (overallStatus === "recovered") {
+    // P0.9 Slice C, finding H-03/H-05: an operational event only — the SMS
+    // was sent, nothing more is claimed. No callerPhone in the payload; no
+    // `recordOutcomeSafely` call — see the function doc comment above.
+    await emitEventSafely({
+      tenantId,
+      eventType: "recovery.sms_sent",
+      actorType: "system",
+      actorId: "missed-call-recovery",
+      entityType: "lead",
+      entityId: leadId,
+      correlationId,
+      causationId: callMissedEvent?.id ?? null,
+      payload: { recoverySmsSid: recoverySmsResult.ok ? recoverySmsResult.sid ?? null : null },
+    });
+  }
 
   await writeHistory(tenantId, payload, {
     status: overallStatus,
