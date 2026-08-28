@@ -231,7 +231,7 @@ describe("effect-idempotency contract (B-05, corrected)", () => {
 
     expect(seenKeys).toHaveLength(2);
     expect(seenKeys[0]).toBe(seenKeys[1]);
-    expect(seenKeys[0]).toBe(`demo:${job.id}`);
+    expect(seenKeys[0]).toBe(`tenant:t1:job:demo:id:${job.id}`);
   });
 
   it("test 5: distinct jobs get distinct default effect keys", async () => {
@@ -253,7 +253,7 @@ describe("effect-idempotency contract (B-05, corrected)", () => {
     expect(computeEffectKey(second.job)).toBe(computeEffectKey(first.job));
     // Namespaced distinctly from the job.id-derived default, so an
     // idempotencyKey-based key can never collide with a bare id-derived one.
-    expect(computeEffectKey(first.job)).toBe("idempotency:order-42");
+    expect(computeEffectKey(first.job)).toBe("tenant:t1:job:demo:idempotency:order-42");
   });
 
   it("test 7: a consequential handler cannot override the runtime-owned effect key", async () => {
@@ -275,7 +275,121 @@ describe("effect-idempotency contract (B-05, corrected)", () => {
 
     await processDueJobs({ demo: consequentialHandler }, { store });
 
-    expect(observedKey).toBe(`demo:${job.id}`);
+    expect(observedKey).toBe(`tenant:t1:job:demo:id:${job.id}`);
+    expect(observedKey).not.toBe("hacked-key");
+  });
+});
+
+/**
+ * Tenant-namespaced effect key (P0.9 Slice B correction 4). Independent
+ * verification found that computeEffectKey's idempotencyKey branch
+ * ("idempotency:${key}") ignored tenant identity entirely — but migration
+ * 016 only guarantees idempotency_key uniqueness as
+ * UNIQUE(tenant_id, idempotency_key), so two DIFFERENT tenants may
+ * legitimately both enqueue the same idempotencyKey and would then collide
+ * on the exact same external-provider idempotency key. Fixed by making
+ * computeEffectKey always tenant- and job-type-namespaced — see
+ * lib/execution/types.ts::computeEffectKey for the exact format.
+ */
+describe("tenant-namespaced effect key (correction 4)", () => {
+  it("test 1: same tenant, same logical job, across retries — identical key", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job } = await store.enqueue({ tenantId: "tenant-a", jobType: "demo", maxAttempts: 5 });
+    const [claim1] = await store.claimBatch("worker-a", 1);
+    const keyAfterClaim1 = computeEffectKey(claim1);
+
+    const stuck = await store.getById("tenant-a", job.id);
+    stuck!.lockExpiresAt = new Date(Date.now() - 1000).toISOString();
+    const [claim2] = await store.claimBatch("worker-b", 1);
+
+    expect(computeEffectKey(claim2)).toBe(keyAfterClaim1);
+    expect(keyAfterClaim1).toBe(`tenant:tenant-a:job:demo:id:${job.id}`);
+  });
+
+  it("test 2: tenant A and tenant B using the SAME idempotencyKey get DIFFERENT keys", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job: jobA } = await store.enqueue({ tenantId: "tenant-a", jobType: "demo", idempotencyKey: "invoice-123" });
+    const { job: jobB } = await store.enqueue({ tenantId: "tenant-b", jobType: "demo", idempotencyKey: "invoice-123" });
+
+    const keyA = computeEffectKey(jobA);
+    const keyB = computeEffectKey(jobB);
+    expect(keyA).not.toBe(keyB);
+    expect(keyA).toBe("tenant:tenant-a:job:demo:idempotency:invoice-123");
+    expect(keyB).toBe("tenant:tenant-b:job:demo:idempotency:invoice-123");
+  });
+
+  it("test 3: same tenant, same idempotencyKey, different jobType — different keys", () => {
+    // computeEffectKey is a pure function of its (tenantId, jobType, id,
+    // idempotencyKey) inputs — tested directly here rather than through
+    // store.enqueue() twice, because enqueue()'s dedup key is
+    // (tenantId, idempotencyKey) ONLY (matching migration 016's real
+    // UNIQUE(tenant_id, idempotency_key) constraint, which this correction
+    // does not change), so a second enqueue() call with the same tenant +
+    // idempotencyKey but a different jobType is legitimately deduped back
+    // to the FIRST job's row — it can never produce two rows differing
+    // only by jobType to exercise this case end-to-end. That dedup
+    // behavior is itself the "explicitly justified reason" the two would
+    // ever represent the same effect (the database says so); this test
+    // instead proves computeEffectKey's own contract holds given two
+    // logically distinct job identities.
+    const keyEmail = computeEffectKey({ tenantId: "tenant-a", jobType: "send_email", id: "job-1", idempotencyKey: "shared-key" });
+    const keyInvoice = computeEffectKey({ tenantId: "tenant-a", jobType: "send_invoice", id: "job-2", idempotencyKey: "shared-key" });
+
+    expect(keyEmail).not.toBe(keyInvoice);
+  });
+
+  it("test 4: the no-idempotency-key fallback remains stable across retries/reclaims", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job } = await store.enqueue({ tenantId: "tenant-a", jobType: "demo", maxAttempts: 5 });
+    const [claim1] = await store.claimBatch("worker-a", 1);
+    const firstKey = computeEffectKey(claim1);
+
+    const stuck = await store.getById("tenant-a", job.id);
+    stuck!.lockExpiresAt = new Date(Date.now() - 1000).toISOString();
+    const [claim2] = await store.claimBatch("worker-b", 1);
+
+    expect(computeEffectKey(claim2)).toBe(firstKey);
+    expect(firstKey).toBe(`tenant:tenant-a:job:demo:id:${job.id}`);
+  });
+
+  it("test 5: changing attempts, lease_token, or worker (locked_by) does not influence the key", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job } = await store.enqueue({ tenantId: "tenant-a", jobType: "demo", maxAttempts: 5 });
+    const [claim1] = await store.claimBatch("worker-alpha", 1);
+    // Capture primitives before the reclaim mutates the shared row object
+    // (InMemoryDurableJobStore aliasing — see the notes earlier in this
+    // file).
+    const firstAttempts = claim1.attempts;
+    const firstToken = claim1.leaseToken;
+    const firstLockedBy = claim1.lockedBy;
+    const firstKey = computeEffectKey(claim1);
+
+    const stuck = await store.getById("tenant-a", job.id);
+    stuck!.lockExpiresAt = new Date(Date.now() - 1000).toISOString();
+    const [claim2] = await store.claimBatch("worker-beta", 1);
+
+    expect(claim2.attempts).not.toBe(firstAttempts);
+    expect(claim2.leaseToken).not.toBe(firstToken);
+    expect(claim2.lockedBy).not.toBe(firstLockedBy);
+    expect(computeEffectKey(claim2)).toBe(firstKey);
+  });
+
+  it("test 6: a consequential handler still cannot override the tenant-namespaced runtime-owned key", async () => {
+    const store = new InMemoryDurableJobStore();
+    const { job } = await enqueueJob({ tenantId: "tenant-a", jobType: "demo" }, store);
+
+    let observedKey: string | null = null;
+    const consequentialHandler = handler(
+      async (_job, ctx) => {
+        observedKey = ctx.effectKey;
+      },
+      { consequential: true }
+    );
+    (consequentialHandler as unknown as Record<string, unknown>).deriveEffectKey = () => "hacked-key";
+
+    await processDueJobs({ demo: consequentialHandler }, { store });
+
+    expect(observedKey).toBe(`tenant:tenant-a:job:demo:id:${job.id}`);
     expect(observedKey).not.toBe("hacked-key");
   });
 });

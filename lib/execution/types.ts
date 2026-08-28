@@ -124,22 +124,38 @@ export interface JobHandlerDefinition {
 }
 
 /**
- * The runtime-owned, authoritative effect-key derivation (P0.9 Slice B
- * correction 2). Computed EXCLUSIVELY from immutable durable-job identity:
+ * The runtime-owned, authoritative effect-key derivation (P0.6 finding
+ * B-05, hardened P0.9 Slice B corrections 2 and 3). Computed EXCLUSIVELY
+ * from immutable durable-job identity, always tenant-namespaced:
  *
- *   - job.idempotencyKey, if the enqueue() caller supplied one — it is set
- *     once at enqueue and never changes; or otherwise
- *   - `${job.jobType}:${job.id}` — job.id is assigned once at enqueue and
- *     never changes either.
+ *   - `tenant:${job.tenantId}:job:${job.jobType}:idempotency:${job.idempotencyKey}`
+ *     when the enqueue() caller supplied an idempotencyKey; or otherwise
+ *   - `tenant:${job.tenantId}:job:${job.jobType}:id:${job.id}`
  *
- * Neither input is affected by attempts, lease_token, locked_by, timestamps,
- * or any other field that changes across a claim/reclaim/retry — so the
- * result is stable BY CONSTRUCTION, not by convention or handler
- * cooperation. No handler input is read; a handler has no way to override
- * this value (see JobHandlerDefinition's doc comment above).
+ * Tenant-namespacing (correction 3) matters because migration 016 only
+ * guarantees idempotency_key uniqueness as UNIQUE(tenant_id,
+ * idempotency_key) — two different tenants may legitimately both enqueue
+ * idempotencyKey='invoice-123'. Without job.tenantId in the key, those two
+ * tenants' jobs would collide on the exact same external-provider
+ * idempotency key, which is not tenant-safe for a provider whose keys are
+ * scoped globally to the account/application, not per caller-tenant.
+ * job.jobType is included too, so the same idempotencyKey used for two
+ * different job types never collides by default — a future case where two
+ * job types genuinely represent the same external effect and must SHARE a
+ * key needs its own explicitly justified design, not an accidental
+ * collision here.
+ *
+ * tenantId, jobType, id, and idempotencyKey are all set once at enqueue()
+ * and never change; none of them are affected by attempts, lease_token,
+ * locked_by, timestamps, or any other field that changes across a
+ * claim/reclaim/retry — so the result is stable BY CONSTRUCTION, not by
+ * convention or handler cooperation. No handler input is read; a handler
+ * has no way to override this value (see JobHandlerDefinition's doc
+ * comment above).
  */
-export function computeEffectKey(job: Pick<DurableJob, "jobType" | "id" | "idempotencyKey">): string {
-  return job.idempotencyKey ? `idempotency:${job.idempotencyKey}` : `${job.jobType}:${job.id}`;
+export function computeEffectKey(job: Pick<DurableJob, "tenantId" | "jobType" | "id" | "idempotencyKey">): string {
+  const identity = job.idempotencyKey ? `idempotency:${job.idempotencyKey}` : `id:${job.id}`;
+  return `tenant:${job.tenantId}:job:${job.jobType}:${identity}`;
 }
 
 export type JobHandlerContext = {
