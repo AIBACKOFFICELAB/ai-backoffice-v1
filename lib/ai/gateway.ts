@@ -283,7 +283,19 @@ export class AiGateway {
       inputTokens: tokens.inputTokens,
       outputTokens: tokens.outputTokens,
       latencyMs,
-      estimatedCostUsd: null,
+      // P0.9 Slice D, D.12: a real provider response can precede this
+      // failure (generateStructured's invalid_response case) — the
+      // provider call itself still consumed real tokens/cost regardless of
+      // what the caller's own validator decided afterward, so this must
+      // not be hardcoded null. estimateCostUsd is already null-safe for
+      // every OTHER recordFailure caller (timeout/auth/rate-limit/
+      // no-provider-configured), where tokens is always the {null, null}
+      // default — same call, same correct null result, no special-casing
+      // needed. estimateCostUsd itself still returns null whenever
+      // PRICING_TABLE has no confirmed price for a given provider/model
+      // (see lib/ai/pricing.ts) — a pre-existing, documented, honest gap
+      // this call does not change.
+      estimatedCostUsd: estimateCostUsd(route.provider, route.model, tokens.inputTokens, tokens.outputTokens),
       status: "failed",
       // Sanitized, safe message only — see normalizeProviderError; never
       // the raw provider error text (P0.9 Slice C, finding C.6).

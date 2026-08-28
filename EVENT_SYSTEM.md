@@ -60,6 +60,41 @@ await emitEvent({ tenantId, eventType: "lead.created", entityType: "lead", entit
   (see `lib/modules/missedCallRecovery/service.ts`) — a business event must
   never be able to break a real customer-facing action.
 
+### Bounded fail-open deadline (P0.9 Slice C, finding H-01)
+
+A caught rejection isn't the whole story: without a finite deadline, an
+underlying request that merely HANGS (a stalled DB connection, a network
+partition) could still hold the calling legacy request open indefinitely —
+just as bad as a thrown error for a serverless function with its own
+execution limit. `emitEventSafely`/`recordOutcomeSafely` race their
+underlying write against `lib/telemetry/deadline.ts::withTelemetryDeadline`,
+a fixed `TELEMETRY_DEADLINE_MS = 3000` (well under Vercel's shortest
+function timeout) — past that, they return `null` immediately, WITHOUT
+cancelling the underlying operation (there's no cancellation primitive for
+a generic Promise; it may still complete later, reported only via a
+sanitized, bounded-length log line, never awaited by the caller). This
+fail-open deadline applies ONLY to these legacy-compatibility telemetry
+helpers — it is a deliberately different trust boundary from the governed
+agent-runtime audit path (`lib/agents/*`, `lib/execution/*`), which has
+never been made fail-open and Slice C does not change that. See
+`lib/telemetry/deadline.test.ts`.
+
+### PII minimization in event payloads (P0.9 Slice B/C — "do not regress")
+
+`business_events` is an orchestration/observability log, not a system of
+record — the raw caller phone number, message text, etc. belong in the
+module's own History table (`missed_call_recovery_history`, which DOES
+hold `caller_phone` — that's its job as the system of record) and never
+need to be duplicated into an event's `payload`/`metadata` merely to prove
+"this happened." `lib/modules/missedCallRecovery/service.ts`'s event
+emission call sites are held to this; see
+`lib/modules/missedCallRecovery/service.test.ts` for the regression tests
+and `lib/db/crossTableIdempotency.pg.test.ts`'s D.8 test (P0.9 Slice D) for
+the real-Postgres confirmation that `business_events` has no dedicated
+raw-phone column at all — the schema itself provides nowhere to
+accidentally duplicate one into beyond the application-controlled `payload`
+jsonb column.
+
 ## Idempotency
 
 Pass `idempotencyKey` for any event whose source might redeliver (a Twilio

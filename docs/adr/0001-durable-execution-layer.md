@@ -100,6 +100,58 @@ Revisit this ADR when **any** of the following becomes true:
 At that point, re-evaluate Inngest/Trigger.dev/QStash against the
 concrete requirement that triggered the revisit — not speculatively.
 
+## Lease model and effect-key hardening (P0.9 Slice B, finding H-02; migration `018`, not yet applied to production)
+
+The claim mechanics above (`WHERE status = 'queued'`) were the ORIGINAL P0.6
+design. P0.9 Slice B hardened ownership with a real lease:
+
+- **`lease_token`** (migration `018`) is the actual ownership credential
+  for a job's CURRENT claim — a fresh UUID generated on every claim/reclaim
+  — distinct from `locked_by` (a diagnostic worker-name label that a
+  process can reuse across a restart). `complete()` / `fail()` /
+  `renewLease()` all require an EXACT `lease_token` match, not just
+  `status = 'running'`.
+- **Active-lease expiry is enforced on every transition, not just claim.**
+  A matching `lease_token` alone is not sufficient — `lock_expires_at` must
+  still be in the future (`lock_expires_at > now()`). A worker whose lease
+  has already expired (crashed, or simply ran past `DEFAULT_LEASE_DURATION_SECONDS`,
+  300s) cannot complete, fail, or heartbeat-renew that job anymore, even
+  with the correct token — only `claimBatch`'s reclaim path can move the
+  job forward again, under a brand-new `lease_token`.
+- **Reclaim**: a `running` job whose `lock_expires_at` has passed is
+  claimable again by any worker, via the same CAS `UPDATE` pattern,
+  re-checking `lock_expires_at <= now()` at UPDATE time (not a stale read)
+  so a heartbeat that renewed the lease in between is never overridden. A
+  reclaim candidate already at `max_attempts` is swept straight to
+  `dead_letter` instead of being reclaimed for another doomed attempt.
+- **This is an AT-LEAST-ONCE execution guarantee, explicitly NOT
+  exactly-once.** A crash between a handler's external effect succeeding
+  and this layer recording that success will cause a retry to run the
+  handler body again — the lease model guarantees at most one worker holds
+  active ownership at a time, it does not and cannot guarantee an external
+  side effect (an SMS send, an API call) happens only once.
+
+**`ctx.effectKey`** (`lib/execution/types.ts::computeEffectKey`) is the
+runtime-owned, retry-invariant identity a handler MUST use as its own
+provider-supported idempotency key (or its own effect ledger) to get real
+exactly-once behavior for a consequential external effect — writing a DB
+row afterward is not sufficient by itself, and calling a handler twice for
+the "same" job is not automatically safe. It is namespaced
+`tenant:<tenantId>:job:<jobType>:<idempotency:<key> | id:<jobId>>` —
+stable across every claim/reclaim/retry of the same logical job (mutable
+fields like `attempts`, lease state, or timestamps never influence it), a
+different key for a different tenant even with an identical caller-supplied
+`idempotencyKey`, and a different key for a different `jobType` even under
+the same tenant + `idempotencyKey`. A handler has no way to influence it —
+it's computed exclusively by the runtime from identity fixed at `enqueue()`.
+
+See `lib/execution/lease.pg.test.ts` (P0.9 Slice D, real Postgres proof —
+concurrent claims, expired-lease refusal on every transition, reclaim
+under a fresh token, stale-token refusal after reclaim, repeated
+crash/reclaim converging on `dead_letter`) and `lib/execution/queue.test.ts`
+/ `lib/db/crossTableIdempotency.pg.test.ts` for the effect-key and
+`durable_jobs` enqueue-idempotency proofs.
+
 ## Consequences
 
 - No new environment variables, no new billing relationship, no new

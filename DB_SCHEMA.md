@@ -116,22 +116,46 @@ P0 amendment below).
 | `outcomes` | Business-outcome attribution | `OUTCOME_ATTRIBUTION.md` |
 | `durable_jobs` | Execution queue (retries/backoff/dead-letter) | `docs/adr/0001-durable-execution-layer.md` |
 
-### P0.9 Slice A hardening (migration 017 — written, reviewed, NOT applied to production)
+### P0.9 hardening migrations 017–020 — written, reviewed, NOT yet applied to production
 
-`db/migrations/017_p0_agentic_foundation_hardening.sql` remediates the
-independent Codex P0 acceptance audit (findings B-01, B-03, M-03):
-composite `(tenant_id, x) REFERENCES parent (tenant_id, id)` foreign keys
-on every cross-table relationship among the tables above (replacing the
-single-column FKs from migrations `010`–`016`), a `payload_digest` column
-and an `'executing'` status on `approvals`, a uniqueness constraint on
-`tool_calls.approval_id`, and a partial unique index on
-`agents (tenant_id, agent_type)` excluding `'custom'`. See that file's
-header for the full verification record (exact constraint names, row
-counts, Postgres version) and `AGENT_SECURITY.md` for what each change
-enforces. **This migration has not been run against the live database** —
-the schema described in the table above (migrations `009`–`016`) is what's
-actually live; migration `017` is reviewed and ready but pending a
-deliberate apply step.
+`db/migrations/017` through `020` are additive/corrective migrations on
+top of `009`–`016`. **None of them have been run against the live
+database** as of P0.9 Slice D — the schema described in the table above
+(migrations `009`–`016`) is what's actually live in production today.
+Each has been fully proven against a disposable local Postgres 16 with the
+entire `001`–`020` sequence applied from empty — see "Running the database
+integration suite" below and the P0.9 Slice D completion report for the
+exact verification record (constraint names, RLS-as-role results, Postgres
+version note).
+
+- **017** (`p0_agentic_foundation_hardening`, Codex findings B-01, B-03,
+  M-03): composite `(tenant_id, x) REFERENCES parent (tenant_id, id)`
+  foreign keys on every cross-table relationship among the tables above
+  (replacing the single-column FKs from migrations `010`–`016`), a
+  `payload_digest` column and an `'executing'` status on `approvals`, a
+  uniqueness constraint on `tool_calls.approval_id`, and a partial unique
+  index on `agents (tenant_id, agent_type)` excluding `'custom'`. See
+  `AGENT_SECURITY.md` for what each change enforces.
+- **018** (`p0_durable_execution_audit_hardening`, findings H-02, H-04):
+  `durable_jobs.lease_token` (the actual per-claim ownership credential —
+  see `docs/adr/0001-durable-execution-layer.md`), `tool_calls.policy_snapshot`
+  (immutable policy-decision audit, set once at creation), and `'denied'`/
+  `'partial'` added to `agent_runs`'s allowed statuses (see
+  `AGENT_SECURITY.md`'s truthful-status section).
+- **019** (`p0_production_compatibility_privacy`, findings C.3, M-05):
+  `outcomes.idempotency_key` + a matching partial unique index (same
+  pattern as `business_events`/`durable_jobs`), and
+  `model_invocations.error_category` (the normalized failure taxonomy —
+  see `MODEL_GATEWAY.md`).
+- **020** (`p0_final_security_hardening`, P0.9 Slice D findings D.9, D.11):
+  revokes `anon`'s `EXECUTE` on `public.is_tenant_member(uuid)` (`authenticated`'s
+  grant is deliberately KEPT — see the migration file's own comment for why:
+  migration `003` tried revoking both and it broke RLS for every real
+  logged-in user in production, reverted by migration `007`); adds the one
+  index genuinely still missing per the P0.9 Slice D index audit,
+  `idx_approvals_approver_user_id` (`approvals.approver_user_id` references
+  `auth.users`, not a tenant-scoped table, so it was correctly out of scope
+  for `017`'s tenant-consistency composite-FK rework).
 
 New required environment variable:
 
@@ -140,3 +164,30 @@ New required environment variable:
 # when unset, so dev/CI/tests never need this). See MODEL_GATEWAY.md.
 ANTHROPIC_API_KEY=your-anthropic-api-key
 ```
+
+### Running the database integration suite
+
+Every `lib/**/*.pg.test.ts` file (tenant-consistency FKs, approval
+concurrency, durable-job lease/reclaim, cross-table idempotency, the RLS
+table matrix, the full exit-criteria demonstration) runs against a REAL
+Postgres — not an in-memory re-implementation, which cannot prove a
+database-enforced constraint or a genuine concurrent-transaction race
+without being circular. See `lib/testHarness/pgTestDb.ts`'s own doc
+comment for the full design.
+
+```bash
+# 1. Any disposable Postgres 15+ — local, CI service container, or a
+#    Supabase branch. NEVER the production project.
+# 2. Apply, in order, from empty:
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/shadow_env/000_supabase_scaffold.sql   # local Postgres only — a real Supabase project/branch already has auth.uid()/anon/authenticated/service_role
+for f in db/migrations/0*.sql; do psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"; done
+# 3. Run the suite — every *.pg.test.ts file executes for real:
+DATABASE_URL="postgresql://..." npm test
+```
+
+Without `DATABASE_URL` (or `TEST_DATABASE_URL`) set, every `*.pg.test.ts`
+suite `describe.skip`s cleanly and explicitly rather than silently passing
+— see the P0.9 Slice D completion report's honest test-count breakdown
+(skipped is never reported as passed). `.github/workflows/ci.yml`'s
+`test-db` job runs this automatically against an ephemeral Postgres
+service container on every push/PR.

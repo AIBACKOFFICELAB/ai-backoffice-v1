@@ -171,6 +171,25 @@ for, and the scope-enforcement cases.
   expired-but-still-pending approval auto-transitions to `'expired'`
   (itself via the same CAS) instead of allowing an approve through.
 
+### Authenticated approval actor boundary (P0.9 Slice C, finding M-02)
+
+`approveApproval`/`rejectApproval` above take `approverUserId`/`approverRole`
+as plain parameters — by design, so the CAS core stays pure and
+store-injectable for testing. Nothing in production may call them with a
+caller-supplied identity, though: `approveApprovalAsAuthenticatedActor` /
+`rejectApprovalAsAuthenticatedActor` are the actual production-facing
+entrypoints, and they resolve the acting human EXCLUSIVELY from trusted
+server-side session context (`resolveApprovalActor` →
+`getTenantContext()`, backed by the real Supabase auth session) — never
+from anything a request body could claim. `resolveApprovalActor` also
+verifies the resolved membership's `tenantId` matches the approval's OWN
+`tenantId` exactly, so a caller authenticated for a different tenant is
+refused even if their session is otherwise valid — closing the door on a
+caller who somehow knows another tenant's `approvalId`. An agent identity
+can never reach this path at all: only a resolved HUMAN tenant-member
+actor is ever produced. See `lib/approvals/service.test.ts` for the
+session-mismatch/no-session/wrong-tenant refusal cases.
+
 ### The execution path (`lib/approvals/store.ts`, `lib/agents/runtime.ts`) — P0.9 Slice A
 
 Approved is not the same as executed. Execution is a separate, atomic,
@@ -199,11 +218,69 @@ pending → approved → executing → executed
 is a SHA-256 hex digest over a canonical `{tenantId, agentId, agentRunId,
 toolName, action, payload}`, computed once when the approval is requested
 and recomputed at execution time from the approval's own stored identity
-plus the *current* `tool_calls` row. Any mutation to
-`tool_calls.request_summary` between those two points — or any mismatch in
+plus **`approvals.payload` itself** (P0.9 Slice C, finding H-05/C.5 —
+**never** `tool_calls.request_summary`, which is now a privacy-minimized
+AUDIT summary that may not even be shaped like valid tool input; see
+"Privacy-minimized tool audit summaries" below). Any mutation to
+`approvals.payload` between those two points — or any mismatch in
 tenant/agent/run/tool/action — changes the recomputed digest, and
 `beginExecution`'s predicate simply never matches. This is what stops
-*"approval UI reviews payload A, tool executes modified payload B."*
+*"approval UI reviews payload A, tool executes modified payload B."* One
+direct consequence worth stating plainly: mutating the redacted
+`tool_calls.request_summary` audit record can no longer authorize
+different execution data, by construction — the tampering surface that
+matters is `approvals.payload`, not the audit trail. See
+`lib/agents/runtime.test.ts`'s "tool_call audit summary can be redacted
+without altering approval-gated execution" test.
+
+### Privacy-minimized tool audit summaries (P0.9 Slice C, finding H-05/C.5; hardened Slice C corrections 2/2B)
+
+`tool_calls.request_summary`/`response_summary` are audit-only —
+`lib/agents/runtime.ts` never executes from them, only from the tool's
+validated in-memory input (`AUTO_EXECUTE*`) or `approvals.payload`
+(approval-gated, see above). Every tool defines its own optional
+`summarizeInputForAudit`/`summarizeOutputForAudit` (e.g.
+`draft_customer_message` persists `{ hasDraft, draftLength }`, never the
+message text; `create_internal_note` persists `{ noteLength }`, never the
+note). The runtime never falls back to the raw value when a tool defines
+none — `lib/agents/toolRegistry.ts::conservativeAuditFallback` (bounded
+structural metadata only: top-level key names + a count, never a value) is
+the default for every tool that defines no summarizer, for every
+unregistered tool name, and for any summarizer that throws or returns
+something malformed (`summarizeForAudit` wraps every call defensively — a
+summarizer runs on the RAW planned input, BEFORE `validateInput`, so a
+call that will go on to fail validation still needs a safe audit record).
+See `lib/agents/toolRegistry.test.ts` and `lib/agents/runtime.test.ts`'s
+sentinel-value tests (`+15550001111` / `private@example.test` /
+`SUPER-SECRET-MESSAGE` never appear in a persisted summary).
+
+### Instruction-hash authority (P0.9 Slice B correction 3)
+
+`policySnapshot.agentInstructionsHash` is `SHA-256(agent.systemInstructions
+?? "")`, computed at evaluation time by `lib/agents/permissions.ts::hashInstructions`
+and copied by value into the immutable snapshot — this, not
+`agentInstructionsVersion` (which requires disciplined manual bumping and
+can drift), is the authoritative historical record of exactly what
+instructions text was in effect for a given policy decision. It stays
+correct even when a version bump was forgotten for a given edit, and a
+later mutation to the agent's CURRENT `systemInstructions` can never
+change a snapshot already taken. See `lib/agents/permissions.test.ts`.
+
+### Truthful run statuses (P0.9 Slice B, finding H-04/B-07)
+
+`lib/agents/runStatus.ts::computeRunStatus` is the single centralized rule
+for an `agent_run`'s terminal status — both `runAgent()` and
+`resumeAfterApprovalDecision()` call it; the decision is never made twice,
+ad hoc, inline. `'denied'` (every tool call in the run was denied by
+policy or rejected by a human — no consequential action of the run
+actually happened) and `'partial'` (a mix of at least one succeeded and at
+least one denied/rejected outcome, no outright execution failure) exist
+specifically so a run whose requested action was entirely refused is never
+misreported as `'succeeded'`. Any genuine execution `'failed'` outcome
+always wins the tie-break over partial/denied — a run that actually broke
+is never reported as merely "some things were denied." See
+`lib/agents/runStatus.test.ts` and `lib/agents/runtime.test.ts` scenarios
+13/15/17.
 
 **The actual guarantee, stated plainly:** at-most-one-concurrent-executor +
 single-use + payload-bound. **Not** exactly-once delivery to the tool
@@ -318,9 +395,35 @@ Two independent layers, not one:
    This is the layer that catches the case layer 1 can't: a row is
    rejected outright if its `tenant_id` doesn't match its parent's, even
    from service-role code, even from a bug nobody anticipated. **This
-   layer is designed and migration-ready but not yet live** — do not claim
-   tenant integrity is structurally guaranteed until migration `017` is
-   applied; today it is enforced by layer 1 only. See
-   `lib/tenantConsistency.pg.test.ts` for the (currently skipped, not
-   executed) test suite that will prove layer 2 once it's applied
+   layer is designed, PROVEN against a real disposable Postgres (P0.9
+   Slice D), and migration-ready — but still not yet live**: do not claim
+   tenant integrity is structurally guaranteed in PRODUCTION until
+   migration `017` is actually applied there; today production is
+   protected by layer 1 only. `lib/tenantConsistency.pg.test.ts` is real,
+   executed (not a placeholder) — every real Postgres foreign-key
+   violation it names has been observed for real, with the exact expected
+   constraint name, against a disposable database with `017` applied; see
+   `DB_SCHEMA.md`'s "Running the database integration suite."
+
+### `is_tenant_member()` grants (P0.9 Slice D, D.9)
+
+`public.is_tenant_member(uuid)` is `SECURITY DEFINER`, owned by `postgres`,
+with a fixed `search_path` — every object it references is already
+schema-qualified in its own body, so there is no object-shadowing risk.
+Its grant history is a real production incident and its fix, in order:
+migration `002` created it (implicit `PUBLIC` execute, Postgres's default);
+migration `003` revoked `anon`/`authenticated`/`PUBLIC`'s `EXECUTE` to stop
+it being callable as a public RPC — this broke RLS for every real
+logged-in user (Postgres requires the QUERYING role, not just the function
+owner, to hold `EXECUTE` on anything an RLS policy invokes), surfacing as
+PostgREST 403s across the Dashboard/Lead Inbox in production; migration
+`007` reverted it, restoring `EXECUTE` to both `anon` and `authenticated`.
+Migration `020` (P0.9 Slice D, written/reviewed, **not yet applied to
+production**) finishes this correctly: revokes only `anon`'s `EXECUTE`
+(no application code calls this RPC directly, and `auth.uid()` is already
+NULL for an unauthenticated session regardless, so this only closes the
+direct-RPC-exposure surface) while explicitly KEEPING `authenticated`'s —
+repeating migration 003's mistake on `authenticated` would repeat its
+production incident. See migration `020`'s own header and
+`lib/db/rlsMatrix.pg.test.ts` for the real-Postgres proof of both halves.
    somewhere with a real Postgres connection.

@@ -3,6 +3,7 @@ import { AiGateway } from "./gateway";
 import { AiGatewayError } from "./types";
 import { InMemoryModelInvocationStore } from "./store";
 import { ChatProvider, ChatCompleteParams, ChatCompleteResult } from "./providers/types";
+import * as pricingModule from "./pricing";
 
 class FakeChatProvider implements ChatProvider {
   id = "fake";
@@ -309,6 +310,42 @@ describe("AiGateway.generateStructured — minimal structured output validation 
     expect(recorded).toHaveLength(1);
     expect(recorded[0].error).not.toContain("+15550001111");
     expect(recorded[0].error).not.toContain("private@example.test");
+  });
+
+  it("scenario (P0.9 Slice D, D.12): an invalid_response failure still records the real estimated cost for the tokens the provider actually consumed", async () => {
+    // PRICING_TABLE (lib/ai/pricing.ts) is empty in this codebase today, so
+    // estimatedCostUsd is null in ordinary operation for every provider —
+    // that's a pre-existing, documented, honest gap (see pricing.ts's own
+    // doc comment), not what this test is proving. This test proves the
+    // WIRING: recordFailure's invalid_response row now computes its cost
+    // through the exact same estimateCostUsd(provider, model, inputTokens,
+    // outputTokens) call every succeeded row already uses, rather than a
+    // hardcoded null — so the moment a real price is added to
+    // PRICING_TABLE, this row picks it up automatically, with no further
+    // code change. Spies on the real function to prove that call actually
+    // happens with the real per-call token counts.
+    const spy = vi.spyOn(pricingModule, "estimateCostUsd").mockReturnValue(0.0042);
+    try {
+      const provider = new FakeChatProvider({ text: "not json at all", inputTokens: 7, outputTokens: 2 });
+      const invocationStore = new InMemoryModelInvocationStore();
+      const gateway = new AiGateway({ chatProviders: { fake: provider }, invocationStore });
+
+      await expect(
+        gateway.generateStructured({
+          tenantId: "t1",
+          prompt: "return json",
+          validate: () => ({ ok: false, errors: ["not valid JSON"] }),
+        })
+      ).rejects.toMatchObject({ category: "invalid_response" });
+
+      const recorded = invocationStore.all();
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0].status).toBe("failed");
+      expect(recorded[0].estimatedCostUsd).toBe(0.0042);
+      expect(spy).toHaveBeenCalledWith("fake", expect.any(String), 7, 2);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("scenario (correction 4): a valid structured response never creates a second synthetic invocation id", async () => {

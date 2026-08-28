@@ -1,0 +1,79 @@
+name: CI
+
+# P0.9 Slice D, D.16 — minimal PR validation. No CI configuration existed
+# before this file. Two jobs, kept deliberately lean (no matrix, no
+# caching layers beyond npm's own, no deploy step):
+#
+#   - test: the ordinary suite every contributor already runs locally
+#     (typecheck, lint, build, `npm test`) — DATABASE_URL is unset here, so
+#     every *.pg.test.ts DB integration suite cleanly `describe.skip`s (see
+#     lib/testHarness/pgTestDb.ts) rather than silently claiming to prove
+#     something it didn't run.
+#   - test-db: the SAME suite again, this time against a real ephemeral
+#     Postgres service container with db/migrations/001-020 actually
+#     applied — this is what actually executes the *.pg.test.ts files (see
+#     db/shadow_env/000_supabase_scaffold.sql for what that container needs
+#     beyond a bare `CREATE DATABASE`). GitHub Actions' Postgres service
+#     container is a standard, well-supported primitive — not the
+#     "expensive or fragile" kind of CI infrastructure the Slice D
+#     directive said to avoid without need; it costs one extra job, no
+#     external account, and tears itself down automatically per run.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: typecheck / lint / build / test (no DB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+
+  test-db:
+    name: DB integration suite (real Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ai_backoffice_shadow
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ai_backoffice_shadow
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - name: Apply Supabase-compatibility scaffold + migrations 001-020
+        run: |
+          set -e
+          for f in db/shadow_env/000_supabase_scaffold.sql db/migrations/0*.sql; do
+            echo "applying $f"
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+        env:
+          PGPASSWORD: postgres
+      - name: Run full suite against the real database (nothing skipped)
+        run: npm test

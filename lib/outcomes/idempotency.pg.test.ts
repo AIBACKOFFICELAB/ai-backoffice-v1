@@ -1,60 +1,129 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterAll } from "vitest";
+import { getPgTestUrl, withRollback, runConcurrently, insertTenant, insertAgent, insertAgentRun, getPgTestPool } from "../testHarness/pgTestDb";
 
 /**
- * Outcome idempotency — DATABASE-LEVEL proof (P0.9 Slice C, finding C.3).
+ * Outcome idempotency — DATABASE-LEVEL proof (P0.9 Slice C, finding C.3;
+ * proved for real in P0.9 Slice D, D.7).
  *
- * STATUS: IMPLEMENTED, NOT EXECUTED.
+ * Was STATUS: IMPLEMENTED, NOT EXECUTED — every `it` body was a placeholder
+ * `expect(true).toBe(true)` because no live test database was reachable
+ * (only production, which Slice C/D both forbid writing to). Slice D
+ * provisions the disposable Postgres this suite always said it needed;
+ * these bodies now run two GENUINELY CONCURRENT raw INSERTs (separate
+ * physical connections/transactions, not a single serialized client) and
+ * assert on the real uq_outcomes_tenant_idempotency partial unique index
+ * from migration 019.
  *
- * The actual guarantee is a Postgres partial unique index
- * (db/migrations/019_p0_production_compatibility_privacy.sql:
- * uq_outcomes_tenant_idempotency, mirroring uq_business_events_tenant_idempotency
- * from migration 009 and uq_durable_jobs_tenant_idempotency from migration
- * 016) — application-level dedup (lib/outcomes/store.ts) is only the fast
- * path; the index is what actually prevents two concurrent
- * SupabaseOutcomeStore.insert() calls for the same (tenant_id,
- * idempotency_key) from both succeeding. That race cannot be proven by an
- * in-memory re-implementation for the same reason
- * lib/tenantConsistency.pg.test.ts documents for migration 017's composite
- * FKs — it would be circular. Only a real concurrent INSERT race against a
- * live Postgres with migration 019 applied proves it.
- *
- * This environment has no live test database available — the only
- * Postgres reachable from this session is the actual AIBACKOFFICE
- * production project, which the P0.9 Slice C directive explicitly forbids
- * writing to (migration 019 itself was verified read-only and NOT applied —
- * see the migration file's header and the Slice C completion report).
- * These tests are therefore written but skipped, not run. They ran zero
- * times in this session. See lib/outcomes/service.test.ts for the
- * application-layer dedup logic that IS exercised (against
- * InMemoryOutcomeStore, which mirrors this exact contract).
- *
- * TO ACTUALLY RUN THIS SUITE:
- *   1. Apply db/migrations/019_p0_production_compatibility_privacy.sql to a
- *      disposable database (local Postgres 15+, or a Supabase branch —
- *      NOT the production project).
- *   2. Point a real `pg`/`@supabase/supabase-js` client at it.
- *   3. Remove the `.skip` below and wire in a real SupabaseOutcomeStore
- *      against that database.
+ * Gated on DATABASE_URL/TEST_DATABASE_URL — see lib/testHarness/pgTestDb.ts.
+ * Never runs against production; skips cleanly (not silently) when unset.
  */
-describe.skip("outcomes idempotency (migration 019) — requires a live Postgres with migration 019 applied; NOT executed in this environment", () => {
-  it("two concurrent SupabaseOutcomeStore.insert() calls with the same (tenant_id, idempotency_key) — exactly one row is created, the other is deduped via 23505 + a re-read", () => {
-    // Promise.all([store.insert({tenantId, idempotencyKey: "k", ...}), store.insert({tenantId, idempotencyKey: "k", ...})])
-    // expected: exactly one row in `outcomes` for (tenantId, "k");
-    // the losing insert's 23505 unique_violation on
-    // uq_outcomes_tenant_idempotency is caught and resolved to the winner's row.
-    expect(true).toBe(true);
+const DESCRIBE = getPgTestUrl() ? describe : describe.skip;
+
+afterAll(async () => {
+  if (getPgTestUrl()) await getPgTestPool().end();
+});
+
+function pgErrorCode(err: unknown): string | undefined {
+  return (err as { code?: string } | null | undefined)?.code;
+}
+function pgConstraint(err: unknown): string | undefined {
+  return (err as { constraint?: string } | null | undefined)?.constraint;
+}
+
+async function insertOutcome(client: import("pg").PoolClient, tenantId: string, runId: string, idempotencyKey: string | null) {
+  return client.query(
+    `INSERT INTO public.outcomes (id, tenant_id, agent_run_id, outcome_type, attribution_confidence, idempotency_key)
+     VALUES (gen_random_uuid(), $1, $2, 'admin_time_saved', 'direct', $3)`,
+    [tenantId, runId, idempotencyKey]
+  );
+}
+
+DESCRIBE("outcomes idempotency (migration 019) — real concurrent-insert Postgres proof, not skipped", () => {
+  it("two concurrent inserts with the same (tenant_id, idempotency_key) — exactly one row is created, the other fails uq_outcomes_tenant_idempotency (23505)", async () => {
+    // Setup rows committed first (outside the race) so both racing inserts
+    // reference the same already-durable tenant/run.
+    let tenantId!: string;
+    let runId!: string;
+
+    const pool = getPgTestPool();
+    const setupClient = await pool.connect();
+    try {
+      await setupClient.query("BEGIN");
+      tenantId = await insertTenant(setupClient);
+      const agentId = await insertAgent(setupClient, tenantId);
+      runId = await insertAgentRun(setupClient, tenantId, agentId);
+      await setupClient.query("COMMIT");
+    } finally {
+      setupClient.release();
+    }
+
+    try {
+      const key = `race-key-${runId}`;
+      const results = await runConcurrently([
+        async (client) => {
+          await client.query("BEGIN");
+          await insertOutcome(client, tenantId, runId, key);
+          await client.query("COMMIT");
+        },
+        async (client) => {
+          await client.query("BEGIN");
+          await insertOutcome(client, tenantId, runId, key);
+          await client.query("COMMIT");
+        },
+      ]);
+
+      const succeeded = results.filter((r) => r.status === "fulfilled");
+      const failed = results.filter((r) => r.status === "rejected");
+      expect(succeeded).toHaveLength(1);
+      expect(failed).toHaveLength(1);
+      const failure = (failed[0] as { status: "rejected"; reason: unknown }).reason;
+      expect(pgErrorCode(failure)).toBe("23505");
+      expect(pgConstraint(failure)).toBe("uq_outcomes_tenant_idempotency");
+
+      const check = await pool.query(`SELECT count(*)::int AS n FROM public.outcomes WHERE tenant_id = $1 AND idempotency_key = $2`, [tenantId, key]);
+      expect(check.rows[0].n).toBe(1);
+    } finally {
+      // Manual cleanup: this test commits real rows (required to exercise a
+      // genuine cross-transaction race), so it cannot rely on ROLLBACK.
+      await pool.query(`DELETE FROM public.outcomes WHERE tenant_id = $1`, [tenantId]);
+      await pool.query(`DELETE FROM public.agent_runs WHERE tenant_id = $1`, [tenantId]);
+      await pool.query(`DELETE FROM public.agents WHERE tenant_id = $1`, [tenantId]);
+      await pool.query(`DELETE FROM public.tenants WHERE id = $1`, [tenantId]);
+    }
   });
 
-  it("the same idempotency_key under a DIFFERENT tenant_id is not deduped — both rows are created", () => {
-    // uq_outcomes_tenant_idempotency is scoped (tenant_id, idempotency_key),
-    // not idempotency_key alone.
-    expect(true).toBe(true);
+  it("the same idempotency_key under a DIFFERENT tenant_id is not deduped — both rows are created", async () => {
+    await withRollback(async (client) => {
+      const tenantA = await insertTenant(client);
+      const tenantB = await insertTenant(client);
+      const agentA = await insertAgent(client, tenantA);
+      const agentB = await insertAgent(client, tenantB);
+      const runA = await insertAgentRun(client, tenantA, agentA);
+      const runB = await insertAgentRun(client, tenantB, agentB);
+
+      const key = "shared-key-across-tenants";
+      // Neither insert should throw — different tenants, same key.
+      await insertOutcome(client, tenantA, runA, key);
+      await insertOutcome(client, tenantB, runB, key);
+
+      const { rows } = await client.query(`SELECT count(*)::int AS n FROM public.outcomes WHERE idempotency_key = $1`, [key]);
+      expect(rows[0].n).toBe(2);
+    });
   });
 
-  it("two outcomes with idempotency_key IS NULL are never treated as duplicates of each other", () => {
-    // The partial index's WHERE idempotency_key IS NOT NULL clause means
-    // Postgres never compares NULLs for uniqueness — this is the same
-    // guarantee already relied on for business_events/durable_jobs.
-    expect(true).toBe(true);
+  it("two outcomes with idempotency_key IS NULL are never treated as duplicates of each other", async () => {
+    await withRollback(async (client) => {
+      const tenant = await insertTenant(client);
+      const agent = await insertAgent(client, tenant);
+      const run = await insertAgentRun(client, tenant, agent);
+
+      // Neither insert should throw — the partial index's WHERE
+      // idempotency_key IS NOT NULL clause means NULLs are never compared.
+      await insertOutcome(client, tenant, run, null);
+      await insertOutcome(client, tenant, run, null);
+
+      const { rows } = await client.query(`SELECT count(*)::int AS n FROM public.outcomes WHERE tenant_id = $1 AND idempotency_key IS NULL`, [tenant]);
+      expect(rows[0].n).toBe(2);
+    });
   });
 });

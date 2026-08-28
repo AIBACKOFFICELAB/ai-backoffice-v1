@@ -12,7 +12,19 @@ that claim to be true, not the claim itself.
 `outcomes` (migration `015`): `workflow_id`, `agent_run_id`, `entity_type`/
 `entity_id` (polymorphic — see `DOMAIN_MODEL.md`), `outcome_type`,
 `outcome_value`, `currency`, `attribution_confidence`, `occurred_at`,
-`metadata`.
+`metadata`. Migration `019` (P0.9 Slice C, finding C.3; written, reviewed,
+**not yet applied to production**) adds `idempotency_key` + a matching
+`UNIQUE (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL`
+partial index — a repeated webhook, event replay, retry, or compatibility
+callback for the SAME logical evidence must not create a duplicate
+outcome. `idempotency_key` is derived from stable EVIDENCE identity, never
+current time — e.g. `lead-recovered:<leadId>:<evidenceType>:<evidenceId>`
+for a future real `lead_recovered` outcome (see `lib/outcomes/service.ts::recordOutcome`).
+`NULL` is valid — not every outcome has a stable evidence identity yet.
+See `lib/outcomes/idempotency.pg.test.ts` (P0.9 Slice D, real Postgres
+proof: a concurrent duplicate-key insert dedupes to one row via
+`uq_outcomes_tenant_idempotency`; a different tenant with the same key
+gets a separate row; two `NULL`-key rows are never treated as duplicates).
 
 ```ts
 type OutcomeType =
@@ -59,15 +71,30 @@ await recordOutcome({
 failure — for use from inside an already-working module (see the Missed
 Call Recovery wiring below).
 
-## Wired into a real workflow (P0's one compatibility-adapter proof)
+## Wired into a real workflow — and the correction that matters (P0.9 Slice C, finding H-03)
 
-`lib/modules/missedCallRecovery/service.ts::executeMissedCallRecovery()`
-records a `lead_recovered` outcome with `attributionConfidence: 'direct'`
-whenever the recovery SMS actually sends — the module's own action *is*
-the cause, with no intermediate human step, which is exactly what `direct`
-means. This is the only outcome currently recorded by production code; every
-other outcome type exists in the schema and type system, ready for P1
-agents, but nothing fabricates data for them today.
+An earlier version of `lib/modules/missedCallRecovery/service.ts::executeMissedCallRecovery()`
+recorded a canonical `lead_recovered` outcome whenever the recovery SMS
+successfully sent. **That was wrong and has been corrected — this is an
+explicit "do not regress" invariant for every P0.9 slice since.** Sending a
+message proves the system ACTED, not that the customer engaged, replied,
+booked, or generated revenue. The module now instead emits a
+`business_events` row (`recovery.sms_sent`, an *operational* event — see
+`EVENT_SYSTEM.md`) and writes the legacy `missed_call_recovery_history`
+row's `status` column as `'recovered'` (kept verbatim for backward-
+compatible analytics/UI — see `computeOverallStatus` in that file) — but
+**no canonical `lead_recovered` outcome is emitted from an outbound SMS
+send.** The legacy History string `"recovered"` and the canonical outcome
+type `lead_recovered` are deliberately different claims: the former means
+"recovery SMS successfully sent," the latter would mean "the customer
+actually re-engaged," which this module cannot currently observe. No
+evidence path for real re-engagement exists yet in this repository, so
+none is fabricated — see `lib/modules/missedCallRecovery/service.ts`'s own
+doc comment on `executeMissedCallRecovery` for the full record, and
+`lib/modules/missedCallRecovery/service.test.ts` for the regression test
+pinning this. **No outcome type is currently recorded by production code**
+— every outcome type exists in the schema and type system, ready for P1
+agents, but nothing fabricates data for any of them today.
 
 ## Testing
 

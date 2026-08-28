@@ -250,6 +250,26 @@ describe("buildPolicySnapshot", () => {
     expect(snapshot.reason).toMatch(/not 'active'/);
   });
 
+  it("P0.9 Slice D, D.13: policy_snapshot never carries a sentinel/PII value, even when the agent's systemInstructions embeds one — only its SHA-256 hash appears", () => {
+    // buildPolicySnapshot is constructed entirely from structural
+    // metadata (tool name/version, resolved tier, decision, scopes,
+    // agentInstructionsVersion/Hash) — never from raw tool call input or
+    // output. This proves that by construction: even when systemInstructions
+    // itself carries what would be sentinel customer PII, the persisted
+    // snapshot contains only its hash, never the text.
+    const SENTINEL = "call back at +15550001111, private@example.test, SUPER-SECRET-MESSAGE";
+    const agent = makeAgent({ systemInstructions: SENTINEL });
+    const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE" });
+    const decision = evaluateToolCall(agent, tool);
+    const snapshot = buildPolicySnapshot(agent, tool, "ping", "execute", decision);
+
+    expect(JSON.stringify(snapshot)).not.toContain(SENTINEL);
+    expect(JSON.stringify(snapshot)).not.toContain("+15550001111");
+    expect(JSON.stringify(snapshot)).not.toContain("private@example.test");
+    expect(JSON.stringify(snapshot)).not.toContain("SUPER-SECRET-MESSAGE");
+    expect(snapshot.agentInstructionsHash).toBe(createHash("sha256").update(SENTINEL, "utf8").digest("hex"));
+  });
+
   it("scenario 16: a historical snapshot remains reconstructable after the agent's CURRENT configuration is later mutated", () => {
     const agent = makeAgent({ allowedTools: ["ping"], approvalPolicy: { ping: "AUTO_EXECUTE" }, readScopes: ["leads"] });
     const tool = makeTool({ name: "ping", intrinsicPermission: "EXECUTE", minimumAutonomyTier: "AUTO_EXECUTE" });

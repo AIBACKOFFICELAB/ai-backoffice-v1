@@ -1,0 +1,89 @@
+-- P0.9 Slice D — Final Database Proof + Security Acceptance
+--
+-- Remediates the D.9 SECURITY DEFINER re-audit finding and the D.11 index
+-- acceptance finding. Migrations 001-019 are historical/reviewed and are
+-- NOT edited, renamed, squashed, replaced, or reordered by this file — this
+-- is a new, additive/corrective migration on top of them.
+--
+-- NOT applied to production as part of this Slice D pass. Applied and
+-- verified against a disposable local Postgres 16 shadow database with
+-- migrations 001-019 already applied — see the Slice D completion report
+-- for the exact verification queries and results. Production is currently
+-- on migrations 002-016 only (017/018/019/020 none applied there).
+--
+-- Lock / deployment note: the REVOKE and the CREATE INDEX below are both
+-- fast, low-risk operations — REVOKE takes no table lock at all (it
+-- modifies pg_proc's ACL), and CREATE INDEX (not CONCURRENTLY) on
+-- approvals takes a brief ACCESS EXCLUSIVE lock, instantaneous against the
+-- current empty/near-empty production table. Re-evaluate CONCURRENTLY once
+-- approvals holds meaningful row volume.
+--
+-- Rollback note: forward-only numbered migrations, no down-migration
+-- tooling (docs/constitution/09_DEVELOPMENT_STANDARDS.md). If this
+-- migration must be reverted: `GRANT EXECUTE ON FUNCTION
+-- public.is_tenant_member(uuid) TO anon;` restores the pre-020 grant
+-- (mirrors migration 007); `DROP INDEX idx_approvals_approver_user_id;`
+-- removes the index. Both safe to revert at any time.
+
+-- =========================================================================
+-- 1. D.9 — SECURITY DEFINER re-audit: public.is_tenant_member(uuid)
+--
+-- Re-verified the CURRENT (not historical/assumed) state on the live
+-- project immediately before authoring this file:
+--   - SECURITY DEFINER, owner postgres, `SET search_path TO 'public'`.
+--   - Every object the function body references is already fully
+--     schema-qualified (public.tenant_memberships, auth.uid()) — the
+--     search_path setting is not load-bearing for correctness, so there is
+--     no object-shadowing / search_path injection risk to fix here; this
+--     function was already written defensively.
+--   - Current grants (information_schema.routine_privileges): EXECUTE to
+--     anon, authenticated, postgres, service_role. Supabase's security
+--     advisor flags BOTH anon and authenticated as "can execute a
+--     SECURITY DEFINER function" — this migration acts on only ONE of
+--     those two findings; see below for why.
+--
+-- authenticated's grant is NOT revoked. Migration 003 already tried
+-- revoking BOTH anon and authenticated's EXECUTE on this exact function —
+-- migration 007's header records the result: it broke every RLS policy
+-- that calls it (every table in this schema except tenant_memberships),
+-- because Postgres requires the QUERYING role to hold EXECUTE on any
+-- function an RLS policy invokes, not just the function owner running as
+-- SECURITY DEFINER. That surfaced in production as PostgREST 403s on every
+-- authenticated request touching these tables. authenticated's grant is
+-- therefore accepted, intentional, load-bearing design, not an oversight —
+-- see the D.9/D.18 findings classification in the Slice D completion
+-- report.
+--
+-- anon's grant IS revoked here. No RLS policy needs anon to hold EXECUTE
+-- for a real authenticated user's request to work (auth.uid() is NULL for
+-- an anon/unauthenticated session regardless of this grant, so
+-- is_tenant_member() already always returns false for anon — this changes
+-- only whether anon can call it directly as a public RPC endpoint via
+-- /rest/v1/rpc/is_tenant_member, which application code never does — see
+-- the Slice D completion report's grep confirming no `.rpc('is_tenant_member'`
+-- call site exists anywhere in this codebase). This is the narrower, lower-risk
+-- half of the original migration 003 attempt — not repeating its mistake.
+-- =========================================================================
+
+REVOKE EXECUTE ON FUNCTION public.is_tenant_member(uuid) FROM anon;
+
+-- =========================================================================
+-- 2. D.11 — index acceptance
+--
+-- Re-checked the four foreign keys named in the Slice D directive against
+-- migration 017 + the current shadow-DB index list:
+--   - approvals.agent_id, outcomes.agent_run_id, tool_calls.approval_id:
+--     already covered — migration 017 upgraded each to a composite
+--     (tenant_id, x) foreign key AND added the matching composite
+--     (tenant_id, x) index in the same migration (section 1j), which is
+--     the correct covering index for a composite FK's parent-side
+--     delete/update scan. No further action needed; see the Slice D
+--     completion report for the exact pg_indexes proof.
+--   - approvals.approver_user_id: genuinely still missing. This FK targets
+--     auth.users(id), not a tenant-scoped table, so it was correctly out
+--     of scope for migration 017's tenant-consistency composite-FK rework
+--     (auth.users has no tenant_id to make a composite key from) — it was
+--     simply never indexed at all, in any migration. Added here.
+-- =========================================================================
+
+CREATE INDEX IF NOT EXISTS idx_approvals_approver_user_id ON public.approvals (approver_user_id);
