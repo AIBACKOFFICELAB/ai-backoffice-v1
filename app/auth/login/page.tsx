@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { Input, Label } from "@/components/ui/Field";
 import { AUDIT_URL } from "@/lib/constants";
+import { FORGOT_PASSWORD_HREF, FORGOT_PASSWORD_LABEL } from "@/lib/auth/passwordRecovery";
 
 /**
  * Supabase auth errors are usually a string `.message`, but a misconfigured
@@ -106,6 +107,11 @@ function LoginForm() {
                 required
                 disabled={loading}
               />
+              <div className="mt-1.5 text-right">
+                <Link href={FORGOT_PASSWORD_HREF} className="text-xs font-medium text-brand-700 hover:underline">
+                  {FORGOT_PASSWORD_LABEL}
+                </Link>
+              </div>
             </div>
 
             <Button type="submit" disabled={loading} className="mt-2 w-full">
