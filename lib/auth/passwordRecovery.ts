@@ -17,8 +17,6 @@ export const MIN_PASSWORD_LENGTH = 8;
 export const GENERIC_RESET_MESSAGE =
   "If an account exists for that email, we've sent password reset instructions.";
 
-export const RATE_LIMIT_MESSAGE = "Too many requests. Please wait a few minutes and try again.";
-
 export const GENERIC_UPDATE_ERROR_MESSAGE =
   "We couldn't update your password. Please request a new reset link and try again.";
 
@@ -74,16 +72,22 @@ type ResetPasswordClient = {
   };
 };
 
-export type PasswordResetOutcome = { message: string; isRateLimited: boolean };
+export type PasswordResetOutcome = { message: string };
 
 /**
- * Always resolves — never throws — with a safe outcome. The only signal
- * this ever surfaces beyond the generic message is rate-limiting, which is
- * an abuse-prevention signal, not an account-existence one. Supabase's own
- * resetPasswordForEmail already does not error for "no such user"; this
- * function additionally makes sure no other failure mode (network, a
- * malformed response, a future API change) can leak that distinction
- * either — every other error still resolves with the generic message.
+ * Always resolves — never throws — with the same safe outcome, regardless
+ * of whether the email has an account AND regardless of any error
+ * Supabase returns, rate-limiting included.
+ *
+ * Rate-limiting deliberately does NOT get a distinct message: Supabase's
+ * reset-email cooldown is scoped per recipient, so an address that
+ * recently received a real reset email returns 429 on a repeat request
+ * while a nonexistent address never does (no email was ever sent to it,
+ * so it never enters a cooldown). Surfacing 429 differently would let an
+ * attacker fire two requests at a candidate address and use the second
+ * response to infer whether the first one actually sent mail — i.e.
+ * whether the account exists. Rate-limit status is only ever logged
+ * server-side (console.error below), never returned to the caller.
  */
 export async function requestPasswordReset(
   supabase: ResetPasswordClient,
@@ -97,11 +101,10 @@ export async function requestPasswordReset(
     if (error) {
       // Metadata only — never the email or any part of the error that
       // could echo user-supplied input in a way that invites logging PII
-      // beyond what's needed to debug a delivery/config problem.
+      // beyond what's needed to debug a delivery/config/rate-limit
+      // problem. This log line is the ONLY place rate-limit status is
+      // observable — it never reaches the returned outcome.
       console.error("[forgot-password] resetPasswordForEmail error:", error.name, error.status);
-      if (error.status === 429) {
-        return { message: RATE_LIMIT_MESSAGE, isRateLimited: true };
-      }
     }
   } catch (err) {
     console.error(
@@ -109,7 +112,7 @@ export async function requestPasswordReset(
       err instanceof Error ? err.message : "unknown"
     );
   }
-  return { message: GENERIC_RESET_MESSAGE, isRateLimited: false };
+  return { message: GENERIC_RESET_MESSAGE };
 }
 
 // ---------------------------------------------------------------------------

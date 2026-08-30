@@ -4,7 +4,6 @@ import {
   FORGOT_PASSWORD_LABEL,
   DEFAULT_NEXT_PATH,
   GENERIC_RESET_MESSAGE,
-  RATE_LIMIT_MESSAGE,
   MIN_PASSWORD_LENGTH,
   buildRecoveryRedirectUrl,
   resolveNextPath,
@@ -74,7 +73,7 @@ describe("requestPasswordReset", () => {
   it("returns the generic message when the email genuinely has no account (Supabase reports no error)", async () => {
     const supabase = { auth: { resetPasswordForEmail: vi.fn().mockResolvedValue({ error: null }) } };
     const outcome = await requestPasswordReset(supabase, "real-customer@example.com", origin);
-    expect(outcome).toEqual({ message: GENERIC_RESET_MESSAGE, isRateLimited: false });
+    expect(outcome).toEqual({ message: GENERIC_RESET_MESSAGE });
   });
 
   it("returns the SAME generic message for an unrelated failure — never a distinguishable signal", async () => {
@@ -87,31 +86,37 @@ describe("requestPasswordReset", () => {
     };
     const outcome = await requestPasswordReset(supabase, "not-an-account@example.com", origin);
     expect(outcome.message).toBe(GENERIC_RESET_MESSAGE);
-    expect(outcome.isRateLimited).toBe(false);
   });
 
-  it("does not enumerate users: both a real and a fake email produce identical output", async () => {
-    const okClient = { auth: { resetPasswordForEmail: vi.fn().mockResolvedValue({ error: null }) } };
-    const errClient = {
-      auth: {
-        resetPasswordForEmail: vi.fn().mockResolvedValue({ error: { name: "AuthApiError", status: 400 } }),
-      },
-    };
-    const [a, b] = await Promise.all([
-      requestPasswordReset(okClient, "exists@example.com", origin),
-      requestPasswordReset(errClient, "does-not-exist@example.com", origin),
-    ]);
-    expect(a).toEqual(b);
-  });
-
-  it("surfaces rate-limiting distinctly, without revealing account existence", async () => {
+  it("returns the SAME generic message on a per-recipient rate limit (429) — this is the one status Supabase's cooldown reserves for addresses that actually received mail, so surfacing it distinctly would itself be an enumeration oracle", async () => {
     const supabase = {
       auth: {
         resetPasswordForEmail: vi.fn().mockResolvedValue({ error: { name: "AuthApiError", status: 429 } }),
       },
     };
     const outcome = await requestPasswordReset(supabase, "someone@example.com", origin);
-    expect(outcome).toEqual({ message: RATE_LIMIT_MESSAGE, isRateLimited: true });
+    expect(outcome).toEqual({ message: GENERIC_RESET_MESSAGE });
+  });
+
+  it("does not enumerate users: a real email, a fake email, and a rate-limited (429) email all produce identical output", async () => {
+    const okClient = { auth: { resetPasswordForEmail: vi.fn().mockResolvedValue({ error: null }) } };
+    const errClient = {
+      auth: {
+        resetPasswordForEmail: vi.fn().mockResolvedValue({ error: { name: "AuthApiError", status: 400 } }),
+      },
+    };
+    const rateLimitedClient = {
+      auth: {
+        resetPasswordForEmail: vi.fn().mockResolvedValue({ error: { name: "AuthApiError", status: 429 } }),
+      },
+    };
+    const [a, b, c] = await Promise.all([
+      requestPasswordReset(okClient, "exists@example.com", origin),
+      requestPasswordReset(errClient, "does-not-exist@example.com", origin),
+      requestPasswordReset(rateLimitedClient, "recently-emailed@example.com", origin),
+    ]);
+    expect(a).toEqual(b);
+    expect(b).toEqual(c);
   });
 
   it("resolves safely (never throws) when the client itself rejects", async () => {
