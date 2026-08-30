@@ -3,10 +3,12 @@ import { getPgTestUrl, getPgTestPool, withRollback, insertTenant, insertMembersh
 import { randomUUID } from "crypto";
 
 /**
- * db/migrations/021_direct_revenue_aggregate.sql — DATABASE-LEVEL proof
- * (P1 Sprint 1 founder final-hardening directive on PR #18).
+ * db/migrations/021_direct_revenue_aggregate.sql +
+ * db/migrations/022_revoke_anon_direct_revenue_aggregate.sql —
+ * DATABASE-LEVEL proof (P1 Sprint 1 founder final-hardening directive on
+ * PR #18, plus the post-cutover privilege-gap correction).
  *
- * Proves, against a REAL Postgres 16 database, not an in-memory
+ * Proves, against a REAL Postgres database, not an in-memory
  * re-implementation:
  *   1. public.sum_direct_outcome_value() computes the correct total over
  *      MORE THAN 5000 direct-attribution rows — the exact scenario the
@@ -16,8 +18,20 @@ import { randomUUID } from "crypto";
  *      are correctly excluded.
  *   3. The function is genuinely SECURITY INVOKER, not SECURITY DEFINER
  *      (checked directly against pg_proc, not merely asserted from this
- *      migration's own SQL text).
- *   4. Grants: 'anon' has no EXECUTE; 'authenticated' does.
+ *      migration's own SQL text), and genuinely STABLE.
+ *   4. Grants after 001-022: PUBLIC and anon have NO EXECUTE; authenticated,
+ *      service_role, and postgres do. A dedicated regression test also
+ *      simulates the exact production incident migration 022 fixes — an
+ *      explicit direct grant to anon existing independently of PUBLIC
+ *      (mirroring the Supabase project's default-ACL-on-functions
+ *      behavior that migration 021's `REVOKE ... FROM PUBLIC` alone could
+ *      not reach) — and proves migration 022's own REVOKE statement
+ *      removes it. This repo's disposable test Postgres has no such
+ *      default-ACL rule for functions (see
+ *      db/shadow_env/000_supabase_scaffold.sql), so without this dedicated
+ *      test the CI suite would never exercise migration 022's actual
+ *      REVOKE against a database that has the grant — exactly how the
+ *      original gap escaped the migration-021 test suite.
  *   5. Tenant/RLS isolation actually holds end-to-end: an authenticated
  *      user who is a member of a DIFFERENT tenant gets 0, not the real
  *      total, when calling this function with someone else's tenant id —
@@ -71,7 +85,7 @@ async function seedBulkOutcomes(client: import("pg").PoolClient, tenantId: strin
   );
 }
 
-DESCRIBE("public.sum_direct_outcome_value (migration 021) — real Postgres proof, not skipped", () => {
+DESCRIBE("public.sum_direct_outcome_value (migrations 021-022) — real Postgres proof, not skipped", () => {
   it("computes the correct lifetime direct total over >5000 rows, excluding other attribution tiers and NULLs", async () => {
     await withRollback(async (client) => {
       const tenantId = await insertTenant(client);
@@ -106,27 +120,81 @@ DESCRIBE("public.sum_direct_outcome_value (migration 021) — real Postgres proo
     });
   });
 
-  it("is genuinely SECURITY INVOKER, not SECURITY DEFINER (checked against pg_proc directly)", async () => {
+  it("is genuinely SECURITY INVOKER, not SECURITY DEFINER, and remains STABLE (checked against pg_proc directly)", async () => {
     await withRollback(async (client) => {
       const { rows } = await client.query(
-        `SELECT prosecdef FROM pg_proc WHERE proname = 'sum_direct_outcome_value' AND pronamespace = 'public'::regnamespace`
+        `SELECT prosecdef, provolatile FROM pg_proc WHERE proname = 'sum_direct_outcome_value' AND pronamespace = 'public'::regnamespace`
       );
       expect(rows).toHaveLength(1);
       // prosecdef = true means SECURITY DEFINER; false means SECURITY
-      // INVOKER (the default, and what this migration explicitly declares).
+      // INVOKER (the default, and what migration 021 explicitly declares).
+      // Migration 022 only touches grants — it must not have disturbed
+      // either property.
       expect(rows[0].prosecdef).toBe(false);
+      // provolatile = 's' is STABLE (021's declared volatility).
+      expect(rows[0].provolatile).toBe("s");
     });
   });
 
-  it("grants: anon has no EXECUTE; authenticated does", async () => {
+  it("grants after migrations 001-022: PUBLIC and anon have no EXECUTE; authenticated, service_role, postgres do", async () => {
     await withRollback(async (client) => {
       const { rows } = await client.query(
         `SELECT grantee, privilege_type FROM information_schema.routine_privileges
          WHERE routine_name = 'sum_direct_outcome_value' AND routine_schema = 'public'`
       );
       const granteesWithExecute = rows.filter((r) => r.privilege_type === "EXECUTE").map((r) => r.grantee);
+      // PUBLIC: migration 021's own REVOKE.
+      expect(granteesWithExecute).not.toContain("PUBLIC");
+      // anon: migration 022's REVOKE — the post-cutover correction this
+      // migration exists for.
       expect(granteesWithExecute).not.toContain("anon");
       expect(granteesWithExecute).toContain("authenticated");
+      expect(granteesWithExecute).toContain("service_role");
+      expect(granteesWithExecute).toContain("postgres");
+    });
+  });
+
+  /**
+   * Regression test for the actual production incident migration 022
+   * fixes. This repo's disposable test Postgres has no project-level
+   * `ALTER DEFAULT PRIVILEGES ... ON FUNCTIONS` rule (see
+   * db/shadow_env/000_supabase_scaffold.sql — it sets one for TABLES only),
+   * so the test above passes on this database regardless of whether
+   * migration 022 ran at all: anon was never granted EXECUTE here in the
+   * first place. That is exactly how the original gap escaped the
+   * migration-021 test suite — the CI database's grant state doesn't match
+   * production's. This test closes that gap by explicitly reproducing the
+   * production condition (an anon grant existing independently of PUBLIC)
+   * inside a rolled-back transaction, then proving migration 022's own
+   * REVOKE statement — not a hand-rewritten equivalent — actually removes
+   * it. Deliberately narrow: it does not attempt to emulate the Supabase
+   * default-ACL rule itself (that would require reproducing platform
+   * provisioning behavior this repo doesn't control), only the grant state
+   * that rule produces.
+   */
+  it("regression: reproduces the production anon-grant condition and proves migration 022's REVOKE removes it", async () => {
+    await withRollback(async (client) => {
+      // Simulate the Supabase project's default-ACL-on-functions behavior:
+      // a direct grant to anon, independent of PUBLIC (mirrors production's
+      // actual state immediately after migration 021, before 022).
+      await client.query(`GRANT EXECUTE ON FUNCTION public.sum_direct_outcome_value(uuid) TO anon`);
+
+      const before = await client.query(
+        `SELECT 1 FROM information_schema.routine_privileges
+         WHERE routine_name = 'sum_direct_outcome_value' AND routine_schema = 'public'
+           AND grantee = 'anon' AND privilege_type = 'EXECUTE'`
+      );
+      expect(before.rows).toHaveLength(1); // sanity: the simulated grant is really there
+
+      // Migration 022's exact corrective statement.
+      await client.query(`REVOKE EXECUTE ON FUNCTION public.sum_direct_outcome_value(uuid) FROM anon`);
+
+      const after = await client.query(
+        `SELECT 1 FROM information_schema.routine_privileges
+         WHERE routine_name = 'sum_direct_outcome_value' AND routine_schema = 'public'
+           AND grantee = 'anon' AND privilege_type = 'EXECUTE'`
+      );
+      expect(after.rows).toHaveLength(0);
     });
   });
 
