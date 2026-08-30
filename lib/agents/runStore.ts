@@ -50,6 +50,18 @@ export interface AgentRunStore {
   update(tenantId: string, id: string, patch: UpdateAgentRunInput): Promise<AgentRun>;
   getById(tenantId: string, id: string): Promise<AgentRun | null>;
   listByTenant(tenantId: string, opts?: { limit?: number }): Promise<AgentRun[]>;
+  /**
+   * P1A retry-safety check: whether a run triggered by this EXACT event has
+   * already reached a terminal 'succeeded' status. Lets a caller whose
+   * trigger event carries a permanent idempotency key (e.g.
+   * lib/agents/estimateClosing/stalledScan.ts's estimate.stalled events)
+   * safely re-attempt processing on a later pass without ever double-
+   * succeeding: a transient failure, or a tenant whose agent wasn't yet
+   * active at scan time, must not permanently lose its trigger merely
+   * because the triggering event itself can never be re-emitted. See
+   * lib/agents/estimateClosing/shadowRunner.ts's 'already_processed' gate.
+   */
+  hasSucceededRun(tenantId: string, triggerEventId: string): Promise<boolean>;
 }
 
 function mapRow(row: Record<string, any>): AgentRun {
@@ -125,6 +137,20 @@ export class SupabaseAgentRunStore implements AgentRunStore {
     if (error) throw new Error(`[agent_runs] list failed: ${error.message}`);
     return (data ?? []).map(mapRow);
   }
+
+  async hasSucceededRun(tenantId: string, triggerEventId: string): Promise<boolean> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase
+      .from("agent_runs")
+      .select("id")
+      .eq("tenant_id", tenantId)
+      .eq("trigger_event_id", triggerEventId)
+      .eq("status", "succeeded")
+      .limit(1)
+      .maybeSingle();
+    if (error) throw new Error(`[agent_runs] hasSucceededRun failed: ${error.message}`);
+    return data != null;
+  }
 }
 
 export class InMemoryAgentRunStore implements AgentRunStore {
@@ -169,6 +195,10 @@ export class InMemoryAgentRunStore implements AgentRunStore {
       .filter((r) => r.tenantId === tenantId)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .slice(0, opts.limit ?? 50);
+  }
+
+  async hasSucceededRun(tenantId: string, triggerEventId: string): Promise<boolean> {
+    return this.rows.some((r) => r.tenantId === tenantId && r.triggerEventId === triggerEventId && r.status === "succeeded");
   }
 
   all(): AgentRun[] {

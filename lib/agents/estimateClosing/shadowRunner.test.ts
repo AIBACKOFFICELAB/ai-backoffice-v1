@@ -143,6 +143,46 @@ describe("triggerEstimateClosingShadow — shadow mode safety", () => {
     expect((await runStore.listByTenant(TENANT)).length).toBe(0);
   });
 
+  it("does nothing when a run triggered by this exact event has already succeeded (retry-safety gate — Codex P1 finding)", async () => {
+    const { agentStore, runStore, eventStore, gateway } = makeHarness();
+    const agent = await seedActiveAgent(agentStore);
+    // Simulate a prior successful run for this exact trigger event, without
+    // going through the full pipeline — proves the gate itself, independent
+    // of how the prior success was produced.
+    const priorRun = await runStore.create({ tenantId: TENANT, agentId: agent.id, triggerEventId: "evt-already-done" });
+    await runStore.update(TENANT, priorRun.id, { status: "succeeded" });
+
+    const outcome = await triggerEstimateClosingShadow(TENANT, "evt-already-done", makeLead(), makeSequence(), {
+      agentStore,
+      runStore,
+      eventStore,
+      gateway,
+      isEnabled: () => true,
+    });
+
+    expect(outcome).toEqual({ status: "skipped", reason: "already_processed" });
+    // No second run was created for this trigger event.
+    const runsForEvent = (await runStore.listByTenant(TENANT)).filter((r) => r.triggerEventId === "evt-already-done");
+    expect(runsForEvent.length).toBe(1);
+  });
+
+  it("does NOT skip when a prior run for this event failed (only a succeeded run blocks a retry)", async () => {
+    const { agentStore, runStore, eventStore, gateway } = makeHarness();
+    const agent = await seedActiveAgent(agentStore);
+    const priorRun = await runStore.create({ tenantId: TENANT, agentId: agent.id, triggerEventId: "evt-failed-before" });
+    await runStore.update(TENANT, priorRun.id, { status: "failed", failureReason: "model gateway failed: timeout" });
+
+    const outcome = await triggerEstimateClosingShadow(TENANT, "evt-failed-before", makeLead(), makeSequence(), {
+      agentStore,
+      runStore,
+      eventStore,
+      gateway,
+      isEnabled: () => true,
+    });
+
+    expect(outcome.status).toBe("succeeded"); // the retry itself succeeds (VALID_RESPONSE provider)
+  });
+
   it("does nothing when the estimate is not actually eligible (e.g. already won)", async () => {
     const { agentStore, runStore, eventStore, gateway } = makeHarness();
     await seedActiveAgent(agentStore);

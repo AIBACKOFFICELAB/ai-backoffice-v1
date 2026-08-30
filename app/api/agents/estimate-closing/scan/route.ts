@@ -51,7 +51,8 @@ export async function GET(request: NextRequest) {
     fired: true,
     candidatesScanned: result.scan.candidatesScanned,
     stalledFound: result.scan.stalledFound,
-    newlyTriggered: result.scan.newlyEmitted.length,
+    newEventsThisSweep: result.scan.stalledCandidates.filter((c) => c.isNewEvent).length,
+    shadowAttempts: result.shadowOutcomes.length,
     outcomes: result.shadowOutcomes.map(({ outcome }) => outcome.status),
   });
 }

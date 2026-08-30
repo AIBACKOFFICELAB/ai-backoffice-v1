@@ -27,7 +27,18 @@ import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosin
 
 const RECENT_ACTIVITY_LIMIT = 12;
 const RECENT_RUNS_LIMIT = 10;
-const OUTCOME_SUMMARY_LIMIT = 200; // bounded — see the doc comment above
+// Bounded, not unlimited (see the doc comment above) — but high enough
+// that "Direct Revenue Recovered by AI" cannot silently shrink as older
+// outcomes age out of the window for any tenant at a realistic outcome
+// volume today. A tenant that ever legitimately exceeds this many
+// lifetime direct outcomes needs a real SUM() aggregate query instead of
+// a bounded fetch-and-reduce; not implemented here — this codebase's
+// Supabase client wrapper (lib/supabase/server.ts) has no verified path
+// to a PostgREST aggregate select from this environment, and shipping an
+// unverified query against a truthful revenue headline is a worse risk
+// than this documented, generous bound. Revisit once a tenant's outcome
+// volume approaches this number for real.
+const OUTCOME_SUMMARY_LIMIT = 5000;
 
 export type AttentionItemKind = "emergency_lead" | "overdue_follow_up" | "stalled_estimate" | "pending_approval" | "agent_failure";
 
@@ -149,13 +160,21 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
 
   for (const event of stalledEvents) {
     const lead = event.entityId ? leadsById.get(event.entityId) : undefined;
+    // A stalled event is a historical fact — "this estimate went stalled at
+    // time T" — but the lead may have since moved on (won, lost, completed,
+    // or simply deleted) or received a reply the sequence recorded. Re-check
+    // CURRENT state before presenting it as still-open work; an event whose
+    // estimate has since resolved is correctly excluded here rather than
+    // lingering in the attention list (and the executive header's count)
+    // until enough newer stalled events push it out of the fetch window.
+    if (!lead || lead.status !== "Estimate Sent") continue;
     const amount = typeof event.payload.estimateAmount === "number" ? event.payload.estimateAmount : null;
     attentionItems.push({
       kind: "stalled_estimate",
-      title: lead?.customerName ?? "Estimate",
-      description: `${lead?.serviceType ?? "Estimate"} has had no response since it was sent`,
+      title: lead.customerName,
+      description: `${lead.serviceType} has had no response since it was sent`,
       value: amount != null ? `$${amount.toLocaleString()}` : undefined,
-      href: lead ? `/leads/${lead.id}` : "/follow-ups",
+      href: `/leads/${lead.id}`,
       occurredAt: event.occurredAt,
     });
   }

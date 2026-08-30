@@ -105,17 +105,26 @@ export type StalledEmission = {
   eventId: string;
   lead: EstimateClosingLeadContext;
   sequence: EstimateFollowupSequenceContext;
+  /** Whether THIS scan run is what created the estimate.stalled event
+   * (true) vs. found one already emitted by a previous run (false) — pure
+   * telemetry; both cases are attempted identically by
+   * runEstimateClosingShadowSweep (see below). */
+  isNewEvent: boolean;
 };
 
 export type StalledScanResult = {
   candidatesScanned: number;
   stalledFound: number;
-  /** Only the events that were genuinely NEW this run (deduped: false) —
-   * these, and only these, are what should go on to trigger a shadow
-   * reasoning call (see runEstimateClosingShadowSweep below). A re-run
-   * that finds the same estimate still stalled correctly reports it in
-   * stalledFound but NOT here. */
-  newlyEmitted: StalledEmission[];
+  /** Every currently-stalled candidate, whether its estimate.stalled event
+   * was newly emitted by this run or already existed from a previous one.
+   * runEstimateClosingShadowSweep attempts shadow reasoning for ALL of
+   * these — it is triggerEstimateClosingShadow's OWN
+   * `hasSucceededRun` check (not event-emission dedup) that prevents a
+   * repeat model call for an estimate already successfully processed, so
+   * a transient failure or a tenant not yet activated at scan time can
+   * still be retried by a later scan instead of permanently losing its
+   * one-time, non-re-emittable trigger event. */
+  stalledCandidates: StalledEmission[];
 };
 
 function daysBetween(a: Date, b: Date): number {
@@ -125,7 +134,7 @@ function daysBetween(a: Date, b: Date): number {
 /**
  * Read-only scan + idempotent event emission. Never invokes the model
  * gateway itself — see runEstimateClosingShadowSweep, which layers that on
- * top of this function's `newlyEmitted` result.
+ * top of this function's `stalledCandidates` result.
  */
 export async function scanForStalledEstimates(deps: StalledScanDeps = {}): Promise<StalledScanResult> {
   const reader = deps.reader ?? new SupabaseSequenceWithLeadReader();
@@ -133,7 +142,7 @@ export async function scanForStalledEstimates(deps: StalledScanDeps = {}): Promi
   const now = deps.now ?? new Date();
 
   const candidates = await reader.listCandidates();
-  const newlyEmitted: StalledEmission[] = [];
+  const stalledCandidates: StalledEmission[] = [];
   let stalledFound = 0;
 
   for (const { sequence, lead } of candidates) {
@@ -158,12 +167,14 @@ export async function scanForStalledEstimates(deps: StalledScanDeps = {}): Promi
       eventStore
     );
 
-    if (!deduped) {
-      newlyEmitted.push({ tenantId: sequence.tenantId, eventId: event.id, lead, sequence });
-    }
+    // Every currently-stalled candidate is tracked, whether this scan
+    // created the event (deduped: false) or found one from a previous run
+    // (deduped: true) — see the doc comment on StalledScanResult above for
+    // why both are attempted identically downstream.
+    stalledCandidates.push({ tenantId: sequence.tenantId, eventId: event.id, lead, sequence, isNewEvent: !deduped });
   }
 
-  return { candidatesScanned: candidates.length, stalledFound, newlyEmitted };
+  return { candidatesScanned: candidates.length, stalledFound, stalledCandidates };
 }
 
 export type ShadowSweepResult = {
@@ -172,9 +183,14 @@ export type ShadowSweepResult = {
 };
 
 /**
- * Top-level entry point: scan for newly-stalled estimates, then — for each
- * one, and ONLY for each one (never for an already-known stalled estimate
- * a prior run already handled) — invoke the shadow agent. This is what
+ * Top-level entry point: scan for currently-stalled estimates, then attempt
+ * shadow reasoning for EVERY one of them — including an estimate whose
+ * estimate.stalled event already existed from a previous run, so a
+ * transient failure or an inactive/disabled tenant at the time of first
+ * detection doesn't permanently forfeit its recommendation (see
+ * shadowRunner.ts's 'already_processed' gate, which is what actually makes
+ * repeat attempts for an already-succeeded estimate a safe no-op — this
+ * function does not pre-filter on its own). This is what
  * app/api/agents/estimate-closing/scan/route.ts calls.
  */
 export async function runEstimateClosingShadowSweep(
@@ -184,7 +200,7 @@ export async function runEstimateClosingShadowSweep(
   const scan = await scanForStalledEstimates(scanDeps);
 
   const shadowOutcomes: Array<{ emission: StalledEmission; outcome: EstimateClosingShadowOutcome }> = [];
-  for (const emission of scan.newlyEmitted) {
+  for (const emission of scan.stalledCandidates) {
     const outcome = await triggerEstimateClosingShadow(emission.tenantId, emission.eventId, emission.lead, emission.sequence, shadowDeps);
     shadowOutcomes.push({ emission, outcome });
   }

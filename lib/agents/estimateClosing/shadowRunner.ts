@@ -48,7 +48,12 @@ function resolveDeps(deps: EstimateClosingShadowDeps) {
   };
 }
 
-export type EstimateClosingShadowSkipReason = "feature_disabled" | "agent_missing" | "agent_inactive" | "not_eligible";
+export type EstimateClosingShadowSkipReason =
+  | "feature_disabled"
+  | "already_processed"
+  | "agent_missing"
+  | "agent_inactive"
+  | "not_eligible";
 
 export type EstimateClosingShadowOutcome =
   | { status: "skipped"; reason: EstimateClosingShadowSkipReason }
@@ -76,11 +81,22 @@ function fingerprintText(text: string): string {
  *   1. isEstimateClosingShadowEnabled() (or the injected override) — the
  *      production kill switch (featureFlag.ts), independent of the agent
  *      row's own status.
- *   2. A tenant `estimate_closing` agent row exists AND its status is
+ *   2. No run triggered by this EXACT event has already succeeded
+ *      (runStore.hasSucceededRun) — the retry-safety check. `triggerEventId`
+ *      carries a PERMANENT idempotency key at the event layer
+ *      (stalledScan.ts's estimate.stalled events can never be re-emitted for
+ *      the same estimate), so gating retries on event-emission dedup alone
+ *      would mean a transient gateway failure, or a tenant whose agent
+ *      wasn't yet active, permanently loses its one chance at a
+ *      recommendation. Gating on "has this actually succeeded" instead
+ *      means a later sweep safely retries anything that hasn't — see
+ *      stalledScan.ts's ShadowSweepResult, which now attempts every
+ *      currently-stalled candidate, not just newly-emitted ones.
+ *   3. A tenant `estimate_closing` agent row exists AND its status is
  *      'active' — re-verified here, never assumed from the caller, the
  *      same discipline lib/agents/permissions.ts applies to every other
  *      agent invocation in this codebase.
- *   3. The estimate is still genuinely eligible AT CALL TIME (re-checked
+ *   4. The estimate is still genuinely eligible AT CALL TIME (re-checked
  *      via eligibility.ts, not trusted from whatever triggered this call —
  *      time may have passed, or the sequence could have gotten a reply
  *      since the caller last checked).
@@ -96,6 +112,10 @@ export async function triggerEstimateClosingShadow(
 
   if (!isEnabled()) {
     return { status: "skipped", reason: "feature_disabled" };
+  }
+
+  if (await runStore.hasSucceededRun(tenantId, triggerEventId)) {
+    return { status: "skipped", reason: "already_processed" };
   }
 
   const agent = await agentStore.findByBuiltinType(tenantId, "estimate_closing");
