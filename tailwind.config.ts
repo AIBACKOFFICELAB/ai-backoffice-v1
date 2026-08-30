@@ -46,6 +46,27 @@ const config: Config = {
           500: "#5b5e6b",
           400: "#80838f",
         },
+        // Semantic status tokens (P1B) — single source of truth so
+        // "success"/"warning"/"danger" stop being ad hoc emerald-600 /
+        // amber-100 / red-600 utility strings copy-pasted per page.
+        success: {
+          50: "#ecfdf5",
+          100: "#d1fae5",
+          600: "#059669",
+          700: "#047857",
+        },
+        warning: {
+          50: "#fffbeb",
+          100: "#fef3c7",
+          600: "#d97706",
+          700: "#b45309",
+        },
+        danger: {
+          50: "#fef2f2",
+          100: "#fee2e2",
+          600: "#dc2626",
+          700: "#b91c1c",
+        },
       },
       borderRadius: {
         card: "14px",

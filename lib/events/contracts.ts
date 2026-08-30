@@ -55,6 +55,37 @@ function forbidRawCallerPhone(payload: unknown): EventPayloadValidation {
   return { ok: true };
 }
 
+/**
+ * P1A: forbids the customer-identifying / free-text fields a lead record
+ * carries (data/leadModel.ts) from ever reaching a business_events
+ * payload — the lead itself remains the system of record for all of
+ * these. Shared by both estimate.stalled (the trigger) and
+ * estimate.closing_recommendation_generated (the shadow agent's output) —
+ * see lib/agents/estimateClosing/*. Also forbids `rationale`: the model's
+ * free-text reasoning must never be persisted verbatim (see
+ * lib/agents/estimateClosing/shadowRunner.ts) — only its length, under
+ * `rationaleLength`, which this check deliberately allows.
+ */
+const FORBIDDEN_ESTIMATE_EVENT_FIELDS = [
+  "customerName",
+  "phone",
+  "email",
+  "serviceAddress",
+  "jobDescription",
+  "customerNotes",
+  "internalNotes",
+  "rationale",
+] as const;
+
+function forbidRawEstimatePii(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  const present = FORBIDDEN_ESTIMATE_EVENT_FIELDS.filter((field) => field in payload);
+  if (present.length > 0) {
+    return { ok: false, errors: [`payload must not include raw customer/model-prose field(s): ${present.join(", ")} — see lib/events/contracts.ts`] };
+  }
+  return { ok: true };
+}
+
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "call.missed": {
     eventType: "call.missed",
@@ -86,6 +117,27 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
     schemaVersion: 1,
     idempotency: "not_applicable",
     validatePayload: () => ({ ok: true }),
+  },
+  "estimate.stalled": {
+    eventType: "estimate.stalled",
+    schemaVersion: 1,
+    // Keyed by the estimate_followup_sequences row id, which can only ever
+    // transition into "stalled" once per estimate (see
+    // lib/agents/estimateClosing/stalledScan.ts) — required, not merely
+    // recommended, so a re-run scan can never emit a second stalled event
+    // (and therefore never trigger a second shadow reasoning call) for the
+    // same estimate.
+    idempotency: "required",
+    validatePayload: forbidRawEstimatePii,
+  },
+  "estimate.closing_recommendation_generated": {
+    eventType: "estimate.closing_recommendation_generated",
+    schemaVersion: 1,
+    // Not applicable: this event is a downstream EFFECT of a successful
+    // shadow reasoning call, not a redeliverable external signal — nothing
+    // "retries" producing it the way a webhook or cron scan could.
+    idempotency: "not_applicable",
+    validatePayload: forbidRawEstimatePii,
   },
 };
 

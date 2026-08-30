@@ -1,23 +1,22 @@
-import Link from "next/link";
 import { getUser } from "@/lib/auth";
 import { getTenantContext } from "@/lib/tenant";
-import { AppNav } from "@/components/AppNav";
+import { Sidebar } from "@/components/app-shell/Sidebar";
+import { TopBar } from "@/components/app-shell/TopBar";
+import { MobileNav } from "@/components/app-shell/MobileNav";
+import { resolveNavGroups } from "@/components/app-shell/navConfig";
 
-const ownerNavItems = [
-  { href: "/dashboard", label: "Dashboard" },
-  { href: "/lead-inbox", label: "Lead Inbox" },
-  { href: "/follow-ups", label: "Follow-Ups" },
-  { href: "/review-requests", label: "Review Requests" },
-  { href: "/prospects", label: "Prospects" },
-  { href: "/settings", label: "Settings" },
-];
-
-const staffNavItems = ownerNavItems.filter((item) => item.href !== "/settings");
-
+/**
+ * P1B premium application shell (P1 directive §12): persistent left
+ * sidebar + top utility bar on desktop, compact top bar + navigation
+ * drawer on mobile. Replaces the P0 horizontal-nav MVP shell
+ * (components/AppNav.tsx, now unused).
+ */
 export async function AppShell({ children }: { children: React.ReactNode }) {
   const user = await getUser();
   const tenant = user ? await getTenantContext() : null;
-  const navItems = tenant?.role === "staff" ? staffNavItems : ownerNavItems;
+  const role = tenant?.role ?? "staff";
+  const navGroups = resolveNavGroups(role);
+  const tenantName = tenant?.tenantName ?? "AI BackOffice";
 
   return (
     <div className="min-h-screen bg-surface text-ink-900">
@@ -27,16 +26,16 @@ export async function AppShell({ children }: { children: React.ReactNode }) {
       >
         Skip to content
       </a>
-      <header className="sticky top-0 z-40 border-b border-surface-border bg-white/90 backdrop-blur">
-        <div className="mx-auto flex h-16 max-w-page items-center justify-between gap-3 px-5 sm:px-8">
-          <Link href={user ? "/dashboard" : "/"} className="font-display text-[17px] font-bold tracking-tight">
-            AI BackOffice
-          </Link>
 
-          <AppNav navItems={navItems} userEmail={user?.email ?? null} />
-        </div>
-      </header>
-      <main id="main-content" className="mx-auto max-w-page px-5 py-8 sm:px-8">{children}</main>
+      <Sidebar groups={navGroups} tenantName={tenantName} />
+      <MobileNav groups={navGroups} tenantName={tenantName} userEmail={user?.email ?? null} />
+
+      <div className="lg:pl-64">
+        <TopBar tenantName={tenantName} userEmail={user?.email ?? null} />
+        <main id="main-content" className="mx-auto max-w-page px-5 py-8 sm:px-8">
+          {children}
+        </main>
+      </div>
     </div>
   );
 }

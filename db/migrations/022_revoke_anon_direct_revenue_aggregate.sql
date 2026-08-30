@@ -1,0 +1,101 @@
+-- P1 Sprint 1 — PR #18 final security correction (post-cutover finding)
+--
+-- Migration 021 is historical/immutable and is NOT edited, rewritten,
+-- reapplied, renamed, or reordered by this file — this is a new, additive,
+-- corrective migration on top of it, exactly like 020 was on top of
+-- 003/007 for the same class of problem on a different function.
+--
+-- =========================================================================
+-- Why migration 021's `REVOKE EXECUTE ... FROM PUBLIC` was insufficient on
+-- production
+-- =========================================================================
+--
+-- `PUBLIC` in Postgres is a pseudo-role representing "every role, via the
+-- implicit privilege every role inherits unless revoked." `REVOKE ... FROM
+-- PUBLIC` only removes THAT implicit privilege. It does not — and cannot —
+-- remove a privilege a specific role holds through its OWN direct grant,
+-- however that grant was created. Migration 021 correctly revoked from
+-- PUBLIC and correctly never issued an explicit `GRANT ... TO anon`. On a
+-- vanilla Postgres instance (this repo's disposable CI/test databases —
+-- see db/shadow_env/000_supabase_scaffold.sql, which sets
+-- `ALTER DEFAULT PRIVILEGES ... ON TABLES` but nothing for FUNCTIONS) that
+-- was the complete fix, and the CI proof suite passed on exactly that
+-- basis.
+--
+-- =========================================================================
+-- The Supabase project-specific default ACL behavior discovered after
+-- cutover
+-- =========================================================================
+--
+-- The production project (yohfpsaemgibarlgodmh) carries a project-level
+-- `ALTER DEFAULT PRIVILEGES IN SCHEMA public ... ON FUNCTIONS` rule
+-- (configured by Supabase platform provisioning, not by any migration in
+-- this repo) that grants EXECUTE DIRECTLY to `anon`, `authenticated`,
+-- `postgres`, and `service_role` on every newly created function in the
+-- `public` schema, independent of the implicit PUBLIC privilege. Read-only
+-- verification immediately after applying migration 021 to production
+-- confirmed: `PUBLIC` correctly has no privilege row (021's revoke worked);
+-- `authenticated`/`service_role`/`postgres` have EXECUTE as intended; but
+-- `anon` ALSO has EXECUTE — a direct grant from that default-ACL rule, not
+-- from PUBLIC, so 021's revoke never touched it. `pg_default_acl` on this
+-- project confirms the rule exists. This is precisely the same category of
+-- issue migration 020 corrected for `public.is_tenant_member(uuid)`
+-- (see 020's header) — a Supabase-provisioning-time grant this repo's
+-- migrations don't control at creation time, correctable only with an
+-- explicit follow-up REVOKE, the same shape as 020's fix.
+--
+-- =========================================================================
+-- Why 021 must remain immutable
+-- =========================================================================
+--
+-- 021 is already applied to production and its own file is an accurate,
+-- byte-for-byte historical record of exactly what ran there and when —
+-- editing it after the fact would make the migration file lie about
+-- production's actual migration history (docs/constitution/09's
+-- forward-only-migrations discipline: correct forward, never rewrite
+-- history). This file is the correction; 021 stays exactly as applied.
+--
+-- =========================================================================
+-- That SECURITY INVOKER + RLS already prevented disclosure
+-- =========================================================================
+--
+-- `public.sum_direct_outcome_value(uuid)` is `SECURITY INVOKER` (021,
+-- confirmed via `pg_proc.prosecdef = false`), so any call — including one
+-- made by `anon` — runs under the CALLING role's own privileges, subject
+-- to `outcomes`' `outcomes_select_tenant` RLS policy
+-- (`is_tenant_member(tenant_id)`). For an `anon` session `auth.uid()` is
+-- always NULL (no JWT), so `is_tenant_member()` is always false regardless
+-- of the tenant id argument — RLS hides every row, and the function's
+-- `COALESCE(SUM(...), 0)` returns the truthful `0`, never real tenant
+-- data. The unintended `anon` grant was an unnecessary anonymous RPC
+-- surface, not a data-disclosure vulnerability — the same conclusion 020's
+-- header reaches for `is_tenant_member` by the same reasoning.
+--
+-- =========================================================================
+-- What this migration does
+-- =========================================================================
+--
+-- Removes exactly the one unintended grant, on exactly the one function.
+-- No change to the function body, SECURITY INVOKER, STABLE, search_path,
+-- the `authenticated`/`service_role`/`postgres` grants, the supporting
+-- index, RLS, the `outcomes_select_tenant` policy, or the project's
+-- default-ACL configuration itself (that default-ACL rule is Supabase
+-- platform configuration, out of scope for a repo migration, and will
+-- affect future functions the same way unless corrected at the platform
+-- level separately — tracked as a follow-up, not fixed here).
+--
+-- =========================================================================
+-- Rollback procedure
+-- =========================================================================
+--
+-- Forward-only numbered migrations, no down-migration tooling
+-- (docs/constitution/09_DEVELOPMENT_STANDARDS.md). If this migration must
+-- be reverted: `GRANT EXECUTE ON FUNCTION public.sum_direct_outcome_value(uuid)
+-- TO anon;` restores the pre-022 (post-021, as-cutover) grant exactly.
+-- Safe to revert at any time — reverting only restores the unnecessary
+-- anonymous RPC surface, which SECURITY INVOKER + RLS still render
+-- non-disclosive per the analysis above.
+
+REVOKE EXECUTE
+ON FUNCTION public.sum_direct_outcome_value(uuid)
+FROM anon;
