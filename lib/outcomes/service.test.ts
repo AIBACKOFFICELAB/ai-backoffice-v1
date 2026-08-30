@@ -78,6 +78,7 @@ describe("recordOutcomeSafely — compatibility telemetry deadline (H-01)", () =
         throw new Error("connection refused");
       },
       listByTenant: async () => [],
+      sumDirectAttributionValue: async () => 0,
     };
     const resultPromise = recordOutcomeSafely({ tenantId: "t1", outcomeType: "admin_time_saved", attributionConfidence: "direct" }, rejectingStore);
     await vi.advanceTimersByTimeAsync(10);
@@ -88,6 +89,7 @@ describe("recordOutcomeSafely — compatibility telemetry deadline (H-01)", () =
     const hangingStore = {
       insert: () => new Promise<never>(() => {}),
       listByTenant: async () => [],
+      sumDirectAttributionValue: async () => 0,
     };
     const resultPromise = recordOutcomeSafely({ tenantId: "t1", outcomeType: "admin_time_saved", attributionConfidence: "direct" }, hangingStore);
 
@@ -113,6 +115,7 @@ describe("recordOutcomeSafely — compatibility telemetry deadline (H-01)", () =
           throw new Error("boom");
         },
         listByTenant: async () => [],
+        sumDirectAttributionValue: async () => 0,
       };
       await recordOutcomeSafely({ tenantId: "t1", outcomeType: "admin_time_saved", attributionConfidence: "direct" }, rejectingStore);
       await vi.advanceTimersByTimeAsync(0);

@@ -7,7 +7,6 @@ import { SupabaseAgentRunStore } from "@/lib/agents/runStore";
 import { SupabaseApprovalStore } from "@/lib/approvals/store";
 import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
 import { SupabaseBusinessEventStore } from "@/lib/events/store";
-import { summarizeOutcomeValue } from "@/lib/outcomes/service";
 import { EstimateClosingRecommendation } from "@/lib/agents/estimateClosing/types";
 import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosing/mode";
 
@@ -27,18 +26,18 @@ import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosin
 
 const RECENT_ACTIVITY_LIMIT = 12;
 const RECENT_RUNS_LIMIT = 10;
-// Bounded, not unlimited (see the doc comment above) — but high enough
-// that "Direct Revenue Recovered by AI" cannot silently shrink as older
-// outcomes age out of the window for any tenant at a realistic outcome
-// volume today. A tenant that ever legitimately exceeds this many
-// lifetime direct outcomes needs a real SUM() aggregate query instead of
-// a bounded fetch-and-reduce; not implemented here — this codebase's
-// Supabase client wrapper (lib/supabase/server.ts) has no verified path
-// to a PostgREST aggregate select from this environment, and shipping an
-// unverified query against a truthful revenue headline is a worse risk
-// than this documented, generous bound. Revisit once a tenant's outcome
-// volume approaches this number for real.
-const OUTCOME_SUMMARY_LIMIT = 5000;
+// Note: "Direct Revenue Recovered by AI" deliberately does NOT use a
+// bounded limit like the constants above — it is computed via
+// OutcomeStore.sumDirectAttributionValue(), a real database SUM()
+// aggregate (db/migrations/021_direct_revenue_aggregate.sql) over the
+// tenant's FULL lifetime direct-attribution outcome history, proven
+// correct against >5000 rows in
+// lib/outcomes/directRevenueAggregate.pg.test.ts. A bounded fetch-and-
+// reduce over this figure previously could silently undercount once a
+// tenant's direct-outcome row count exceeded the fetch limit (Codex
+// review finding on PR #18) — bounding is correct for the activity feeds
+// below, which are intentionally windowed views, but was never correct
+// for a lifetime headline total.
 
 export type AttentionItemKind = "emergency_lead" | "overdue_follow_up" | "stalled_estimate" | "pending_approval" | "agent_failure";
 
@@ -111,7 +110,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     agents,
     recentRuns,
     pendingApprovals,
-    outcomesForSummary,
+    directRevenueRecoveredUsd,
     stalledEvents,
     recommendationEvents,
   ] = await Promise.all([
@@ -121,7 +120,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     agentStore.listByTenant(tenantId),
     runStore.listByTenant(tenantId, { limit: RECENT_RUNS_LIMIT }),
     approvalStore.listByTenant(tenantId, { status: "pending" }),
-    outcomeStore.listByTenant(tenantId, { limit: OUTCOME_SUMMARY_LIMIT }),
+    outcomeStore.sumDirectAttributionValue(tenantId),
     eventStore.listByTenant(tenantId, { eventType: "estimate.stalled", limit: RECENT_ACTIVITY_LIMIT }),
     eventStore.listByTenant(tenantId, { eventType: "estimate.closing_recommendation_generated", limit: RECENT_ACTIVITY_LIMIT }),
   ]);
@@ -130,8 +129,6 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
   const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
   const estimateClosingAgentActive = agents.some((a) => a.agentType === "estimate_closing" && a.status === "active");
-
-  const directRevenueRecoveredUsd = summarizeOutcomeValue(outcomesForSummary).direct;
 
   const today = new Date().toISOString().slice(0, 10);
 

@@ -10,6 +10,21 @@ export interface OutcomeStore {
    * mirrors lib/events/store.ts and lib/execution/store.ts exactly. */
   insert(input: RecordOutcomeInput): Promise<{ outcome: Outcome; deduped: boolean }>;
   listByTenant(tenantId: string, opts?: { outcomeType?: OutcomeType; limit?: number }): Promise<Outcome[]>;
+  /**
+   * The tenant's full LIFETIME sum of outcome_value across every
+   * direct-attribution-confidence row — never bounded by a row limit, and
+   * never blended with assisted/inferred/unknown (OUTCOME_ATTRIBUTION.md's
+   * honesty rule). This is what backs the "Direct Revenue Recovered by AI"
+   * dashboard headline (lib/dashboard/revenueCommandCenter.ts) — use this,
+   * never listByTenant()+summarizeOutcomeValue(), for that figure; a
+   * bounded fetch-and-reduce can silently undercount once a tenant's
+   * direct-outcome row count exceeds the fetch limit (Codex review finding
+   * on PR #18, fixed by db/migrations/021_direct_revenue_aggregate.sql).
+   * listByTenant()+summarizeOutcomeValue() remains correct for a bounded
+   * recent-activity view, which is a different, intentionally-windowed
+   * question.
+   */
+  sumDirectAttributionValue(tenantId: string): Promise<number>;
 }
 
 function mapRow(row: Record<string, any>): Outcome {
@@ -86,6 +101,17 @@ export class SupabaseOutcomeStore implements OutcomeStore {
     if (error) throw new Error(`[outcomes] list failed: ${error.message}`);
     return (data ?? []).map(mapRow);
   }
+
+  async sumDirectAttributionValue(tenantId: string): Promise<number> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase.rpc("sum_direct_outcome_value", { p_tenant_id: tenantId });
+    if (error) throw new Error(`[outcomes] sumDirectAttributionValue failed: ${error.message}`);
+    // The Postgres function returns numeric(12,2), which supabase-js
+    // surfaces as a string (or occasionally a number) to avoid silent
+    // float-precision loss on the wire — normalize explicitly rather than
+    // trusting either shape.
+    return data == null ? 0 : Number(data);
+  }
 }
 
 export class InMemoryOutcomeStore implements OutcomeStore {
@@ -122,6 +148,12 @@ export class InMemoryOutcomeStore implements OutcomeStore {
       .filter((r) => r.tenantId === tenantId && (!opts.outcomeType || r.outcomeType === opts.outcomeType))
       .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
       .slice(0, opts.limit ?? 50);
+  }
+
+  async sumDirectAttributionValue(tenantId: string): Promise<number> {
+    return this.rows
+      .filter((r) => r.tenantId === tenantId && r.attributionConfidence === "direct" && r.outcomeValue != null)
+      .reduce((sum, r) => sum + (r.outcomeValue ?? 0), 0);
   }
 
   all(): Outcome[] {
