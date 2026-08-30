@@ -67,6 +67,11 @@ export function buildLeadMetrics(leads: PlumbingLead[]) {
     estimatesSent: leads.filter((lead) => lead.status === "Estimate Sent").length,
     jobsWon: leads.filter((lead) => lead.status === "Won").length,
     revenuePipeline: leads.filter((lead) => !["Lost", "Completed"].includes(lead.status)).reduce((sum, lead) => sum + lead.estimateAmount, 0),
+    // P1B: open estimate dollars specifically needing attention — distinct
+    // from revenuePipeline (which includes New/Contacted/Scheduled leads
+    // with no estimate sent yet). See DOMAIN_MODEL.md / OUTCOME_ATTRIBUTION.md's
+    // "AT-RISK ESTIMATE VALUE" vs "PIPELINE VALUE" distinction.
+    atRiskEstimateValue: leads.filter((lead) => lead.status === "Estimate Sent").reduce((sum, lead) => sum + lead.estimateAmount, 0),
     reviewPending: leads.filter((lead) => lead.reviewRequestStatus === "Ready to Send").length,
     reviewVisibleStatuses,
   };
