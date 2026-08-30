@@ -76,6 +76,13 @@ export const KNOWN_EVENT_TYPES = [
   "estimate.sent",
   "estimate.viewed",
   "estimate.stalled",
+  /** P1A: emitted by the Estimate Closing Agent (Shadow Mode) after it
+   * reasons about a stalled estimate — never by a page render, never on
+   * every scan. Payload is the privacy-safe, structured
+   * EstimateClosingRecommendation (see lib/agents/estimateClosing/types.ts)
+   * — no raw model prose, no customer PII. See
+   * lib/agents/estimateClosing/shadowRunner.ts. */
+  "estimate.closing_recommendation_generated",
   "job.created",
   "job.completed",
   "invoice.created",
