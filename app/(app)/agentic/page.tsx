@@ -16,7 +16,11 @@ import { SupabaseApprovalStore } from "@/lib/approvals/store";
 import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
 import { modeForRunWorkflow, ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosing/mode";
 import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
-import { listEstimateClosingRecommendations, summarizeEstimateClosingRecommendations } from "@/lib/agents/estimateClosing/recommendationReadModel";
+import {
+  listEstimateClosingRecommendations,
+  summarizeEstimateClosingRecommendations,
+  selectFeaturedRecommendations,
+} from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { MetricCard } from "@/components/dashboard/MetricCard";
@@ -118,14 +122,18 @@ export default async function AgenticActivityPage() {
               title="Registered, not running"
               description="Estimate Closing is configured but not running."
             />
-          ) : !estimateClosingShadowEnabled ? (
-            <EmptyState
-              icon={<Bot className="h-8 w-8" />}
-              title="Shadow disabled"
-              description="Shadow intelligence is not currently enabled."
-            />
           ) : (
             <>
+              {/* ESTIMATE_CLOSING_SHADOW_ENABLED is an execution kill switch
+                  for FUTURE scans only — it must never hide recommendations
+                  a prior, still-enabled scan already generated (Codex
+                  review finding on PR #20). */}
+              {!estimateClosingShadowEnabled && (
+                <Alert tone="info" className="mb-4" title="Shadow intelligence is not currently enabled">
+                  New scans are paused. Showing past recommendations only.
+                </Alert>
+              )}
+
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <MetricCard label="Recommendations generated" value={estimateClosingSummary.estimatesAnalyzed} icon={<Bot className="h-4 w-4" />} />
                 <MetricCard
@@ -162,7 +170,7 @@ export default async function AgenticActivityPage() {
                   />
                 ) : (
                   <div className="grid gap-4 md:grid-cols-2">
-                    {recommendationsResult.recommendations.slice(0, AGENTIC_RECOMMENDATION_CARD_LIMIT).map((rec) => (
+                    {selectFeaturedRecommendations(recommendationsResult.recommendations, AGENTIC_RECOMMENDATION_CARD_LIMIT).map((rec) => (
                       <ShadowRecommendationCard
                         key={rec.recommendationEventId}
                         recommendation={{

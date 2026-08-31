@@ -124,7 +124,16 @@ export function parsePersistedRecommendationPayload(
   if (payload.suggestedTiming !== null && (typeof payload.suggestedTiming !== "string" || !TIMING_VALUES.has(payload.suggestedTiming))) {
     return { ok: false };
   }
-  if (payload.opportunityValue !== null && (typeof payload.opportunityValue !== "number" || !Number.isFinite(payload.opportunityValue))) {
+  // opportunityValue, whenever present, is always the estimate's own
+  // stored amount at write time (shadowRunner.ts:
+  // opportunityValue: lead.estimateAmount) — and eligibility.ts's
+  // no_estimate_value gate already guarantees that amount is > 0 for
+  // every estimate a recommendation could ever be generated for. A
+  // zero/negative value here cannot be a genuine recommendation; it can
+  // only be corrupted/hand-edited data, and must be excluded rather than
+  // summed into the displayed opportunity metric (Codex review finding
+  // on PR #20).
+  if (payload.opportunityValue !== null && (typeof payload.opportunityValue !== "number" || !Number.isFinite(payload.opportunityValue) || payload.opportunityValue <= 0)) {
     return { ok: false };
   }
   if (payload.agentRunId !== undefined && payload.agentRunId !== null && typeof payload.agentRunId !== "string") {
@@ -198,6 +207,35 @@ export async function listEstimateClosingRecommendations(
   }
 
   return { recommendations, skippedMalformed };
+}
+
+/**
+ * Ranks recommendations for a small, bounded card display (both
+ * /dashboard and /agentic use this): actionable recommendations
+ * (follow_up, owner_review) surface before "wait" ones, and within each
+ * group, higher opportunity value comes first (a recommendation with no
+ * value sorts last within its group), with recency as the final
+ * tiebreaker. Plain most-recent-first slicing could hide an older
+ * high-value follow_up behind several newer, lower-priority wait
+ * recommendations — which defeats the "highest-value/recent actionable
+ * recommendations" goal the P1 Sprint 2 directive states explicitly
+ * (Codex review finding on PR #20). Pure — takes the already-fetched view
+ * list, does not re-fetch or re-sort the caller's own array in place.
+ */
+export function selectFeaturedRecommendations(
+  recommendations: EstimateClosingRecommendationView[],
+  limit: number
+): EstimateClosingRecommendationView[] {
+  const actionabilityRank = (r: EstimateClosingRecommendationView) => (r.recommendation === "wait" ? 1 : 0);
+  return [...recommendations]
+    .sort((a, b) => {
+      const rankDiff = actionabilityRank(a) - actionabilityRank(b);
+      if (rankDiff !== 0) return rankDiff;
+      const valueDiff = (b.opportunityValue ?? -Infinity) - (a.opportunityValue ?? -Infinity);
+      if (valueDiff !== 0) return valueDiff;
+      return b.occurredAt.localeCompare(a.occurredAt);
+    })
+    .slice(0, limit);
 }
 
 export type EstimateClosingRecommendationSummary = {

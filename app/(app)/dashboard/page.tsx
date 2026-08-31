@@ -23,11 +23,7 @@ import { ActionCard, ActionCardTone } from "@/components/dashboard/ActionCard";
 import { ActivityItem } from "@/components/dashboard/ActivityItem";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { AIStatusBadge } from "@/components/ui/AIStatusBadge";
-
-/** Bounded — the P1 Sprint 2 directive requires "a small bounded number of
- * the highest-value/recent actionable recommendations," not the entire
- * (already-bounded-at-the-read-model-level) window. */
-const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
+import { Alert } from "@/components/ui/Alert";
 
 const ATTENTION_TONE: Record<AttentionItemKind, ActionCardTone> = {
   emergency_lead: "danger",
@@ -149,14 +145,24 @@ export default async function DashboardPage() {
               title="Registered, not running"
               description="Estimate Closing is configured but not running."
             />
-          ) : !data.estimateClosingShadowEnabled ? (
-            <EmptyState
-              icon={<Bot className="h-8 w-8" />}
-              title="Shadow disabled"
-              description="Shadow intelligence is not currently enabled."
-            />
           ) : (
             <>
+              {/* ESTIMATE_CLOSING_SHADOW_ENABLED is an execution kill switch
+                  for FUTURE scans only — it must never hide recommendations
+                  a prior, still-enabled scan already generated (Codex review
+                  finding on PR #20). The metrics/cards below always reflect
+                  real data whenever any exists; this note only ever
+                  supplements that, never replaces it. */}
+              {!data.estimateClosingShadowEnabled && (
+                <Alert
+                  tone="info"
+                  className="mb-4"
+                  title="Shadow intelligence is not currently enabled"
+                >
+                  New scans are paused. Showing past recommendations only.
+                </Alert>
+              )}
+
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <MetricCard label="Estimates analyzed by AI" value={data.estimateClosingSummary.estimatesAnalyzed} icon={<Bot className="h-4 w-4" />} />
                 <MetricCard
@@ -178,7 +184,7 @@ export default async function DashboardPage() {
                   />
                 ) : (
                   <div className="grid gap-4 md:grid-cols-2">
-                    {data.shadowRecommendations.slice(0, DASHBOARD_RECOMMENDATION_CARD_LIMIT).map((rec) => (
+                    {data.shadowRecommendations.map((rec) => (
                       <ShadowRecommendationCard
                         key={rec.eventId}
                         recommendation={rec.recommendation}

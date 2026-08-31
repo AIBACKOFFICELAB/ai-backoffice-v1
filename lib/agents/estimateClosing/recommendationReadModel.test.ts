@@ -3,6 +3,7 @@ import {
   listEstimateClosingRecommendations,
   parsePersistedRecommendationPayload,
   summarizeEstimateClosingRecommendations,
+  selectFeaturedRecommendations,
   EstimateClosingRecommendationView,
 } from "./recommendationReadModel";
 import { InMemoryBusinessEventStore } from "@/lib/events/store";
@@ -32,6 +33,27 @@ async function seedRecommendationEvent(
     payload: (overrides.payload ?? VALID_PAYLOAD) as Record<string, unknown>,
     occurredAt: overrides.occurredAt,
   });
+}
+
+/** Shared fixture builder — used by selectFeaturedRecommendations and
+ * summarizeEstimateClosingRecommendations tests below, both of which
+ * operate on already-fetched, already-validated view lists. */
+function rec(overrides: Partial<EstimateClosingRecommendationView>): EstimateClosingRecommendationView {
+  return {
+    recommendationEventId: "evt-1",
+    agentRunId: "run-1",
+    leadId: "lead-1",
+    sequenceId: "seq-1",
+    occurredAt: "2026-08-31T00:00:00.000Z",
+    recommendation: "follow_up",
+    confidence: 0.8,
+    reasonCodes: [],
+    suggestedChannel: "sms",
+    suggestedTiming: "within_24_hours",
+    opportunityValue: 1000,
+    mode: "shadow",
+    ...overrides,
+  };
 }
 
 describe("parsePersistedRecommendationPayload", () => {
@@ -68,6 +90,8 @@ describe("parsePersistedRecommendationPayload", () => {
     ["invalid suggestedChannel", { ...VALID_PAYLOAD, suggestedChannel: "carrier_pigeon" }],
     ["invalid suggestedTiming", { ...VALID_PAYLOAD, suggestedTiming: "eventually" }],
     ["opportunityValue not a number", { ...VALID_PAYLOAD, opportunityValue: "$4,200" }],
+    ["opportunityValue negative (corrupted/hand-edited data — eligibility.ts guarantees a real one is always > 0)", { ...VALID_PAYLOAD, opportunityValue: -500 }],
+    ["opportunityValue zero", { ...VALID_PAYLOAD, opportunityValue: 0 }],
     ["agentRunId not a string", { ...VALID_PAYLOAD, agentRunId: 12345 }],
   ])("rejects malformed payload: %s", (_label, payload) => {
     const result = parsePersistedRecommendationPayload(payload);
@@ -80,6 +104,14 @@ describe("parsePersistedRecommendationPayload", () => {
     if (result.ok) {
       // @ts-expect-error rationale does not exist on the parsed value's type
       expect(result.value.rationale).toBeUndefined();
+    }
+  });
+
+  it("still accepts a genuinely null opportunityValue — the positivity check only rejects a present-but-invalid number", () => {
+    const result = parsePersistedRecommendationPayload({ ...VALID_PAYLOAD, opportunityValue: null });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.opportunityValue).toBeNull();
     }
   });
 });
@@ -179,23 +211,73 @@ describe("listEstimateClosingRecommendations", () => {
   });
 });
 
-describe("summarizeEstimateClosingRecommendations", () => {
-  const rec = (overrides: Partial<EstimateClosingRecommendationView>): EstimateClosingRecommendationView => ({
-    recommendationEventId: "evt-1",
-    agentRunId: "run-1",
-    leadId: "lead-1",
-    sequenceId: "seq-1",
-    occurredAt: "2026-08-31T00:00:00.000Z",
-    recommendation: "follow_up",
-    confidence: 0.8,
-    reasonCodes: [],
-    suggestedChannel: "sms",
-    suggestedTiming: "within_24_hours",
-    opportunityValue: 1000,
-    mode: "shadow",
-    ...overrides,
+/**
+ * P1 Sprint 2 — Codex review finding on PR #20: a plain most-recent-first
+ * slice could hide an older high-value actionable recommendation behind
+ * several newer, lower-priority "wait" ones. These tests prove the fix
+ * directly: actionable recommendations rank ahead of "wait" regardless of
+ * recency, and higher opportunity value wins within each group.
+ */
+describe("selectFeaturedRecommendations", () => {
+  it("ranks actionable recommendations (follow_up/owner_review) ahead of 'wait', even when 'wait' is more recent", () => {
+    const olderHighValueFollowUp = rec({
+      recommendationEventId: "high-value-old",
+      recommendation: "follow_up",
+      opportunityValue: 9000,
+      occurredAt: "2026-08-01T00:00:00.000Z",
+    });
+    const newerLowPriorityWaits = [1, 2, 3, 4].map((i) =>
+      rec({ recommendationEventId: `wait-${i}`, recommendation: "wait", opportunityValue: 100, occurredAt: `2026-08-0${i + 2}T00:00:00.000Z` })
+    );
+
+    const featured = selectFeaturedRecommendations([...newerLowPriorityWaits, olderHighValueFollowUp], 2);
+
+    expect(featured.map((r) => r.recommendationEventId)).toContain("high-value-old");
+    expect(featured[0].recommendationEventId).toBe("high-value-old");
   });
 
+  it("within the actionable group, higher opportunity value sorts first", () => {
+    const low = rec({ recommendationEventId: "low", recommendation: "follow_up", opportunityValue: 500 });
+    const high = rec({ recommendationEventId: "high", recommendation: "owner_review", opportunityValue: 8000 });
+    const mid = rec({ recommendationEventId: "mid", recommendation: "follow_up", opportunityValue: 2000 });
+
+    const featured = selectFeaturedRecommendations([low, high, mid], 3);
+    expect(featured.map((r) => r.recommendationEventId)).toEqual(["high", "mid", "low"]);
+  });
+
+  it("a null opportunityValue sorts after every valued recommendation within its group, never crashing or sorting first", () => {
+    const valued = rec({ recommendationEventId: "valued", recommendation: "follow_up", opportunityValue: 100 });
+    const unvalued = rec({ recommendationEventId: "unvalued", recommendation: "follow_up", opportunityValue: null });
+
+    const featured = selectFeaturedRecommendations([unvalued, valued], 2);
+    expect(featured.map((r) => r.recommendationEventId)).toEqual(["valued", "unvalued"]);
+  });
+
+  it("fills remaining slots with 'wait' recommendations when fewer actionable ones exist than the limit", () => {
+    const oneActionable = rec({ recommendationEventId: "actionable", recommendation: "follow_up", opportunityValue: 500 });
+    const wait1 = rec({ recommendationEventId: "wait-1", recommendation: "wait", occurredAt: "2026-08-05T00:00:00.000Z" });
+    const wait2 = rec({ recommendationEventId: "wait-2", recommendation: "wait", occurredAt: "2026-08-06T00:00:00.000Z" });
+
+    const featured = selectFeaturedRecommendations([wait1, oneActionable, wait2], 2);
+    expect(featured).toHaveLength(2);
+    expect(featured[0].recommendationEventId).toBe("actionable");
+    // Among the wait group, the more recent one fills the remaining slot.
+    expect(featured[1].recommendationEventId).toBe("wait-2");
+  });
+
+  it("does not mutate the input array", () => {
+    const input = [rec({ recommendationEventId: "a", occurredAt: "2026-08-01T00:00:00.000Z" }), rec({ recommendationEventId: "b", occurredAt: "2026-08-02T00:00:00.000Z" })];
+    const inputCopy = [...input];
+    selectFeaturedRecommendations(input, 1);
+    expect(input).toEqual(inputCopy);
+  });
+
+  it("returns an empty array for an empty input, never throwing", () => {
+    expect(selectFeaturedRecommendations([], 4)).toEqual([]);
+  });
+});
+
+describe("summarizeEstimateClosingRecommendations", () => {
   it("returns all-zero, non-null-crashing values for an empty list", () => {
     const summary = summarizeEstimateClosingRecommendations([]);
     expect(summary).toEqual({

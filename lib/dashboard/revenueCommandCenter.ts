@@ -13,6 +13,7 @@ import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/fea
 import {
   listEstimateClosingRecommendations,
   summarizeEstimateClosingRecommendations,
+  selectFeaturedRecommendations,
   EstimateClosingRecommendationSummary,
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
@@ -33,6 +34,15 @@ import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@
 
 const RECENT_ACTIVITY_LIMIT = 12;
 const RECENT_RUNS_LIMIT = 10;
+/** Bounded — the P1 Sprint 2 directive requires "a small bounded number of
+ * the highest-value/recent actionable recommendations," not the entire
+ * (already-bounded-at-the-read-model-level) window. Ranking (actionable
+ * before "wait", higher opportunity value first) happens via
+ * selectFeaturedRecommendations BEFORE this limit is applied — a plain
+ * recency slice could otherwise hide an older high-value recommendation
+ * behind several newer, lower-priority ones (Codex review finding on
+ * PR #20). */
+const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
 // Note: "Direct Revenue Recovered by AI" deliberately does NOT use a
 // bounded limit like the constants above — it is computed via
 // OutcomeStore.sumDirectAttributionValue(), a real database SUM()
@@ -228,7 +238,12 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
 
   attentionItems.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
 
-  const shadowRecommendations: ShadowRecommendationView[] = recommendationsResult.recommendations.map((rec) => {
+  // Rank BEFORE bounding — the dashboard card grid must never lose an
+  // older high-value follow_up/owner_review behind newer, lower-priority
+  // "wait" recommendations (Codex review finding on PR #20).
+  const featuredRecommendations = selectFeaturedRecommendations(recommendationsResult.recommendations, DASHBOARD_RECOMMENDATION_CARD_LIMIT);
+
+  const shadowRecommendations: ShadowRecommendationView[] = featuredRecommendations.map((rec) => {
     const lead = rec.leadId ? leadsById.get(rec.leadId) : undefined;
     return {
       eventId: rec.recommendationEventId,
