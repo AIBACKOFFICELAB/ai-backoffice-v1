@@ -9,6 +9,14 @@ import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
 import { SupabaseBusinessEventStore } from "@/lib/events/store";
 import { EstimateClosingRecommendation } from "@/lib/agents/estimateClosing/types";
 import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosing/mode";
+import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
+import {
+  listEstimateClosingRecommendations,
+  summarizeEstimateClosingRecommendations,
+  selectFeaturedRecommendations,
+  EstimateClosingRecommendationSummary,
+} from "@/lib/agents/estimateClosing/recommendationReadModel";
+import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -26,6 +34,15 @@ import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosin
 
 const RECENT_ACTIVITY_LIMIT = 12;
 const RECENT_RUNS_LIMIT = 10;
+/** Bounded — the P1 Sprint 2 directive requires "a small bounded number of
+ * the highest-value/recent actionable recommendations," not the entire
+ * (already-bounded-at-the-read-model-level) window. Ranking (actionable
+ * before "wait", higher opportunity value first) happens via
+ * selectFeaturedRecommendations BEFORE this limit is applied — a plain
+ * recency slice could otherwise hide an older high-value recommendation
+ * behind several newer, lower-priority ones (Codex review finding on
+ * PR #20). */
+const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
 // Note: "Direct Revenue Recovered by AI" deliberately does NOT use a
 // bounded limit like the constants above — it is computed via
 // OutcomeStore.sumDirectAttributionValue(), a real database SUM()
@@ -79,7 +96,21 @@ export type RevenueCommandCenterData = {
   attentionItems: AttentionItem[];
   shadowRecommendations: ShadowRecommendationView[];
   recentActivity: AgentActivityItem[];
+  /** @deprecated use estimateClosingAgentStatus === "active" — kept only
+   * because it is a strict narrowing of the same underlying fact; prefer
+   * the tri-state field for anything UI-facing so "never registered" and
+   * "registered but off" don't collapse into the same falsy value. */
   estimateClosingAgentActive: boolean;
+  estimateClosingAgentStatus: EstimateClosingAgentStatus;
+  /** The production kill switch (featureFlag.ts) — independent of the
+   * agent row's own status. Both must be true for Shadow Mode to actually
+   * run; the UI shows each truthfully rather than collapsing them. */
+  estimateClosingShadowEnabled: boolean;
+  /** Aggregate observation/recommendation metrics — see
+   * recommendationReadModel.ts's doc comment for why these reflect a
+   * bounded recent window, not a lifetime total, and why they must never
+   * be presented as recovered/won revenue. */
+  estimateClosingSummary: EstimateClosingRecommendationSummary;
 };
 
 /** Exported for unit testing (dashboard/attention.test.ts) — the same
@@ -112,7 +143,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     pendingApprovals,
     directRevenueRecoveredUsd,
     stalledEvents,
-    recommendationEvents,
+    recommendationsResult,
   ] = await Promise.all([
     getLeads(tenantId),
     getMissedCallAnalytics(tenantId),
@@ -122,13 +153,20 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     approvalStore.listByTenant(tenantId, { status: "pending" }),
     outcomeStore.sumDirectAttributionValue(tenantId),
     eventStore.listByTenant(tenantId, { eventType: "estimate.stalled", limit: RECENT_ACTIVITY_LIMIT }),
-    eventStore.listByTenant(tenantId, { eventType: "estimate.closing_recommendation_generated", limit: RECENT_ACTIVITY_LIMIT }),
+    // Dedicated, validated read model (P1 Sprint 2) — never parses a raw
+    // business_event payload here directly; a malformed historical payload
+    // is safely excluded rather than trusted or crashing the page. See
+    // recommendationReadModel.ts.
+    listEstimateClosingRecommendations(tenantId),
   ]);
 
   const metrics = buildLeadMetrics(leads);
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
   const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
-  const estimateClosingAgentActive = agents.some((a) => a.agentType === "estimate_closing" && a.status === "active");
+  const estimateClosingAgentStatus = resolveEstimateClosingAgentStatus(agents);
+  const estimateClosingAgentActive = estimateClosingAgentStatus === "active";
+  const estimateClosingShadowEnabled = isEstimateClosingShadowEnabled();
+  const estimateClosingSummary = summarizeEstimateClosingRecommendations(recommendationsResult.recommendations);
 
   const today = new Date().toISOString().slice(0, 10);
 
@@ -200,24 +238,32 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
 
   attentionItems.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
 
-  const shadowRecommendations: ShadowRecommendationView[] = recommendationEvents.map((event) => {
-    const lead = event.entityId ? leadsById.get(event.entityId) : undefined;
-    const payload = event.payload as unknown as EstimateClosingRecommendation & { sequenceId?: string; agentRunId?: string };
+  // Rank BEFORE bounding — the dashboard card grid must never lose an
+  // older high-value follow_up/owner_review behind newer, lower-priority
+  // "wait" recommendations (Codex review finding on PR #20).
+  const featuredRecommendations = selectFeaturedRecommendations(recommendationsResult.recommendations, DASHBOARD_RECOMMENDATION_CARD_LIMIT);
+
+  const shadowRecommendations: ShadowRecommendationView[] = featuredRecommendations.map((rec) => {
+    const lead = rec.leadId ? leadsById.get(rec.leadId) : undefined;
     return {
-      eventId: event.id,
-      occurredAt: event.occurredAt,
+      eventId: rec.recommendationEventId,
+      occurredAt: rec.occurredAt,
       serviceType: lead?.serviceType ?? "Estimate",
       customerName: lead?.customerName ?? null,
-      leadId: event.entityId ?? "",
+      leadId: rec.leadId ?? "",
       recommendation: {
-        recommendation: payload.recommendation,
-        confidence: payload.confidence,
-        reasonCodes: payload.reasonCodes ?? [],
-        suggestedChannel: payload.suggestedChannel,
-        suggestedTiming: payload.suggestedTiming,
-        opportunityValue: payload.opportunityValue ?? null,
-        rationaleLength: payload.rationaleLength ?? 0,
-      },
+        recommendation: rec.recommendation,
+        confidence: rec.confidence,
+        reasonCodes: rec.reasonCodes,
+        suggestedChannel: rec.suggestedChannel,
+        suggestedTiming: rec.suggestedTiming,
+        opportunityValue: rec.opportunityValue,
+        // rationaleLength is not part of the read model's view (the raw
+        // model rationale never crosses this layer at all — see
+        // recommendationReadModel.ts) — 0 here is not "empty rationale",
+        // it is "this field is intentionally not carried this far."
+        rationaleLength: 0,
+      } satisfies EstimateClosingRecommendation,
     };
   });
 
@@ -247,5 +293,8 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     shadowRecommendations,
     recentActivity,
     estimateClosingAgentActive,
+    estimateClosingAgentStatus,
+    estimateClosingShadowEnabled,
+    estimateClosingSummary,
   };
 }

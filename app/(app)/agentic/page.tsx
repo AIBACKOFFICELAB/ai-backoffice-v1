@@ -1,7 +1,7 @@
 export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
-import { Bot, CircleCheck } from "lucide-react";
+import { Bot, CircleCheck, Target, Sparkles, ShieldAlert } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardBody, CardHeader } from "@/components/ui/Card";
@@ -14,7 +14,21 @@ import { SupabaseAgentRunStore } from "@/lib/agents/runStore";
 import { SupabaseToolCallStore } from "@/lib/agents/toolCallStore";
 import { SupabaseApprovalStore } from "@/lib/approvals/store";
 import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
-import { modeForRunWorkflow } from "@/lib/agents/estimateClosing/mode";
+import { modeForRunWorkflow, ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosing/mode";
+import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
+import {
+  listEstimateClosingRecommendations,
+  summarizeEstimateClosingRecommendations,
+  selectFeaturedRecommendations,
+} from "@/lib/agents/estimateClosing/recommendationReadModel";
+import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
+import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
+import { MetricCard } from "@/components/dashboard/MetricCard";
+
+/** Bounded — a small, scannable set of recent recommendation cards, not the
+ * full read-model window. Matches the same discipline the dashboard's own
+ * DASHBOARD_RECOMMENDATION_CARD_LIMIT applies. */
+const AGENTIC_RECOMMENDATION_CARD_LIMIT = 6;
 
 const RUN_STATUS_TONE: Record<string, string> = {
   succeeded: "bg-success-50 text-success-700",
@@ -41,12 +55,15 @@ export default async function AgenticActivityPage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [events, agents, agentRuns, approvals, outcomes] = await Promise.all([
+  const [events, agents, agentRuns, approvals, outcomes, recommendationsResult] = await Promise.all([
     new SupabaseBusinessEventStore().listByTenant(tenant.tenantId, { limit: 15 }),
     new SupabaseAgentStore().listByTenant(tenant.tenantId),
     new SupabaseAgentRunStore().listByTenant(tenant.tenantId, { limit: 10 }),
     new SupabaseApprovalStore().listByTenant(tenant.tenantId),
     new SupabaseOutcomeStore().listByTenant(tenant.tenantId, { limit: 10 }),
+    // Dedicated, validated read model (P1 Sprint 2) — see
+    // lib/agents/estimateClosing/recommendationReadModel.ts.
+    listEstimateClosingRecommendations(tenant.tenantId),
   ]);
 
   const toolCallStore = new SupabaseToolCallStore();
@@ -56,6 +73,13 @@ export default async function AgenticActivityPage() {
 
   const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
   const pendingApprovals = approvals.filter((a) => a.status === "pending");
+
+  // Estimate Closing — Shadow Mode: dedicated status + metrics for the
+  // section below, built the same honest way revenueCommandCenter.ts does.
+  const estimateClosingAgentStatus = resolveEstimateClosingAgentStatus(agents);
+  const estimateClosingShadowEnabled = isEstimateClosingShadowEnabled();
+  const estimateClosingSummary = summarizeEstimateClosingRecommendations(recommendationsResult.recommendations);
+  const estimateClosingFailures = agentRuns.filter((run) => run.workflowId === ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID && run.status === "failed");
 
   return (
     <div className="space-y-6">
@@ -69,6 +93,106 @@ export default async function AgenticActivityPage() {
           An agent has drafted an action that requires your sign-off before it can happen — see Approvals below.
         </Alert>
       )}
+
+      {/* Estimate Closing — Shadow Mode */}
+      <Card>
+        <CardHeader>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="font-semibold text-ink-900">Estimate Closing — Shadow Mode</h2>
+              <p className="mt-0.5 text-sm text-ink-500">
+                {estimateClosingAgentStatus === "not_registered"
+                  ? "Not yet configured for this account."
+                  : "Nothing is sent to customers. Every recommendation below is observation only."}
+              </p>
+            </div>
+            {estimateClosingAgentStatus === "active" && estimateClosingShadowEnabled && <AIStatusBadge mode="shadow" />}
+          </div>
+        </CardHeader>
+        <CardBody>
+          {estimateClosingAgentStatus === "not_registered" ? (
+            <EmptyState
+              icon={<Bot className="h-8 w-8" />}
+              title="No agent registered"
+              description="Estimate Closing is available but has not been configured for this account."
+            />
+          ) : estimateClosingAgentStatus === "inactive" ? (
+            <EmptyState
+              icon={<Bot className="h-8 w-8" />}
+              title="Registered, not running"
+              description="Estimate Closing is configured but not running."
+            />
+          ) : (
+            <>
+              {/* ESTIMATE_CLOSING_SHADOW_ENABLED is an execution kill switch
+                  for FUTURE scans only — it must never hide recommendations
+                  a prior, still-enabled scan already generated (Codex
+                  review finding on PR #20). */}
+              {!estimateClosingShadowEnabled && (
+                <Alert tone="info" className="mb-4" title="Shadow intelligence is not currently enabled">
+                  New scans are paused. Showing past recommendations only.
+                </Alert>
+              )}
+
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <MetricCard label="Recommendations generated" value={estimateClosingSummary.estimatesAnalyzed} icon={<Bot className="h-4 w-4" />} />
+                <MetricCard
+                  label="Opportunity value analyzed"
+                  value={`$${estimateClosingSummary.opportunityValueAnalyzed.toLocaleString()}`}
+                  helpText="What AI noticed — not revenue recovered"
+                  icon={<Target className="h-4 w-4" />}
+                />
+                <MetricCard
+                  label="Recommendation breakdown"
+                  value={`${estimateClosingSummary.followUpCount} / ${estimateClosingSummary.waitCount} / ${estimateClosingSummary.ownerReviewCount}`}
+                  helpText="Follow up / Wait / Owner review"
+                  icon={<Sparkles className="h-4 w-4" />}
+                />
+                <MetricCard
+                  label="Latest recommendation"
+                  value={estimateClosingSummary.latestRecommendationAt ?? "—"}
+                  icon={<Bot className="h-4 w-4" />}
+                />
+              </div>
+
+              {estimateClosingFailures.length > 0 && (
+                <Alert tone="warning" className="mt-4" title={`${estimateClosingFailures.length} recent shadow run${estimateClosingFailures.length === 1 ? "" : "s"} failed`}>
+                  {estimateClosingFailures[0].failureReason ?? "A shadow reasoning run did not complete."} No customer action was attempted or affected.
+                </Alert>
+              )}
+
+              <div className="mt-4">
+                {recommendationsResult.recommendations.length === 0 ? (
+                  <EmptyState
+                    icon={<Bot className="h-8 w-8" />}
+                    title="No recommendations yet"
+                    description="No stalled estimates have produced a recommendation yet."
+                  />
+                ) : (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    {selectFeaturedRecommendations(recommendationsResult.recommendations, AGENTIC_RECOMMENDATION_CARD_LIMIT).map((rec) => (
+                      <ShadowRecommendationCard
+                        key={rec.recommendationEventId}
+                        recommendation={{
+                          recommendation: rec.recommendation,
+                          confidence: rec.confidence,
+                          reasonCodes: rec.reasonCodes,
+                          suggestedChannel: rec.suggestedChannel,
+                          suggestedTiming: rec.suggestedTiming,
+                          opportunityValue: rec.opportunityValue,
+                          rationaleLength: 0,
+                        }}
+                        serviceType="Estimate"
+                        occurredAt={rec.occurredAt}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader>
