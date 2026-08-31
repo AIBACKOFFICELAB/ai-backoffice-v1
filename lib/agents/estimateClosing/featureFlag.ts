@@ -12,21 +12,32 @@
  * instead of it (see shadowRunner.ts::triggerEstimateClosingShadow).
  *
  * ACTIVATION PROCEDURE (do not perform without founder approval — see the
- * P1 Sprint 1 directive's "Production Rule" and "Feature Enablement"
+ * P1 Sprint 1/2 directives' "Production Rule" and "Feature Enablement"
  * sections):
- *   1. Seed the tenant's estimate_closing agent row (status: 'inactive'
- *      initially — see lib/agents/seed.ts for the createIfAbsent pattern
- *      this would extend; NOT done in this sprint):
- *        agentStore.createIfAbsent({ tenantId, agentType: "estimate_closing", status: "inactive", ... })
+ *   1. Register the tenant's estimate_closing agent row (status:
+ *      'inactive' initially) — use
+ *      lib/agents/estimateClosing/registration.ts::ensureEstimateClosingAgent(tenantId),
+ *      NOT lib/agents/seed.ts::seedAgents (that function also creates an
+ *      unrelated dev_test agent as a side effect — see registration.ts's
+ *      own doc comment for why a dedicated primitive exists). The operator
+ *      script at scripts/register-estimate-closing-agent.mjs performs
+ *      exactly this step for one explicit tenant id; NOT run against
+ *      production as part of any sprint so far.
  *   2. Explicitly set the row's status to 'active' for that tenant only
- *      (owner-authorized action, not part of seeding).
+ *      (owner-authorized action, not part of registration).
  *   3. Set ESTIMATE_CLOSING_SHADOW_ENABLED=true in the Vercel production
  *      environment (a deploy-time config change, not a runtime toggle).
- *   4. Wire app/api/agents/estimate-closing/scan/route.ts into
- *      vercel.json's `crons` array (it exists and is CRON_SECRET-gated,
- *      but is deliberately NOT yet listed there — see that file).
- * All four steps are required; any one left undone keeps production
+ * All three steps are required; any one left undone keeps production
  * disabled.
+ *
+ * P1 Sprint 2 note: app/api/agents/estimate-closing/scan/route.ts is now
+ * WIRED into vercel.json's `crons` array (a conservative daily schedule,
+ * scheduled after the Estimate Follow-up cron) — cron wiring is no longer
+ * one of the required activation steps above. Being scheduled does not
+ * activate anything: the route itself checks this exact flag first and
+ * returns before any database read, model call, or event write whenever
+ * it isn't exactly "true" (see the route's own doc comment). A disabled
+ * route firing on schedule is a safe, cheap no-op, by design.
  */
 export function isEstimateClosingShadowEnabled(): boolean {
   return process.env.ESTIMATE_CLOSING_SHADOW_ENABLED === "true";
