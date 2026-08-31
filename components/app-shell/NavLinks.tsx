@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { NavGroup, isNavItemActive } from "./navConfig";
+import { LayoutDashboard, Inbox, Clock, Bot, Target, Star, Settings, type LucideIcon } from "lucide-react";
+import { NavGroup, NavIconKey, isNavItemActive } from "./navConfig";
 
 /**
  * The nav item list itself — shared, unstyled-at-the-container-level
@@ -10,7 +11,25 @@ import { NavGroup, isNavItemActive } from "./navConfig";
  * MobileNav.tsx (drawer). Active-route highlighting needs usePathname, so
  * this is a client component; the surrounding shell (AppShell.tsx) stays a
  * server component.
+ *
+ * The actual Lucide icon component references live ONLY here, inside the
+ * client boundary — navConfig.ts (imported by the Server Component
+ * AppShell.tsx) only ever holds a plain NavIconKey string. Icon components
+ * are functions; a function value cannot be serialized across a Server ->
+ * Client props boundary, which is exactly what produced production digest
+ * 1267400528. Do not move this ICONS map (or any Lucide component
+ * reference) back into navConfig.ts.
  */
+const ICONS: Record<NavIconKey, LucideIcon> = {
+  dashboard: LayoutDashboard,
+  inbox: Inbox,
+  clock: Clock,
+  bot: Bot,
+  target: Target,
+  star: Star,
+  settings: Settings,
+};
+
 export function NavLinks({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: () => void }) {
   const pathname = usePathname();
 
@@ -22,7 +41,7 @@ export function NavLinks({ groups, onNavigate }: { groups: NavGroup[]; onNavigat
           <div className="mt-1.5 flex flex-col gap-0.5">
             {group.items.map((item) => {
               const active = isNavItemActive(pathname, item.href);
-              const Icon = item.icon;
+              const Icon = ICONS[item.icon];
               return (
                 <Link
                   key={item.href}
