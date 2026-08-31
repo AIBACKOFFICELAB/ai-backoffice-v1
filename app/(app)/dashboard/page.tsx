@@ -12,6 +12,7 @@ import {
   PhoneMissed,
   CircleCheck,
   ShieldAlert,
+  Target,
 } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
 import { buildRevenueCommandCenterData, AttentionItemKind } from "@/lib/dashboard/revenueCommandCenter";
@@ -21,6 +22,12 @@ import { MetricCard } from "@/components/dashboard/MetricCard";
 import { ActionCard, ActionCardTone } from "@/components/dashboard/ActionCard";
 import { ActivityItem } from "@/components/dashboard/ActivityItem";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
+import { AIStatusBadge } from "@/components/ui/AIStatusBadge";
+
+/** Bounded — the P1 Sprint 2 directive requires "a small bounded number of
+ * the highest-value/recent actionable recommendations," not the entire
+ * (already-bounded-at-the-read-model-level) window. */
+const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
 
 const ATTENTION_TONE: Record<AttentionItemKind, ActionCardTone> = {
   emergency_lead: "danger",
@@ -115,31 +122,76 @@ export default async function DashboardPage() {
         </div>
       </section>
 
-      {/* D. AI Workforce / Activity */}
+      {/* D. Estimate Closing — Shadow Insights */}
       <section>
-        <div className="flex items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-xl font-bold text-ink-900">AI workforce</h2>
+            <h2 className="text-xl font-bold text-ink-900">Estimate Closing — Shadow Insights</h2>
             <p className="text-sm text-ink-500">
-              {data.estimateClosingAgentActive
-                ? "The Estimate Closing Agent is analyzing stalled estimates in Shadow Mode — nothing is sent to customers."
-                : "The Estimate Closing Agent is not yet active for this account."}
+              {data.estimateClosingAgentStatus === "active" && data.estimateClosingShadowEnabled
+                ? "The Estimate Closing Agent is analyzing stalled estimates in Shadow Mode. Nothing is sent to customers."
+                : "AI observation only — no customer action is ever taken by this agent, active or not."}
             </p>
           </div>
+          {data.estimateClosingAgentStatus === "active" && data.estimateClosingShadowEnabled && <AIStatusBadge mode="shadow" />}
         </div>
 
-        {data.shadowRecommendations.length > 0 && (
-          <div className="mt-4 grid gap-4 md:grid-cols-2">
-            {data.shadowRecommendations.map((rec) => (
-              <ShadowRecommendationCard
-                key={rec.eventId}
-                recommendation={rec.recommendation}
-                serviceType={rec.customerName ? `${rec.customerName} — ${rec.serviceType}` : rec.serviceType}
-                occurredAt={rec.occurredAt}
-              />
-            ))}
-          </div>
-        )}
+        <div className="mt-4">
+          {data.estimateClosingAgentStatus === "not_registered" ? (
+            <EmptyState
+              icon={<Bot className="h-8 w-8" />}
+              title="No agent registered"
+              description="Estimate Closing is available but has not been configured for this account."
+            />
+          ) : data.estimateClosingAgentStatus === "inactive" ? (
+            <EmptyState
+              icon={<Bot className="h-8 w-8" />}
+              title="Registered, not running"
+              description="Estimate Closing is configured but not running."
+            />
+          ) : !data.estimateClosingShadowEnabled ? (
+            <EmptyState
+              icon={<Bot className="h-8 w-8" />}
+              title="Shadow disabled"
+              description="Shadow intelligence is not currently enabled."
+            />
+          ) : (
+            <>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <MetricCard label="Estimates analyzed by AI" value={data.estimateClosingSummary.estimatesAnalyzed} icon={<Bot className="h-4 w-4" />} />
+                <MetricCard
+                  label="AI opportunity value analyzed"
+                  value={`$${data.estimateClosingSummary.opportunityValueAnalyzed.toLocaleString()}`}
+                  helpText="What AI noticed is at stake — not revenue recovered"
+                  icon={<Target className="h-4 w-4" />}
+                />
+                <MetricCard label="Follow-up recommendations" value={data.estimateClosingSummary.followUpCount} icon={<Sparkles className="h-4 w-4" />} />
+                <MetricCard label="Owner-review recommendations" value={data.estimateClosingSummary.ownerReviewCount} icon={<ShieldAlert className="h-4 w-4" />} />
+              </div>
+
+              <div className="mt-4">
+                {data.shadowRecommendations.length === 0 ? (
+                  <EmptyState
+                    icon={<Bot className="h-8 w-8" />}
+                    title="No recommendations yet"
+                    description="No stalled estimates have produced a recommendation yet."
+                  />
+                ) : (
+                  <div className="grid gap-4 md:grid-cols-2">
+                    {data.shadowRecommendations.slice(0, DASHBOARD_RECOMMENDATION_CARD_LIMIT).map((rec) => (
+                      <ShadowRecommendationCard
+                        key={rec.eventId}
+                        recommendation={rec.recommendation}
+                        serviceType={rec.customerName ? `${rec.customerName} — ${rec.serviceType}` : rec.serviceType}
+                        occurredAt={rec.occurredAt}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
 
         <Card className="mt-4">
           <CardHeader>
