@@ -111,6 +111,12 @@ function validateReviewPayloadShape(payload: unknown): EventPayloadValidation {
   return { ok: true };
 }
 
+/**
+ * P1 Sprint 4: the canonical "an estimate was sent" lifecycle event — see
+ * lib/leads/estimateLifecycle.ts, the only writer. `estimate.sent` was
+ * already reserved in lib/events/types.ts's KNOWN_EVENT_TYPES since P0 but
+ * never actually emitted until this sprint.
+ */
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "call.missed": {
     eventType: "call.missed",
@@ -162,6 +168,16 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
     // shadow reasoning call, not a redeliverable external signal — nothing
     // "retries" producing it the way a webhook or cron scan could.
     idempotency: "not_applicable",
+    validatePayload: forbidRawEstimatePii,
+  },
+  "estimate.sent": {
+    eventType: "estimate.sent",
+    schemaVersion: 1,
+    // Required: keyed by the lead's own id (buildEstimateSentIdempotencyKey)
+    // — a lead can only have one canonical "the estimate was sent" moment
+    // in its lifecycle, so any retry/concurrent-request/reconciliation call
+    // must dedupe to the original event, never create a second one.
+    idempotency: "required",
     validatePayload: forbidRawEstimatePii,
   },
   "estimate.closing_recommendation_reviewed": {

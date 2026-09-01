@@ -35,6 +35,30 @@ export async function getEstimateFollowupSettings(tenantId: string): Promise<Est
   };
 }
 
+export type FollowupAutomationStatus = "enabled" | "disabled" | "unknown";
+
+/**
+ * P1 Sprint 4 — distinguishes "we genuinely know it's off" from "we don't
+ * know" (a real query/RLS error), unlike getEstimateFollowupSettings above,
+ * which deliberately collapses BOTH a query error and a missing settings
+ * row into the same `null` for its EXISTING callers (processSequence,
+ * recordReplyForPhone) — that collapse is the CORRECT fail-safe direction
+ * for a SENDING decision (never send when we can't confirm the setting).
+ * A UI claim about whether messages WILL be sent needs the opposite
+ * fail-safe direction: never confidently tell an owner "no automated
+ * messages will be sent" when the truth is merely unknown right now — a
+ * later cron run reads the real setting and may still send (Codex review
+ * finding on PR #23, P1). Used only by app/(app)/leads/[id]/page.tsx's
+ * display copy; every existing SENDING-decision call site is untouched.
+ */
+export async function getFollowupAutomationStatus(tenantId: string): Promise<FollowupAutomationStatus> {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase.from("estimate_followup_settings").select("enabled").eq("tenant_id", tenantId).maybeSingle();
+  if (error) return "unknown";
+  if (!data) return "disabled"; // no settings row for this tenant genuinely means the module has never been configured — the same fact processSequence's "module-disabled" skip reason reflects.
+  return data.enabled ? "enabled" : "disabled";
+}
+
 export async function updateEstimateFollowupSettings(tenantId: string, update: Partial<Omit<EstimateFollowupSettings, "tenantId">>) {
   const supabase = await createServerSupabaseClient();
   const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -62,7 +86,24 @@ export function computeFollowupDueDates(sentAt: Date): FollowupDueDates {
   };
 }
 
-/** Trigger layer: enroll a lead the moment its status becomes "Estimate Sent". */
+/** Postgres unique-violation error code — see
+ * lib/events/store.ts::SupabaseBusinessEventStore.insert for the same
+ * pattern already established in this codebase. */
+const UNIQUE_VIOLATION = "23505";
+
+/**
+ * Trigger layer: enroll a lead the moment its status becomes
+ * "Estimate Sent". Idempotent under real concurrency, not just the
+ * pre-check above: `estimate_followup_sequences` has a
+ * `UNIQUE (tenant_id, lead_id)` constraint (migration 005), so two
+ * concurrent calls that both pass the pre-check above (a genuine TOCTOU
+ * race) can still only ever result in ONE row — the loser's insert fails
+ * with a unique-violation, which is recognized here and reported as the
+ * same successful `already-enrolled` outcome as the pre-check case, never
+ * as a generic failure (P1 Sprint 4 directive Gate 5: "concurrent
+ * enrollment safe... never create duplicate sequences" — using the
+ * existing DB constraint, no migration needed).
+ */
 export async function enrollLeadInFollowup(tenantId: string, lead: PlumbingLead) {
   const supabase = await createServerSupabaseClient();
 
@@ -90,6 +131,9 @@ export async function enrollLeadInFollowup(tenantId: string, lead: PlumbingLead)
   });
 
   if (error) {
+    if (error.code === UNIQUE_VIOLATION) {
+      return { enrolled: false, reason: "already-enrolled" as const };
+    }
     return { enrolled: false, reason: "insert-failed" as const, error: error.message };
   }
   return { enrolled: true as const };
@@ -252,6 +296,52 @@ export async function getEstimateFollowupHistory(tenantId: string, limit = 50) {
     .limit(limit);
   if (error) throw new Error(error.message);
   return data ?? [];
+}
+
+export type FollowupSequenceRow = {
+  id: string;
+  leadId: string;
+  status: "active" | "replied" | "completed" | "stopped";
+  estimateSentAt: string;
+  day1DueAt: string;
+  day3DueAt: string;
+  day7DueAt: string;
+  day1SentAt: string | null;
+  day3SentAt: string | null;
+  day7SentAt: string | null;
+  lastReplyAt: string | null;
+  stoppedReason: string | null;
+};
+
+/**
+ * P1 Sprint 4 — full sequence rows for a tenant (not just the `status`
+ * column getEstimateFollowupAnalytics selects). Feeds
+ * lib/leads/estimateLifecycleReadModel.ts, the dedicated read model for the
+ * /estimates product surface — kept here, alongside the rest of this
+ * module's tenant-scoped Supabase reads, rather than duplicated.
+ */
+export async function getEstimateFollowupSequencesForTenant(tenantId: string): Promise<FollowupSequenceRow[]> {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("estimate_followup_sequences")
+    .select("id, lead_id, status, estimate_sent_at, day1_due_at, day3_due_at, day7_due_at, day1_sent_at, day3_sent_at, day7_sent_at, last_reply_at, stopped_reason")
+    .eq("tenant_id", tenantId);
+  if (error) throw new Error(error.message);
+
+  return (data ?? []).map((row) => ({
+    id: row.id,
+    leadId: row.lead_id,
+    status: row.status,
+    estimateSentAt: row.estimate_sent_at,
+    day1DueAt: row.day1_due_at,
+    day3DueAt: row.day3_due_at,
+    day7DueAt: row.day7_due_at,
+    day1SentAt: row.day1_sent_at,
+    day3SentAt: row.day3_sent_at,
+    day7SentAt: row.day7_sent_at,
+    lastReplyAt: row.last_reply_at,
+    stoppedReason: row.stopped_reason,
+  }));
 }
 
 export async function getEstimateFollowupAnalytics(tenantId: string) {

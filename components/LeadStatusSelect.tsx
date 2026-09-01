@@ -9,10 +9,12 @@ type Props = {
   initialStatus: string;
 };
 
+const DEFAULT_ERROR_MESSAGE = "Save failed — try again";
+
 export default function LeadStatusSelect({ leadId, initialStatus }: Props) {
   const [status, setStatus] = useState<LeadStatus>(normalizeStatus(initialStatus));
   const [saving, setSaving] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const errorId = useId();
 
   async function handleChange(e: React.ChangeEvent<HTMLSelectElement>) {
@@ -20,7 +22,7 @@ export default function LeadStatusSelect({ leadId, initialStatus }: Props) {
     const newStatus = e.target.value as LeadStatus;
     const prev = status;
     setStatus(newStatus);
-    setError(false);
+    setError(null);
     setSaving(true);
     try {
       const res = await fetch(`/api/leads/${leadId}`, {
@@ -30,11 +32,16 @@ export default function LeadStatusSelect({ leadId, initialStatus }: Props) {
       });
       if (!res.ok) {
         setStatus(prev);
-        setError(true);
+        // Surfaces the API's specific refusal reason when available (e.g.
+        // "Enter a valid estimate amount..." — see
+        // app/api/leads/[id]/route.ts's estimate-lifecycle validation) —
+        // never a raw/unexpected response shape, always a safe fallback.
+        const data = await res.json().catch(() => null);
+        setError(typeof data?.error === "string" && data.error.length > 0 ? data.error : DEFAULT_ERROR_MESSAGE);
       }
     } catch {
       setStatus(prev);
-      setError(true);
+      setError(DEFAULT_ERROR_MESSAGE);
     } finally {
       setSaving(false);
     }
@@ -58,8 +65,8 @@ export default function LeadStatusSelect({ leadId, initialStatus }: Props) {
           </option>
         ))}
       </select>
-      <span id={errorId} role="alert" className={`mt-1 text-[11px] font-medium text-red-600 ${error ? "" : "sr-only"}`}>
-        {error ? "Save failed — try again" : ""}
+      <span id={errorId} role="alert" className={`mt-1 max-w-[14rem] text-right text-[11px] font-medium text-red-600 ${error ? "" : "sr-only"}`}>
+        {error ?? ""}
       </span>
     </span>
   );

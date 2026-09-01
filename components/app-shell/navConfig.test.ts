@@ -12,6 +12,7 @@ describe("resolveNavGroups", () => {
     expect(hrefs).toContain("/settings");
     expect(hrefs).toContain("/dashboard");
     expect(hrefs).toContain("/lead-inbox");
+    expect(hrefs).toContain("/estimates");
     expect(hrefs).toContain("/follow-ups");
     expect(hrefs).toContain("/agentic");
     expect(hrefs).toContain("/approvals");
@@ -28,6 +29,7 @@ describe("resolveNavGroups", () => {
     const hrefs = flatten(resolveNavGroups("staff"));
     expect(hrefs).toContain("/dashboard");
     expect(hrefs).toContain("/lead-inbox");
+    expect(hrefs).toContain("/estimates");
     expect(hrefs).toContain("/follow-ups");
     expect(hrefs).toContain("/agentic");
     expect(hrefs).toContain("/approvals");
@@ -39,6 +41,7 @@ describe("resolveNavGroups", () => {
     const KNOWN_ROUTES = new Set([
       "/dashboard",
       "/lead-inbox",
+      "/estimates",
       "/follow-ups",
       "/agentic",
       "/approvals",
@@ -109,6 +112,7 @@ describe("Server -> Client boundary serializability (production hotfix, digest 1
     "star",
     "settings",
     "shield",
+    "wallet",
   ]);
 
   /**

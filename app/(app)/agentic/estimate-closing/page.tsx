@@ -17,6 +17,7 @@ import { ApprovalReadinessEvidence } from "@/components/ai/ApprovalReadinessEvid
 import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
 import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { getEstimateClosingEvaluation } from "@/lib/agents/estimateClosing/evaluationReadModel";
+import { getEstimateLifecycleReadModel, buildShadowReadinessLines } from "@/lib/leads/estimateLifecycleReadModel";
 
 /**
  * P1 Sprint 3 §9 — the dedicated Estimate Closing specialist workspace.
@@ -30,11 +31,13 @@ export default async function EstimateClosingWorkspacePage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [agents, evaluation, { leads }] = await Promise.all([
+  const [agents, evaluation, { leads }, lifecycle] = await Promise.all([
     new SupabaseAgentStore().listByTenant(tenant.tenantId),
     getEstimateClosingEvaluation(tenant.tenantId),
     getLeads(tenant.tenantId),
+    getEstimateLifecycleReadModel(tenant.tenantId),
   ]);
+  const readinessLines = buildShadowReadinessLines(lifecycle);
 
   const agentStatus = resolveEstimateClosingAgentStatus(agents);
   const shadowEnabled = isEstimateClosingShadowEnabled();
@@ -96,6 +99,22 @@ export default async function EstimateClosingWorkspacePage() {
               A model reasoning run did not complete. No customer action was attempted or affected.
             </Alert>
           )}
+        </CardBody>
+      </Card>
+
+      {/* Shadow data readiness (P1 Sprint 4 §12) — truthful, never accelerated */}
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold text-ink-900">Shadow data readiness</h2>
+          <p className="mt-1 text-sm text-ink-500">How many real estimates exist, and how close they are to Shadow eligibility. Nothing here is accelerated or forced.</p>
+        </CardHeader>
+        <CardBody className="space-y-1.5">
+          {readinessLines.map((line) => (
+            <p key={line} className="text-sm text-ink-700">{line}</p>
+          ))}
+          <Link href="/estimates" className="mt-2 inline-block text-sm font-semibold text-brand-700 hover:text-brand-800">
+            View Estimate Pipeline &rarr;
+          </Link>
         </CardBody>
       </Card>
 

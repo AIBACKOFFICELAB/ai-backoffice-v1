@@ -48,8 +48,8 @@ export async function createLead(lead: LeadInsert, tenantId: string) {
   return insertLeadToDb(lead, tenantId);
 }
 
-export async function updateLead(id: string, update: LeadUpdate, tenantId: string) {
-  return updateLeadInDb(id, update, tenantId);
+export async function updateLead(id: string, update: LeadUpdate, tenantId: string, options: { expectedCurrentStatus?: string } = {}) {
+  return updateLeadInDb(id, update, tenantId, options);
 }
 
 export async function deleteLead(id: string, tenantId: string) {

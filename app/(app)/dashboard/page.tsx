@@ -78,6 +78,14 @@ export default async function DashboardPage() {
             tone={metrics.atRiskEstimateValue > 0 ? "warning" : "default"}
           />
           <MetricCard label="Follow-Ups Due" value={metrics.followUpsDue} helpText="Leads needing a callback today" icon={<Clock className="h-4 w-4" />} href="/follow-ups" />
+          <MetricCard
+            label="Stalled Estimates"
+            value={data.stalledEstimatesCount}
+            helpText="Past Day 7, no reply — Shadow-eligible"
+            icon={<Sparkles className="h-4 w-4" />}
+            href="/estimates"
+            tone={data.stalledEstimatesCount > 0 ? "warning" : "default"}
+          />
           <MetricCard label="New Leads" value={metrics.newLeads} helpText="Not yet contacted" icon={<UserPlus className="h-4 w-4" />} href="/lead-inbox" />
           <MetricCard label="Jobs Won" value={metrics.jobsWon} helpText="Closed and won" icon={<Trophy className="h-4 w-4" />} />
           <MetricCard

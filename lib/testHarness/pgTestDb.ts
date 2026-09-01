@@ -211,6 +211,24 @@ export async function insertOutcome(client: PoolClient, tenantId: string, agentR
   return id;
 }
 
+/** Minimal-columns `leads` row — enough to satisfy every NOT NULL
+ * constraint (migration 001) plus the tenant_id column migration 002
+ * added. P1 Sprint 4's estimate-lifecycle DB-level tests are this
+ * function's first caller. */
+export async function insertLead(client: PoolClient, tenantId: string, overrides: { status?: string; estimateAmount?: number } = {}): Promise<string> {
+  const id = randomUUID();
+  await client.query(
+    `INSERT INTO public.leads (
+       id, tenant_id, date, customer_name, phone, service_address, property_type, service_type,
+       emergency, urgency, job_description, photos_uploaded, customer_role, lead_source,
+       status, estimate_amount, review_request_status
+     ) VALUES ($1, $2, now(), 'Test Customer', '555-0100', '1 Test St', 'Single Family Home', 'Other',
+       'No', 'Flexible', 'Test job', 'No', 'Owner', 'Other', $3, $4, 'Not Ready')`,
+    [id, tenantId, overrides.status ?? "New", overrides.estimateAmount ?? 500]
+  );
+  return id;
+}
+
 export async function insertDurableJob(client: PoolClient, tenantId: string, overrides: { jobType?: string; idempotencyKey?: string | null; status?: string } = {}): Promise<string> {
   const id = randomUUID();
   await client.query(

@@ -123,7 +123,20 @@ export async function insertLeadToDb(lead: LeadInsert, tenantId: string): Promis
   return mapRowToLead(data as LeadRow);
 }
 
-export async function updateLeadInDb(id: string, update: LeadUpdate, tenantId: string): Promise<PlumbingLead | null> {
+/**
+ * P1 Sprint 4 — `options.expectedCurrentStatus`, when given, adds
+ * `.eq("status", expectedCurrentStatus)` to the update's WHERE clause: a
+ * compare-and-swap that makes the write a no-op (zero rows affected, same
+ * as "not found") if the lead's status has changed since the caller last
+ * read it. Used by app/api/leads/[id]/route.ts's Estimate Sent transition
+ * specifically — without it, a concurrent request that closes the lead
+ * (Won/Lost/Completed) between this route's validation read and this write
+ * could be silently overwritten back to "Estimate Sent" and enrolled in
+ * follow-up (Codex review finding on PR #23). Every other existing caller
+ * omits the option and keeps today's unconstrained-by-status behavior
+ * exactly as before.
+ */
+export async function updateLeadInDb(id: string, update: LeadUpdate, tenantId: string, options: { expectedCurrentStatus?: string } = {}): Promise<PlumbingLead | null> {
   const supabase = await createServerSupabaseClient();
   const updateRow = {
     ...(update.date && { date: update.date }),
@@ -149,7 +162,11 @@ export async function updateLeadInDb(id: string, update: LeadUpdate, tenantId: s
     updated_at: new Date().toISOString(),
   };
 
-  const { data, error } = await supabase.from(tableName).update(updateRow).eq("id", id).eq("tenant_id", tenantId).select().single();
+  let query = supabase.from(tableName).update(updateRow).eq("id", id).eq("tenant_id", tenantId);
+  if (options.expectedCurrentStatus !== undefined) {
+    query = query.eq("status", options.expectedCurrentStatus);
+  }
+  const { data, error } = await query.select().single();
   if (error) {
     if (error.code === "PGRST116") {
       return null;

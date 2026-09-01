@@ -5,6 +5,7 @@ import Link from "next/link";
 import { getLeadById } from "@/lib/leads/repository";
 import { getTenantContext } from "@/lib/tenant";
 import { getMissedCallHistoryForLead } from "@/lib/modules/missedCallRecovery/service";
+import { getFollowupAutomationStatus } from "@/lib/modules/estimateFollowup/service";
 import LeadEditForm from "@/components/LeadEditForm";
 import { Card } from "@/components/ui/Card";
 
@@ -40,7 +41,10 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
   const { lead } = await getLeadById(id, tenant.tenantId);
   if (!lead) notFound();
 
-  const mcrHistory = await getMissedCallHistoryForLead(tenant.tenantId, id);
+  const [mcrHistory, followupStatus] = await Promise.all([
+    getMissedCallHistoryForLead(tenant.tenantId, id),
+    getFollowupAutomationStatus(tenant.tenantId),
+  ]);
 
   return (
     <div className="space-y-6">
@@ -58,7 +62,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
         </p>
       </div>
 
-      <LeadEditForm lead={lead} />
+      <LeadEditForm lead={lead} followupStatus={followupStatus} />
 
       {mcrHistory && (
         <Card className="p-5">

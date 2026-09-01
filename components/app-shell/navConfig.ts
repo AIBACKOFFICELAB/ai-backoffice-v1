@@ -21,7 +21,7 @@
  * which asserts recursively that NAV_GROUPS/resolveNavGroups() output
  * contains no function values.
  */
-export type NavIconKey = "dashboard" | "inbox" | "clock" | "bot" | "target" | "star" | "settings" | "shield";
+export type NavIconKey = "dashboard" | "inbox" | "clock" | "bot" | "target" | "star" | "settings" | "shield" | "wallet";
 
 export type NavItem = { href: string; label: string; icon: NavIconKey; ownerOnly?: boolean };
 export type NavGroup = { label: string; items: NavItem[] };
@@ -35,6 +35,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Revenue",
     items: [
       { href: "/lead-inbox", label: "Lead Inbox", icon: "inbox" },
+      { href: "/estimates", label: "Estimates", icon: "wallet" },
       { href: "/follow-ups", label: "Follow-Ups", icon: "clock" },
     ],
   },
