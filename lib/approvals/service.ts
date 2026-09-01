@@ -12,6 +12,40 @@ export async function requestApproval(input: RequestApprovalInput, store: Approv
 }
 
 /**
+ * Lazily transitions a still-'pending' approval to 'expired' if its
+ * deadline has passed, and reports what happened — shared by
+ * approveApproval and rejectApproval (Codex review finding on PR #21:
+ * only approveApproval applied this check, so a request past its deadline
+ * could still be REJECTED — landing on a misleading terminal status —
+ * instead of correctly expiring, and the /approvals page could keep
+ * showing decision buttons for a row that should already read "expired").
+ * Diagnostic read is not the decision: `store.decide()`'s own CAS is.
+ */
+async function expireIfPastDeadline(
+  tenantId: string,
+  approvalId: string,
+  store: ApprovalStore
+): Promise<"expired_now" | "not_applicable"> {
+  // Diagnostic-only: confirms the id exists and drives this check. A stale
+  // read here cannot cause an incorrect decision to go through — the CAS
+  // below (and the caller's own decide() afterward) re-checks
+  // status='pending' atomically.
+  const preRead = await store.getById(tenantId, approvalId);
+  if (!preRead || preRead.status !== "pending" || !preRead.expiresAt || new Date(preRead.expiresAt) >= new Date()) {
+    return "not_applicable";
+  }
+
+  const expired = await store.decide(tenantId, approvalId, { status: "expired" });
+  if (expired) return "expired_now";
+  // Lost the race to expire it — someone else decided it first (approved,
+  // rejected, or expired it themselves). Fall through: the caller's own
+  // decide() attempt will fail its own CAS and report whatever the
+  // approval's actual current state is, via the same diagnostic path
+  // every other CAS failure uses.
+  return "not_applicable";
+}
+
+/**
  * Approve — requires the acting user to hold the tenant's 'owner' role.
  * Callers (API routes) must resolve and pass the approver's tenant role;
  * this function refuses to guess it, matching how every other mutation in
@@ -36,21 +70,8 @@ export async function approveApproval(
     throw new Error("only a tenant owner may approve an agent action");
   }
 
-  // Diagnostic-only: confirms the id exists at all, and drives the expiry
-  // check below. A stale read here cannot cause an incorrect approve to
-  // go through — the CAS below re-checks status='pending' atomically.
-  const preRead = await store.getById(tenantId, approvalId);
-  if (!preRead) throw new Error(`approval ${approvalId} not found`);
-
-  if (preRead.status === "pending" && preRead.expiresAt && new Date(preRead.expiresAt) < new Date()) {
-    const expired = await store.decide(tenantId, approvalId, { status: "expired" });
-    if (expired) {
-      throw new Error(`approval ${approvalId} has expired`);
-    }
-    // Lost the race to expire it — someone else decided it first (approved
-    // or rejected). Fall through: the real approve attempt below will fail
-    // its own CAS and report whatever the approval's actual current state
-    // is, via the same diagnostic path every other CAS failure uses.
+  if ((await expireIfPastDeadline(tenantId, approvalId, store)) === "expired_now") {
+    throw new Error(`approval ${approvalId} has expired`);
   }
 
   const decided = await store.decide(tenantId, approvalId, { status: "approved", approverUserId });
@@ -60,6 +81,12 @@ export async function approveApproval(
   return decided;
 }
 
+/**
+ * Reject — same owner-only, CAS-authoritative contract as approveApproval,
+ * including the SAME deadline check (Codex review finding on PR #21):
+ * a request whose deadline has already passed can no longer be rejected
+ * either — it expires instead, exactly like the approve path.
+ */
 export async function rejectApproval(
   tenantId: string,
   approvalId: string,
@@ -70,6 +97,10 @@ export async function rejectApproval(
 ): Promise<Approval> {
   if (approverRole !== "owner") {
     throw new Error("only a tenant owner may reject an agent action");
+  }
+
+  if ((await expireIfPastDeadline(tenantId, approvalId, store)) === "expired_now") {
+    throw new Error(`approval ${approvalId} has expired`);
   }
 
   const decided = await store.decide(tenantId, approvalId, { status: "rejected", approverUserId, reason: reason ?? null });

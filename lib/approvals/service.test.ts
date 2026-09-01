@@ -58,6 +58,35 @@ describe("approval enforcement (P0.4)", () => {
     const after = await store.getById("t1", approval.id);
     expect(after?.status).toBe("expired");
   });
+
+  it("an expired approval cannot be rejected either — it transitions to 'expired', never 'rejected' (Codex review finding on PR #21)", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval(
+      { tenantId: "t1", requestedAction: "x", expiresAt: new Date(Date.now() - 1000).toISOString(), payloadDigest: "digest-1" },
+      store
+    );
+    await expect(rejectApproval("t1", approval.id, "owner-user", "owner", "too risky", store)).rejects.toThrow(/expired/);
+    const after = await store.getById("t1", approval.id);
+    expect(after?.status).toBe("expired");
+    expect(after?.reason).toBeNull(); // the reject's own reason was never applied
+  });
+
+  it("a not-yet-expired pending approval can still be rejected normally", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval(
+      { tenantId: "t1", requestedAction: "x", expiresAt: new Date(Date.now() + 60_000).toISOString(), payloadDigest: "digest-1" },
+      store
+    );
+    const decided = await rejectApproval("t1", approval.id, "owner-user", "owner", "not needed", store);
+    expect(decided.status).toBe("rejected");
+  });
+
+  it("an approval with no expiresAt is never treated as expired", async () => {
+    const store = new InMemoryApprovalStore();
+    const approval = await requestApproval({ tenantId: "t1", requestedAction: "x", payloadDigest: "digest-1" }, store);
+    const decided = await rejectApproval("t1", approval.id, "owner-user", "owner", undefined, store);
+    expect(decided.status).toBe("rejected");
+  });
 });
 
 /**

@@ -17,6 +17,7 @@ import {
   EstimateClosingRecommendationSummary,
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
+import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateClosing/evaluationReadModel";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -111,6 +112,11 @@ export type RevenueCommandCenterData = {
    * bounded recent window, not a lifetime total, and why they must never
    * be presented as recovered/won revenue. */
   estimateClosingSummary: EstimateClosingRecommendationSummary;
+  /** P1 Sprint 3 — how many of the (bounded) recent recommendations the
+   * owner has already reviewed. Powers the "Review Shadow intelligence"
+   * link into /agentic/estimate-closing; the dashboard itself stays a
+   * thin summary, not an evaluation console (P1 Sprint 3 directive §10). */
+  estimateClosingRecommendationsReviewed: number;
 };
 
 /** Exported for unit testing (dashboard/attention.test.ts) — the same
@@ -159,6 +165,19 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     // recommendationReadModel.ts.
     listEstimateClosingRecommendations(tenantId),
   ]);
+
+  // P1 Sprint 3 — bounded review-count only; the dashboard links to
+  // /agentic/estimate-closing for the full evaluation console rather than
+  // duplicating it here (directive §10: "Do not make Dashboard a giant
+  // evaluation console"). Scoped by THIS window's recommendation ids
+  // (never an independent recency limit — Codex review finding on PR #21:
+  // that can under/over-count "reviewed" against recommendations actually
+  // displayed), so it must run after recommendationsResult resolves.
+  const reviewsResult = await listEstimateClosingRecommendationReviews(
+    tenantId,
+    recommendationsResult.recommendations.map((r) => r.recommendationEventId),
+    { eventStore }
+  );
 
   const metrics = buildLeadMetrics(leads);
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
@@ -296,5 +315,6 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     estimateClosingAgentStatus,
     estimateClosingShadowEnabled,
     estimateClosingSummary,
+    estimateClosingRecommendationsReviewed: reviewsResult.reviews.length,
   };
 }

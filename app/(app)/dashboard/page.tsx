@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import {
   Wallet,
   AlertTriangle,
@@ -173,6 +174,16 @@ export default async function DashboardPage() {
                 />
                 <MetricCard label="Follow-up recommendations" value={data.estimateClosingSummary.followUpCount} icon={<Sparkles className="h-4 w-4" />} />
                 <MetricCard label="Owner-review recommendations" value={data.estimateClosingSummary.ownerReviewCount} icon={<ShieldAlert className="h-4 w-4" />} />
+              </div>
+
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-sm text-ink-500">
+                <p>
+                  {data.estimateClosingSummary.estimatesAnalyzed} Shadow recommendation{data.estimateClosingSummary.estimatesAnalyzed === 1 ? "" : "s"} &bull;{" "}
+                  {data.estimateClosingRecommendationsReviewed} reviewed
+                </p>
+                <Link href="/agentic/estimate-closing" className="font-semibold text-brand-700 hover:text-brand-800">
+                  Review Shadow intelligence &rarr;
+                </Link>
               </div>
 
               <div className="mt-4">

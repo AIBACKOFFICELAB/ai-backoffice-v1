@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Inbox, Clock, Bot, Target, Star, Settings, type LucideIcon } from "lucide-react";
+import { LayoutDashboard, Inbox, Clock, Bot, Target, Star, Settings, ShieldCheck, type LucideIcon } from "lucide-react";
 import { NavGroup, NavIconKey, isNavItemActive } from "./navConfig";
 
 /**
@@ -28,6 +28,7 @@ const ICONS: Record<NavIconKey, LucideIcon> = {
   target: Target,
   star: Star,
   settings: Settings,
+  shield: ShieldCheck,
 };
 
 export function NavLinks({ groups, onNavigate }: { groups: NavGroup[]; onNavigate?: () => void }) {
