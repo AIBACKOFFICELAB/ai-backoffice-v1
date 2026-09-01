@@ -53,3 +53,21 @@ export function buildRecoveryErrorUrl(origin: string): URL {
   url.searchParams.set(RECOVERY_ERROR_QUERY_PARAM, RECOVERY_ERROR_QUERY_VALUE);
   return url;
 }
+
+/**
+ * Minimal HTML-attribute escaping, used only to embed the (attacker/URL-
+ * supplied) token_hash into the confirmation interstitial's hidden form
+ * field (`value="..."`) — see recoveryConfirmRoute.ts. `next` is never
+ * escaped anywhere it's used because it is never free text: it always comes
+ * back from passwordRecovery.ts's resolveNextPath allow-list, so it can
+ * only ever be one of a small set of known-safe literal strings, not
+ * attacker-controlled content.
+ */
+export function escapeHtmlAttribute(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}

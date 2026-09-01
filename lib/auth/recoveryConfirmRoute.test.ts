@@ -1,16 +1,32 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { NextRequest } from "next/server";
-import { handleRecoveryConfirm, createServerRecoveryDeps, type RecoveryConfirmDeps, type CookieToSet } from "./recoveryConfirmRoute";
+import {
+  handleRecoveryConfirmView,
+  handleRecoveryConfirmSubmit,
+  createServerRecoveryDeps,
+  type RecoveryConfirmDeps,
+  type CookieToSet,
+} from "./recoveryConfirmRoute";
 import { RECOVERY_OTP_TYPE } from "./recoveryConfirm";
 
 const ORIGIN = "https://aibackoffice.app";
 
-function makeRequest(query: Record<string, string | undefined>, cookieHeader = ""): NextRequest {
+function makeGetRequest(query: Record<string, string | undefined>, cookieHeader = ""): NextRequest {
   const url = new URL("/auth/confirm", ORIGIN);
   for (const [key, value] of Object.entries(query)) {
     if (value !== undefined) url.searchParams.set(key, value);
   }
   return new NextRequest(url, cookieHeader ? { headers: { cookie: cookieHeader } } : undefined);
+}
+
+function makePostRequest(form: Record<string, string | undefined>, cookieHeader = ""): NextRequest {
+  const body = new URLSearchParams();
+  for (const [key, value] of Object.entries(form)) {
+    if (value !== undefined) body.set(key, value);
+  }
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded" };
+  if (cookieHeader) headers.cookie = cookieHeader;
+  return new NextRequest(new URL("/auth/confirm", ORIGIN), { method: "POST", body: body.toString(), headers });
 }
 
 /** A deps double whose verifyRecoveryOtp is fully test-controlled. */
@@ -25,27 +41,95 @@ function makeDeps(opts: {
   return { deps: { verifyRecoveryOtp }, verifyRecoveryOtp };
 }
 
-describe("handleRecoveryConfirm — valid recovery token_hash", () => {
-  it("calls verifyRecoveryOtp with the token_hash from the URL", async () => {
+describe("handleRecoveryConfirmView (GET) — never consumes the token", () => {
+  it("renders the confirmation interstitial for a valid recovery link, without calling Supabase", async () => {
+    const request = makeGetRequest({ token_hash: "real-token-hash-value", type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain('<form method="POST" action="/auth/confirm">');
+    expect(html).toContain('name="token_hash"');
+    expect(html).toContain('value="real-token-hash-value"');
+  });
+
+  it("embeds the resolved next destination as a hidden field", async () => {
+    const request = makeGetRequest({ token_hash: "abc", type: "recovery", next: "/dashboard" });
+    const response = handleRecoveryConfirmView(request);
+    const html = await response.text();
+    expect(html).toContain('name="next"');
+    expect(html).toContain('value="/dashboard"');
+  });
+
+  it("falls back to /auth/update-password as the embedded next when none is given", async () => {
+    const request = makeGetRequest({ token_hash: "abc", type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    const html = await response.text();
+    expect(html).toContain('value="/auth/update-password"');
+  });
+
+  it("HTML-escapes a token_hash containing quotes/angle-brackets so it cannot break out of the attribute or inject a tag", async () => {
+    const malicious = '"><script>alert(1)</script>';
+    const request = makeGetRequest({ token_hash: malicious, type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    const html = await response.text();
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;");
+  });
+
+  it("sets Cache-Control: private, no-store on the interstitial response (it embeds a live token)", () => {
+    const request = makeGetRequest({ token_hash: "abc", type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  it("rejects a missing token_hash safely, redirecting without rendering any interstitial", () => {
+    const request = makeGetRequest({ type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
+  });
+
+  it("rejects a wrong auth type safely, without rendering any interstitial", () => {
+    const request = makeGetRequest({ token_hash: "abc", type: "signup" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.status).toBe(307);
+    expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
+  });
+
+  it("rejects a malformed/empty type safely", () => {
+    const request = makeGetRequest({ token_hash: "abc", type: "" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.status).toBe(307);
+  });
+
+  it("sets Cache-Control: private, no-store on the rejection redirect too", () => {
+    const request = makeGetRequest({ type: "recovery" });
+    const response = handleRecoveryConfirmView(request);
+    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+});
+
+describe("handleRecoveryConfirmSubmit (POST) — the only path that consumes the token", () => {
+  it("calls verifyRecoveryOtp with the token_hash from the form body", async () => {
     const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "real-token-hash-value", type: "recovery" });
-    await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "real-token-hash-value", next: "/auth/update-password" });
+    await handleRecoveryConfirmSubmit(request, deps);
     expect(verifyRecoveryOtp).toHaveBeenCalledTimes(1);
     expect(verifyRecoveryOtp.mock.calls[0][0]).toBe("real-token-hash-value");
   });
 
   it("redirects to the default /auth/update-password destination on success", async () => {
     const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/update-password`);
   });
 
   it("redirects to an explicit, allow-listed next destination when provided", async () => {
     const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery", next: "/dashboard" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc", next: "/dashboard" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.headers.get("location")).toBe(`${ORIGIN}/dashboard`);
   });
 
@@ -57,100 +141,56 @@ describe("handleRecoveryConfirm — valid recovery token_hash", () => {
         { name: "sb-refresh-token", value: "refresh-token-value" },
       ],
     });
-    const request = makeRequest({ token_hash: "abc", type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.cookies.get("sb-access-token")?.value).toBe("session-token-value");
     expect(response.cookies.get("sb-refresh-token")?.value).toBe("refresh-token-value");
   });
 
   it("sets a private, no-store Cache-Control header on the success response", async () => {
     const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
   });
 
   it("passes the request's incoming cookies through getAll() to the verifier", async () => {
     const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery" }, "existing-cookie=1");
-    await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc" }, "existing-cookie=1");
+    await handleRecoveryConfirmSubmit(request, deps);
     const cookieAdapter = verifyRecoveryOtp.mock.calls[0][1];
     expect(cookieAdapter.getAll()).toEqual(expect.arrayContaining([expect.objectContaining({ name: "existing-cookie", value: "1" })]));
   });
-});
 
-describe("handleRecoveryConfirm — rejected before Supabase is ever called", () => {
   it("rejects a missing token_hash safely, without calling verifyRecoveryOtp", async () => {
     const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ next: "/dashboard" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(verifyRecoveryOtp).not.toHaveBeenCalled();
     expect(response.status).toBe(307);
     expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
   });
 
-  it("rejects a wrong auth type (e.g. 'signup') safely, without calling verifyRecoveryOtp", async () => {
-    const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "signup" });
-    const response = await handleRecoveryConfirm(request, deps);
-    expect(verifyRecoveryOtp).not.toHaveBeenCalled();
-    expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
-  });
-
-  it("rejects a malformed/empty type safely, without calling verifyRecoveryOtp", async () => {
-    const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "" });
-    const response = await handleRecoveryConfirm(request, deps);
-    expect(verifyRecoveryOtp).not.toHaveBeenCalled();
-    expect(response.status).toBe(307);
-  });
-
-  it("rejects a missing type entirely, without calling verifyRecoveryOtp", async () => {
-    const { deps, verifyRecoveryOtp } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc" });
-    const response = await handleRecoveryConfirm(request, deps);
-    expect(verifyRecoveryOtp).not.toHaveBeenCalled();
-    expect(response.status).toBe(307);
-  });
-
-  it("sets Cache-Control: private, no-store on the rejection response too", async () => {
+  it("refuses an arbitrary external next value and falls back to the default destination", async () => {
     const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
-    expect(response.headers.get("Cache-Control")).toBe("private, no-store");
-  });
-});
-
-describe("handleRecoveryConfirm — open-redirect protection", () => {
-  it("refuses an arbitrary external next URL and falls back to the default destination", async () => {
-    const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery", next: "https://evil.example.com" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc", next: "https://evil.example.com" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/update-password`);
   });
 
-  it("refuses a protocol-relative external next URL — an external redirect is impossible", async () => {
+  it("refuses a protocol-relative next value — an external redirect is impossible", async () => {
     const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery", next: "//evil.example.com" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc", next: "//evil.example.com" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     const location = response.headers.get("location")!;
     expect(location.startsWith(ORIGIN)).toBe(true);
     expect(location).not.toContain("evil.example.com");
   });
 
-  it("refuses an unlisted internal path and falls back to the default destination", async () => {
-    const { deps } = makeDeps({ error: null });
-    const request = makeRequest({ token_hash: "abc", type: "recovery", next: "/some/other/path" });
-    const response = await handleRecoveryConfirm(request, deps);
-    expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/update-password`);
-  });
-});
-
-describe("handleRecoveryConfirm — verifyOtp failure", () => {
   it("redirects to the safe recovery-error state on a rejected token, without exposing the raw error", async () => {
     const { deps } = makeDeps({ error: { name: "AuthApiError", status: 403 } });
-    const request = makeRequest({ token_hash: "expired-or-used-token", type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "expired-or-used-token" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.status).toBe(307);
     const location = response.headers.get("location")!;
     expect(location).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
@@ -159,7 +199,7 @@ describe("handleRecoveryConfirm — verifyOtp failure", () => {
   });
 });
 
-describe("handleRecoveryConfirm — no logging of sensitive data", () => {
+describe("no logging of sensitive data", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
@@ -168,15 +208,17 @@ describe("handleRecoveryConfirm — no logging of sensitive data", () => {
     vi.restoreAllMocks();
   });
 
-  it("never logs the raw token_hash, on success or failure", async () => {
+  it("never logs the raw token_hash, on success or failure, GET or POST", async () => {
     const sensitiveToken = "super-secret-recovery-token-value";
     const errorSpy = vi.spyOn(console, "error");
 
+    handleRecoveryConfirmView(makeGetRequest({ token_hash: sensitiveToken, type: "recovery" }));
+
     const { deps: okDeps } = makeDeps({ error: null });
-    await handleRecoveryConfirm(makeRequest({ token_hash: sensitiveToken, type: "recovery" }), okDeps);
+    await handleRecoveryConfirmSubmit(makePostRequest({ token_hash: sensitiveToken }), okDeps);
 
     const { deps: failDeps } = makeDeps({ error: { name: "AuthApiError", status: 403 } });
-    await handleRecoveryConfirm(makeRequest({ token_hash: sensitiveToken, type: "recovery" }), failDeps);
+    await handleRecoveryConfirmSubmit(makePostRequest({ token_hash: sensitiveToken }), failDeps);
 
     const allLoggedText = errorSpy.mock.calls.flat().map((arg) => String(arg)).join(" | ");
     expect(allLoggedText).not.toContain(sensitiveToken);
@@ -207,8 +249,8 @@ describe("createServerRecoveryDeps — fails closed when Supabase env vars are m
 
   it("routes through the same safe error redirect as a real verifyOtp failure, end to end", async () => {
     const deps = createServerRecoveryDeps();
-    const request = makeRequest({ token_hash: "abc", type: "recovery" });
-    const response = await handleRecoveryConfirm(request, deps);
+    const request = makePostRequest({ token_hash: "abc" });
+    const response = await handleRecoveryConfirmSubmit(request, deps);
     expect(response.headers.get("location")).toBe(`${ORIGIN}/auth/forgot-password?error=expired`);
   });
 });

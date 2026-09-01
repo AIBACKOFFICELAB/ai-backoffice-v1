@@ -6,6 +6,7 @@ import {
   RECOVERY_ERROR_QUERY_VALUE,
   isValidRecoveryConfirmRequest,
   buildRecoveryErrorUrl,
+  escapeHtmlAttribute,
 } from "./recoveryConfirm";
 
 describe("RECOVERY_OTP_TYPE", () => {
@@ -69,5 +70,27 @@ describe("buildRecoveryErrorUrl", () => {
     const url = buildRecoveryErrorUrl("https://aibackoffice.app");
     const paramNames = Array.from(url.searchParams.keys());
     expect(paramNames).toEqual([RECOVERY_ERROR_QUERY_PARAM]);
+  });
+});
+
+describe("escapeHtmlAttribute", () => {
+  it("leaves a plain, opaque token_hash-shaped value unchanged", () => {
+    expect(escapeHtmlAttribute("abc123-def456_ghi789")).toBe("abc123-def456_ghi789");
+  });
+
+  it("escapes double quotes so a value cannot break out of a value=\"...\" attribute", () => {
+    expect(escapeHtmlAttribute('abc" onmouseover="alert(1)')).not.toContain('"');
+    expect(escapeHtmlAttribute('abc" onmouseover="alert(1)')).toContain("&quot;");
+  });
+
+  it("escapes angle brackets so a value cannot inject a new tag", () => {
+    const escaped = escapeHtmlAttribute('"><script>alert(1)</script>');
+    expect(escaped).not.toContain("<script>");
+    expect(escaped).toContain("&lt;script&gt;");
+  });
+
+  it("escapes ampersands and single quotes", () => {
+    expect(escapeHtmlAttribute("a&b")).toBe("a&amp;b");
+    expect(escapeHtmlAttribute("a'b")).toBe("a&#39;b");
   });
 });

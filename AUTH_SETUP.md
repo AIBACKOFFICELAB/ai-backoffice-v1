@@ -201,7 +201,8 @@ Refer to:
 
 ### Incident
 
-Production account `5starplumbing05@gmail.com` could not complete password
+A production account (email redacted from source control — see the
+incident report for the exact address) could not complete password
 recovery: `resetPasswordForEmail()` sent a real recovery email, the emailed
 link was followed, Supabase confirmed the recovery request and flow state
 were created — but no authenticated recovery session ever resulted, and the
@@ -255,10 +256,22 @@ hostname or browser the click happens in:
 ```
 Supabase Reset Password email template
   → {{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=recovery&next=/auth/update-password
+  → GET /auth/confirm  [renders a confirmation interstitial — NO Supabase call]
+  → explicit click → same-site POST /auth/confirm
   → verifyOtp({ token_hash, type: "recovery" })  [server-side, no verifier needed]
   → recovery session cookies attached to the redirect response
   → /auth/update-password
 ```
+
+The GET step is deliberately non-consuming: an earlier version of this route
+called `verifyOtp` directly on GET, which a Codex review finding caught as
+its own production-shaped bug — email-security scanners and link-preview
+services routinely fetch a link via GET before a human clicks, which would
+consume the one-time recovery token on the scanner's behalf and leave the
+real click to fail as "expired," reproducing the same class of failure this
+hotfix exists to fix. Verification now happens only on a same-site POST
+triggered by an explicit click on the interstitial, which a passive GET
+scan/prefetch never issues.
 
 `app/auth/callback/route.ts` (the PKCE flow) is **unchanged and still
 present** — it remains available for any future magic-link/OAuth-style flow
