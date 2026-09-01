@@ -31,6 +31,7 @@ export function ApprovalCard({
   payloadDigest,
   approvalId,
   canDecide,
+  effectivelyExpired,
 }: {
   requestedAction: string;
   riskLevel: string;
@@ -41,7 +42,17 @@ export function ApprovalCard({
   payloadDigest: string;
   approvalId: string;
   canDecide: boolean;
+  /** True when `status` is still 'pending' in the database but its
+   * deadline has already passed — the backend only applies that
+   * transition lazily, on the next decision attempt (see
+   * lib/approvals/service.ts / lib/approvals/display.ts). Display and
+   * decision-eligibility must reflect this even before the row's stored
+   * `status` catches up (Codex review finding on PR #21). */
+  effectivelyExpired: boolean;
 }) {
+  const displayStatus = effectivelyExpired ? "expired" : status;
+  const canRenderDecision = status === "pending" && !effectivelyExpired;
+
   return (
     <Card className="p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -49,7 +60,7 @@ export function ApprovalCard({
           <p className="font-semibold text-ink-900">{requestedAction}</p>
           <p className="mt-0.5 text-sm text-ink-500">{agentName}</p>
         </div>
-        <span className={`rounded-pill px-2.5 py-1 text-xs font-semibold ${STATUS_TONE[status] ?? "bg-surface-sunken text-ink-700"}`}>{status}</span>
+        <span className={`rounded-pill px-2.5 py-1 text-xs font-semibold ${STATUS_TONE[displayStatus] ?? "bg-surface-sunken text-ink-700"}`}>{displayStatus}</span>
       </div>
 
       <dl className="mt-3 grid grid-cols-2 gap-2 text-xs text-ink-500 sm:grid-cols-4">
@@ -71,7 +82,7 @@ export function ApprovalCard({
         </div>
       </dl>
 
-      {status === "pending" && (
+      {canRenderDecision && (
         <div className="mt-4 border-t border-surface-border pt-3">
           <ApprovalDecisionButtons approvalId={approvalId} canDecide={canDecide} />
         </div>

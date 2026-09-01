@@ -44,17 +44,38 @@ function toReviewView(event: BusinessEvent): EstimateClosingRecommendationReview
   return { ...parsed.value, reviewEventId: event.id, occurredAt: event.occurredAt };
 }
 
-/** Reads ONLY estimate.closing_recommendation_reviewed events for this
- * tenant, bounded, most-recent-first. Mirrors
- * recommendationReadModel.ts::listEstimateClosingRecommendations exactly. */
+/**
+ * Reads ONLY estimate.closing_recommendation_reviewed events that belong
+ * to the given `recommendationEventIds` — NOT an independent recency
+ * `limit` (Codex review finding on PR #21: two bounded reads of related-
+ * but-different event types, each bounded by ITS OWN recency, can silently
+ * mismatch. If a tenant accumulates more reviews of OLDER recommendations
+ * than `limit`, a genuinely-reviewed but comparatively newer recommendation
+ * could be pushed out of a plain recency-bounded review fetch and render
+ * as unreviewed — corrupting the exact agreement/would-act metrics this
+ * read model exists to report, and making a resubmitted review look like
+ * a no-op since idempotency correctly returns the original, already-
+ * existing-but-unfetched row). Scoping by `causationIdIn` (every review's
+ * causationId is always its recommendation's own id — see review.ts)
+ * guarantees every recommendation actually in scope gets its review
+ * fetched, regardless of how many OTHER reviews exist elsewhere — a
+ * strictly correct question instead of an approximated one. The result is
+ * naturally bounded to at most `recommendationEventIds.length` rows (one
+ * review per recommendation, by idempotency), so no separate `limit` is
+ * needed or accepted here.
+ */
 export async function listEstimateClosingRecommendationReviews(
   tenantId: string,
-  options: { limit?: number; eventStore?: BusinessEventStore } = {}
+  recommendationEventIds: string[],
+  options: { eventStore?: BusinessEventStore } = {}
 ): Promise<ListEstimateClosingRecommendationReviewsResult> {
-  const eventStore = options.eventStore ?? new SupabaseBusinessEventStore();
-  const limit = options.limit ?? DEFAULT_LIMIT;
+  if (recommendationEventIds.length === 0) return { reviews: [], skippedMalformed: 0 };
 
-  const events = await eventStore.listByTenant(tenantId, { eventType: "estimate.closing_recommendation_reviewed", limit });
+  const eventStore = options.eventStore ?? new SupabaseBusinessEventStore();
+  const events = await eventStore.listByTenant(tenantId, {
+    eventType: "estimate.closing_recommendation_reviewed",
+    causationIdIn: recommendationEventIds,
+  });
 
   const reviews: EstimateClosingRecommendationReviewView[] = [];
   let skippedMalformed = 0;
@@ -173,11 +194,20 @@ export async function getEstimateClosingEvaluation(
   const runStore = options.runStore ?? new SupabaseAgentRunStore();
   const limit = options.limit ?? DEFAULT_LIMIT;
 
-  const [recommendationsResult, reviewsResult, runs] = await Promise.all([
+  // Reviews are scoped by the recommendation ids actually in this window
+  // (see listEstimateClosingRecommendationReviews's doc comment — an
+  // independent recency-bounded review fetch can silently mismatch), so
+  // recommendations must resolve first; runs has no such dependency and
+  // still runs concurrently with it.
+  const [recommendationsResult, runs] = await Promise.all([
     listEstimateClosingRecommendations(tenantId, { limit, eventStore }),
-    listEstimateClosingRecommendationReviews(tenantId, { limit, eventStore }),
     runStore.listByTenant(tenantId, { limit }),
   ]);
+  const reviewsResult = await listEstimateClosingRecommendationReviews(
+    tenantId,
+    recommendationsResult.recommendations.map((r) => r.recommendationEventId),
+    { eventStore }
+  );
 
   const pairs = pairRecommendationsWithReviews(recommendationsResult.recommendations, reviewsResult.reviews);
   const reviewedRecommendations = pairs.filter((p): p is EvaluatedRecommendation & { review: EstimateClosingRecommendationReviewView } => p.review !== null);

@@ -4,7 +4,24 @@ import { BusinessEvent, EmitEventInput } from "./types";
 
 export interface BusinessEventStore {
   insert(input: EmitEventInput): Promise<{ event: BusinessEvent; deduped: boolean }>;
-  listByTenant(tenantId: string, opts?: { eventType?: string; limit?: number }): Promise<BusinessEvent[]>;
+  /**
+   * `causationIdIn`, when provided, restricts results to events whose
+   * `causationId` is one of the given ids — e.g. "the review events caused
+   * by these specific recommendation events" (see
+   * lib/agents/estimateClosing/review.ts, which always sets `causationId`
+   * to the recommendation event's own id). Added for a Codex finding on
+   * PR #21: fetching a bounded set of events by RECENCY alone (`limit`)
+   * and a bounded set of RELATED events independently can silently
+   * mismatch — an older recommendation's review can crowd out a newer
+   * recommendation's review from its own recency window even though the
+   * newer recommendation itself is still in scope. `causationIdIn` lets a
+   * caller ask the correct, narrower question directly instead. Mutually
+   * exclusive with `limit` in practice (a caller passing `causationIdIn`
+   * already has a natural bound — at most one review per recommendation,
+   * by idempotency — so no separate `limit` is needed); both may be
+   * combined but `limit` still applies to the reduced set if so.
+   */
+  listByTenant(tenantId: string, opts?: { eventType?: string; limit?: number; causationIdIn?: string[] }): Promise<BusinessEvent[]>;
   getById(tenantId: string, id: string): Promise<BusinessEvent | null>;
 }
 
@@ -78,11 +95,18 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
     return mapRow(data);
   }
 
-  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number } = {}): Promise<BusinessEvent[]> {
+  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
     const supabase = await createServerSupabaseClient();
     let query = supabase.from("business_events").select("*").eq("tenant_id", tenantId);
     if (opts.eventType) query = query.eq("event_type", opts.eventType);
-    query = query.order("occurred_at", { ascending: false }).limit(opts.limit ?? 50);
+    if (opts.causationIdIn) {
+      if (opts.causationIdIn.length === 0) return [];
+      query = query.in("causation_id", opts.causationIdIn);
+    }
+    // Default limit is 50 for a plain recency read; a causationIdIn read's
+    // own natural bound is the size of that id set (it can never match
+    // more rows than that) unless the caller narrows further.
+    query = query.order("occurred_at", { ascending: false }).limit(opts.limit ?? opts.causationIdIn?.length ?? 50);
     const { data, error } = await query;
     if (error) throw new Error(`[business_events] list failed: ${error.message}`);
     return (data ?? []).map(mapRow);
@@ -128,11 +152,18 @@ export class InMemoryBusinessEventStore implements BusinessEventStore {
     return { event, deduped: false };
   }
 
-  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number } = {}): Promise<BusinessEvent[]> {
+  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
+    if (opts.causationIdIn && opts.causationIdIn.length === 0) return [];
+    const causationIdSet = opts.causationIdIn ? new Set(opts.causationIdIn) : null;
     return this.rows
-      .filter((r) => r.tenantId === tenantId && (!opts.eventType || r.eventType === opts.eventType))
+      .filter(
+        (r) =>
+          r.tenantId === tenantId &&
+          (!opts.eventType || r.eventType === opts.eventType) &&
+          (!causationIdSet || (r.causationId !== null && causationIdSet.has(r.causationId)))
+      )
       .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
-      .slice(0, opts.limit ?? 50);
+      .slice(0, opts.limit ?? causationIdSet?.size ?? 50);
   }
 
   async getById(tenantId: string, id: string): Promise<BusinessEvent | null> {

@@ -50,15 +50,23 @@ async function seedRecommendation(
 
 async function seedReview(
   store: InMemoryBusinessEventStore,
-  overrides: { tenantId?: string; payload?: unknown; occurredAt?: string } = {}
+  overrides: { tenantId?: string; payload?: unknown; causationId?: string; occurredAt?: string } = {}
 ) {
+  const payload = (overrides.payload ?? VALID_REVIEW_PAYLOAD) as Record<string, unknown>;
+  // Mirrors review.ts's real production behavior: causationId is always
+  // the recommendation event's own id — same value as
+  // payload.recommendationEventId. Defaulting to it here (rather than
+  // requiring every call site to pass both) keeps existing tests that
+  // already set recommendationEventId correctly scoped without change.
+  const causationId = overrides.causationId ?? (typeof payload.recommendationEventId === "string" ? payload.recommendationEventId : undefined);
   const { event } = await store.insert({
     tenantId: overrides.tenantId ?? "tenant-1",
     eventType: "estimate.closing_recommendation_reviewed",
     actorType: "user",
     entityType: "lead",
     entityId: "lead-1",
-    payload: (overrides.payload ?? VALID_REVIEW_PAYLOAD) as Record<string, unknown>,
+    causationId,
+    payload,
     occurredAt: overrides.occurredAt,
   });
   return event;
@@ -128,44 +136,65 @@ describe("parsePersistedReviewPayload", () => {
 });
 
 describe("listEstimateClosingRecommendationReviews", () => {
-  it("reads valid review events for the tenant", async () => {
+  it("reads valid review events scoped to the given recommendation ids", async () => {
     const store = new InMemoryBusinessEventStore();
-    await seedReview(store);
-    const result = await listEstimateClosingRecommendationReviews("tenant-1", { eventStore: store });
+    await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: "rec-1" } });
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", ["rec-1"], { eventStore: store });
     expect(result.reviews).toHaveLength(1);
     expect(result.skippedMalformed).toBe(0);
     expect(result.reviews[0].verdict).toBe("agree");
   });
 
+  it("excludes a review whose recommendation is not in the given id set", async () => {
+    const store = new InMemoryBusinessEventStore();
+    await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: "rec-1" } });
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", ["rec-DIFFERENT"], { eventStore: store });
+    expect(result.reviews).toHaveLength(0);
+  });
+
+  it("returns empty immediately for an empty id list", async () => {
+    const store = new InMemoryBusinessEventStore();
+    await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: "rec-1" } });
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", [], { eventStore: store });
+    expect(result).toEqual({ reviews: [], skippedMalformed: 0 });
+  });
+
   it("skips a malformed review payload and counts it, never crashing", async () => {
     const store = new InMemoryBusinessEventStore();
-    await seedReview(store, { payload: { verdict: "agree" } }); // missing required fields
-    const result = await listEstimateClosingRecommendationReviews("tenant-1", { eventStore: store });
+    await seedReview(store, { payload: { verdict: "agree" }, causationId: "rec-1" }); // missing required fields
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", ["rec-1"], { eventStore: store });
     expect(result.reviews).toHaveLength(0);
     expect(result.skippedMalformed).toBe(1);
   });
 
   it("never reads across tenants", async () => {
     const store = new InMemoryBusinessEventStore();
-    await seedReview(store, { tenantId: "tenant-A" });
-    const result = await listEstimateClosingRecommendationReviews("tenant-B", { eventStore: store });
+    await seedReview(store, { tenantId: "tenant-A", payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: "rec-1" } });
+    const result = await listEstimateClosingRecommendationReviews("tenant-B", ["rec-1"], { eventStore: store });
     expect(result.reviews).toHaveLength(0);
   });
 
   it("filters strictly on the review event type — a recommendation event is never mistaken for a review", async () => {
     const store = new InMemoryBusinessEventStore();
-    await seedRecommendation(store);
-    const result = await listEstimateClosingRecommendationReviews("tenant-1", { eventStore: store });
+    const rec = await seedRecommendation(store);
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", [rec.id], { eventStore: store });
     expect(result.reviews).toHaveLength(0);
   });
 
-  it("is bounded by limit", async () => {
+  it("fetches every in-scope review regardless of how many OTHER reviews exist elsewhere — the exact bug this fix closes (Codex review finding on PR #21)", async () => {
     const store = new InMemoryBusinessEventStore();
-    for (let i = 0; i < 5; i++) {
-      await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: `rec-${i}` } });
+    // A large backlog of reviews for OLDER recommendations that would
+    // previously have crowded a plain recency-bounded fetch (limit=200)
+    // and pushed a newer, still-in-scope recommendation's own review out
+    // of the window entirely.
+    for (let i = 0; i < 250; i++) {
+      await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: `old-rec-${i}` } });
     }
-    const result = await listEstimateClosingRecommendationReviews("tenant-1", { eventStore: store, limit: 2 });
-    expect(result.reviews).toHaveLength(2);
+    await seedReview(store, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: "rec-newer" } });
+
+    const result = await listEstimateClosingRecommendationReviews("tenant-1", ["rec-newer"], { eventStore: store });
+    expect(result.reviews).toHaveLength(1);
+    expect(result.reviews[0].recommendationEventId).toBe("rec-newer");
   });
 });
 
@@ -316,11 +345,17 @@ describe("getEstimateClosingEvaluation", () => {
   it("skips malformed recommendation and review events safely, counting each", async () => {
     const eventStore = new InMemoryBusinessEventStore();
     const runStore = new InMemoryAgentRunStore();
-    await seedRecommendation(eventStore, { payload: { recommendation: "not_a_real_value" } });
-    await seedReview(eventStore, { payload: { verdict: "agree" } });
+    await seedRecommendation(eventStore, { payload: { recommendation: "not_a_real_value" }, entityId: "lead-malformed" });
+    // The malformed review must reference a VALID recommendation to be
+    // in-scope at all under the new causationId-scoped fetch — a review
+    // for a recommendation that itself never parsed isn't reachable
+    // either way, so this pins the real case: a valid recommendation with
+    // a corrupted review.
+    const validRec = await seedRecommendation(eventStore, { entityId: "lead-valid" });
+    await seedReview(eventStore, { payload: { verdict: "agree" }, causationId: validRec.id });
 
     const evaluation = await getEstimateClosingEvaluation("tenant-1", { eventStore, runStore });
-    expect(evaluation.recommendationsGenerated).toBe(0);
+    expect(evaluation.recommendationsGenerated).toBe(1);
     expect(evaluation.skippedMalformedRecommendations).toBe(1);
     expect(evaluation.skippedMalformedReviews).toBe(1);
   });
@@ -333,6 +368,33 @@ describe("getEstimateClosingEvaluation", () => {
     }
     const evaluation = await getEstimateClosingEvaluation("tenant-1", { eventStore, runStore, limit: 3 });
     expect(evaluation.recommendationsGenerated).toBe(3);
+  });
+
+  it("a recommendation's review is never lost behind a large backlog of reviews for older recommendations (Codex review finding on PR #21)", async () => {
+    const eventStore = new InMemoryBusinessEventStore();
+    const runStore = new InMemoryAgentRunStore();
+
+    // A newer recommendation, reviewed once.
+    const newerRec = await seedRecommendation(eventStore, { entityId: "lead-newer", occurredAt: "2026-09-01T12:00:00.000Z" });
+    await seedReview(eventStore, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: newerRec.id, verdict: "agree" } });
+
+    // A large backlog of reviews for unrelated OLDER recommendations —
+    // before the fix, this alone was enough to push newerRec's review out
+    // of a plain recency-bounded fetch even though newerRec itself
+    // remains well within the recommendations window.
+    for (let i = 0; i < 250; i++) {
+      await seedReview(eventStore, { payload: { ...VALID_REVIEW_PAYLOAD, recommendationEventId: `old-rec-${i}` } });
+    }
+
+    const evaluation = await getEstimateClosingEvaluation("tenant-1", { eventStore, runStore });
+
+    expect(evaluation.recommendationsGenerated).toBe(1);
+    expect(evaluation.recommendationsReviewed).toBe(1);
+    expect(evaluation.agreeCount).toBe(1);
+    expect(evaluation.agreementRate).toBe(1);
+    const pair = evaluation.recommendationsWithReviewStatus[0];
+    expect(pair.review).not.toBeNull();
+    expect(pair.review?.recommendationEventId).toBe(newerRec.id);
   });
 });
 

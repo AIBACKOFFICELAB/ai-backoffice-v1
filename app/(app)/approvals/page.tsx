@@ -8,7 +8,8 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { ApprovalCard } from "@/components/approvals/ApprovalCard";
 import { ApprovalModeLadder } from "@/components/ai/ApprovalModeLadder";
-import type { Approval, ApprovalStatus } from "@/lib/approvals/types";
+import { classifyApprovalBucket, isEffectivelyExpired, ApprovalDisplayBucket } from "@/lib/approvals/display";
+import type { Approval } from "@/lib/approvals/types";
 
 /**
  * P1 Sprint 3 §11 — Human Approval Center UI foundation. Built on the
@@ -30,12 +31,17 @@ export default async function ApprovalsPage() {
   ]);
 
   const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
-  const byStatus = (statuses: ApprovalStatus[]) => approvals.filter((a) => statuses.includes(a.status));
+  // Bucketed by CLASSIFIED status, not raw `approval.status` — a
+  // still-'pending' row past its own deadline must display (and behave)
+  // as expired even before the backend's lazy transition has run against
+  // it (Codex review finding on PR #21; see lib/approvals/display.ts).
+  const now = new Date();
+  const byBucket = (bucket: ApprovalDisplayBucket) => approvals.filter((a) => classifyApprovalBucket(a, now) === bucket);
 
-  const pending = byStatus(["pending"]);
-  const approved = byStatus(["approved", "executing", "executed"]);
-  const rejected = byStatus(["rejected"]);
-  const expired = byStatus(["expired"]);
+  const pending = byBucket("pending");
+  const approved = byBucket("approved");
+  const rejected = byBucket("rejected");
+  const expired = byBucket("expired");
 
   const canDecide = tenant.role === "owner";
 
@@ -57,6 +63,7 @@ export default async function ApprovalsPage() {
             agentName={approval.agentId ? (agentNameById.get(approval.agentId) ?? "Agent") : "Agent"}
             payloadDigest={approval.payloadDigest}
             canDecide={canDecide}
+            effectivelyExpired={isEffectivelyExpired(approval, now)}
           />
         ))}
       </div>

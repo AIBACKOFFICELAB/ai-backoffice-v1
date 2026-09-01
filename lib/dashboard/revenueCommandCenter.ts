@@ -150,7 +150,6 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     directRevenueRecoveredUsd,
     stalledEvents,
     recommendationsResult,
-    reviewsResult,
   ] = await Promise.all([
     getLeads(tenantId),
     getMissedCallAnalytics(tenantId),
@@ -165,12 +164,20 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     // is safely excluded rather than trusted or crashing the page. See
     // recommendationReadModel.ts.
     listEstimateClosingRecommendations(tenantId),
-    // P1 Sprint 3 — bounded review-count only; the dashboard links to
-    // /agentic/estimate-closing for the full evaluation console rather
-    // than duplicating it here (directive §10: "Do not make Dashboard a
-    // giant evaluation console").
-    listEstimateClosingRecommendationReviews(tenantId),
   ]);
+
+  // P1 Sprint 3 — bounded review-count only; the dashboard links to
+  // /agentic/estimate-closing for the full evaluation console rather than
+  // duplicating it here (directive §10: "Do not make Dashboard a giant
+  // evaluation console"). Scoped by THIS window's recommendation ids
+  // (never an independent recency limit — Codex review finding on PR #21:
+  // that can under/over-count "reviewed" against recommendations actually
+  // displayed), so it must run after recommendationsResult resolves.
+  const reviewsResult = await listEstimateClosingRecommendationReviews(
+    tenantId,
+    recommendationsResult.recommendations.map((r) => r.recommendationEventId),
+    { eventStore }
+  );
 
   const metrics = buildLeadMetrics(leads);
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
