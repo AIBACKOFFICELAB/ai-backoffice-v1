@@ -86,6 +86,31 @@ function forbidRawEstimatePii(payload: unknown): EventPayloadValidation {
   return { ok: true };
 }
 
+/**
+ * P1 Sprint 3: the recommendation-review payload is a closed, fully
+ * enumerated shape with no free-text field ever offered by its writer (see
+ * lib/agents/estimateClosing/review.ts, which validates verdict/wouldAct/
+ * reasonCodes deeply BEFORE ever calling emitEvent — this contract is a
+ * shallow shape/privacy guard, matching every other contract in this file,
+ * not a re-implementation of that deep validation). Rejects anything that
+ * isn't a plain object referencing a recommendation event, and — as
+ * defense in depth, mirroring forbidRawEstimatePii above — any accidental
+ * free-text field a future caller might add.
+ */
+const FORBIDDEN_REVIEW_EVENT_FIELDS = ["notes", "comment", "feedback", "freeText", "rationale"] as const;
+
+function validateReviewPayloadShape(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  if (typeof payload.recommendationEventId !== "string" || !payload.recommendationEventId) {
+    return { ok: false, errors: ["payload must include recommendationEventId"] };
+  }
+  const present = FORBIDDEN_REVIEW_EVENT_FIELDS.filter((field) => field in payload);
+  if (present.length > 0) {
+    return { ok: false, errors: [`payload must not include free-text field(s): ${present.join(", ")} — see lib/events/contracts.ts`] };
+  }
+  return { ok: true };
+}
+
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "call.missed": {
     eventType: "call.missed",
@@ -138,6 +163,19 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
     // "retries" producing it the way a webhook or cron scan could.
     idempotency: "not_applicable",
     validatePayload: forbidRawEstimatePii,
+  },
+  "estimate.closing_recommendation_reviewed": {
+    eventType: "estimate.closing_recommendation_reviewed",
+    schemaVersion: 1,
+    // Required, not merely recommended: (tenant_id, idempotency_key) is
+    // what makes "a single canonical review per recommendation" safe
+    // WITHOUT a migration (P1 Sprint 3 directive §6/§17) — see
+    // lib/agents/estimateClosing/review.ts, which derives the key
+    // deterministically from recommendationEventId alone, so a second
+    // review attempt on the same recommendation always dedupes to the
+    // original row rather than creating a second one.
+    idempotency: "required",
+    validatePayload: validateReviewPayloadShape,
   },
 };
 

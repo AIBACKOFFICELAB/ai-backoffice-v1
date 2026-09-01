@@ -83,6 +83,13 @@ export const KNOWN_EVENT_TYPES = [
    * — no raw model prose, no customer PII. See
    * lib/agents/estimateClosing/shadowRunner.ts. */
   "estimate.closing_recommendation_generated",
+  /** P1 Sprint 3: emitted when the tenant owner records a verdict on a
+   * previously-generated shadow recommendation — evaluation EVIDENCE, never
+   * an outcome, never a customer action. actorType is "user" (a human
+   * reviewed it), not "agent" — the opposite of the event it reviews. See
+   * lib/agents/estimateClosing/review.ts, the only writer. Enumerated
+   * feedback only: verdict/wouldAct/reasonCodes, no free text, no PII. */
+  "estimate.closing_recommendation_reviewed",
   "job.created",
   "job.completed",
   "invoice.created",
