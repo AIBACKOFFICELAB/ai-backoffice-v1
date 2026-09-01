@@ -21,15 +21,24 @@ export const GENERIC_UPDATE_ERROR_MESSAGE =
   "We couldn't update your password. Please request a new reset link and try again.";
 
 /**
- * Where Supabase should send the browser after the user clicks the emailed
- * reset link. This project's @supabase/ssr setup (see lib/supabase/client.ts,
- * lib/supabase/server.ts, middleware.ts) defaults to the PKCE flow — the
- * link Supabase generates carries a `?code=` param that must be exchanged
- * for a session server-side before any page can rely on
- * supabase.auth.getUser() seeing it. So this points at the code-exchange
- * callback (app/auth/callback/route.ts), not directly at
- * /auth/update-password; the callback performs the exchange and only then
- * forwards the browser to /auth/update-password.
+ * Legacy/compatibility redirect target for resetPasswordForEmail's
+ * `redirectTo` option — still passed on every call below, but no longer the
+ * security-critical path. The CANONICAL recovery mechanism is now the
+ * token-hash route (app/auth/confirm/route.ts, see AUTH_SETUP.md's
+ * "Production Hotfix" section): once the Supabase Reset Password email
+ * template is switched to `{{ .SiteURL }}/auth/confirm?token_hash=...`, the
+ * emailed link is built entirely from that fixed template — NOT from this
+ * `redirectTo` value — so it no longer matters which hostname
+ * (window.location.origin) the user happened to be on when they submitted
+ * the forgot-password form. `redirectTo` is kept here only so
+ * resetPasswordForEmail has a harmless, working fallback if the email
+ * template has not yet been updated; it was never required for the
+ * token-hash flow to succeed.
+ *
+ * This still points at the PKCE code-exchange callback
+ * (app/auth/callback/route.ts) for backward compatibility — see that file's
+ * own doc comment. It is not removed; it is simply no longer load-bearing
+ * for password recovery specifically.
  */
 export function buildRecoveryRedirectUrl(origin: string): string {
   return `${origin}/auth/callback?next=${encodeURIComponent(DEFAULT_NEXT_PATH)}`;

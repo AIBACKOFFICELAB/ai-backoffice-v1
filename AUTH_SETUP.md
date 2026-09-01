@@ -194,3 +194,103 @@ Refer to:
 - [Supabase Auth Docs](https://supabase.com/docs/guides/auth)
 - [Supabase SSR Guide](https://supabase.com/docs/guides/auth/server-side-rendering)
 - [Next.js Authentication](https://nextjs.org/docs/app/building-your-application/authentication)
+
+---
+
+## Production Hotfix: SSR Token-Hash Password Recovery
+
+### Incident
+
+Production account `5starplumbing05@gmail.com` could not complete password
+recovery: `resetPasswordForEmail()` sent a real recovery email, the emailed
+link was followed, Supabase confirmed the recovery request and flow state
+were created — but no authenticated recovery session ever resulted, and the
+user eventually ended up back at `/auth/login` instead of
+`/auth/update-password`.
+
+### Root-cause model (suspected, not exhaustively proven)
+
+The prior recovery path was entirely PKCE `code`-based:
+
+```
+resetPasswordForEmail()
+  → redirectTo built from window.location.origin
+  → emailed link: /auth/callback?code=...
+  → exchangeCodeForSession(code)
+  → recovery session cookie
+  → /auth/update-password
+```
+
+`exchangeCodeForSession` requires a PKCE `code_verifier` that Supabase's
+`@supabase/ssr` browser client persists (as a cookie) scoped to the origin
+and browser session that called `resetPasswordForEmail`. That dependency is
+fragile in exactly the ways this production app now exercises:
+
+- The app is reachable through three separate hostnames —
+  `https://aibackoffice.app`, `https://www.aibackoffice.app`, and
+  `https://ai-backoffice-v1.vercel.app` — and a verifier cookie set on one
+  origin is not available on another.
+- A recovery link opened in a different browser, device, or private/
+  incognito context than the one that requested the reset never had the
+  verifier cookie to begin with.
+- Some email clients and corporate link-scanning proxies pre-fetch links
+  server-side before a human ever clicks, which can consume a one-time PKCE
+  code before the real click happens.
+
+We are not asserting which of these specifically occurred in production —
+only that PKCE-verifier fragility across a hostname/cookie/browser boundary
+is the class of failure consistent with every observed symptom, and that
+Supabase's own current SSR guidance recommends moving password recovery off
+this pattern entirely.
+
+### Fix: `token_hash` + `verifyOtp` (SSR, hostname-independent)
+
+A new route, `/auth/confirm` (`app/auth/confirm/route.ts`, logic in
+`lib/auth/recoveryConfirmRoute.ts` / `lib/auth/recoveryConfirm.ts`), verifies
+the emailed `token_hash` directly server-side via
+`supabase.auth.verifyOtp({ token_hash, type: "recovery" })`. This requires no
+browser-held secret at all — no code_verifier, no dependency on which
+hostname or browser the click happens in:
+
+```
+Supabase Reset Password email template
+  → {{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=recovery&next=/auth/update-password
+  → verifyOtp({ token_hash, type: "recovery" })  [server-side, no verifier needed]
+  → recovery session cookies attached to the redirect response
+  → /auth/update-password
+```
+
+`app/auth/callback/route.ts` (the PKCE flow) is **unchanged and still
+present** — it remains available for any future magic-link/OAuth-style flow
+— but password-recovery emails should no longer depend on it for a
+successful recovery once the email template below is applied.
+
+### Required manual Supabase configuration (founder action — NOT applied automatically)
+
+This hotfix does not and cannot modify your Supabase Auth dashboard
+configuration. After reviewing and merging the PR, apply the following
+manually in the Supabase dashboard for the production project:
+
+**1. Auth → URL Configuration → Site URL:**
+
+```
+https://aibackoffice.app
+```
+
+**2. Auth → URL Configuration → Redirect URLs (add all three):**
+
+```
+https://aibackoffice.app/**
+https://www.aibackoffice.app/**
+https://ai-backoffice-v1.vercel.app/**
+```
+
+**3. Auth → Email Templates → Reset Password — change the action link to:**
+
+```
+{{ .SiteURL }}/auth/confirm?token_hash={{ .TokenHash }}&type=recovery&next=/auth/update-password
+```
+
+No secrets are involved in any of the above — this is routing/template
+configuration only, made in the Supabase dashboard, not committed to this
+repository.
