@@ -227,6 +227,36 @@ export function computeEstimateLifecycleReadModel(leads: PlumbingLead[], sequenc
   };
 }
 
+/**
+ * P1 Sprint 4 §12 — truthful, plain-English Shadow data-readiness lines for
+ * the Estimate Closing workspace. Deliberately built from the SAME figures
+ * the rest of this read model already computes (never a separate/optimistic
+ * estimate) and never promises a specific future recommendation or
+ * shortens the Day 7 window — see the directive's explicit examples ("No
+ * eligible estimates yet", "2 estimates currently in deterministic
+ * follow-up", "1 estimate becomes Shadow-eligible after Day 7 if no reply
+ * is received").
+ */
+export function buildShadowReadinessLines(model: Pick<EstimateLifecycleReadModel, "estimatesSent" | "activeFollowupSequences" | "stalledEligible">): string[] {
+  if (model.estimatesSent === 0) {
+    return ["No eligible estimates yet — no estimates have been sent."];
+  }
+
+  const lines: string[] = [];
+  if (model.stalledEligible > 0) {
+    lines.push(`${model.stalledEligible} estimate${model.stalledEligible === 1 ? " is" : "s are"} currently Shadow-eligible (past Day 7, no reply).`);
+  }
+  if (model.activeFollowupSequences > 0) {
+    lines.push(
+      `${model.activeFollowupSequences} estimate${model.activeFollowupSequences === 1 ? "" : "s"} currently in deterministic Day 1/3/7 follow-up — ${model.activeFollowupSequences === 1 ? "it becomes" : "each becomes"} Shadow-eligible only if it reaches Day 7 with no reply.`
+    );
+  }
+  if (lines.length === 0) {
+    lines.push("No estimates are currently eligible for Shadow review.");
+  }
+  return lines;
+}
+
 export async function getEstimateLifecycleReadModel(tenantId: string): Promise<EstimateLifecycleReadModel> {
   const [{ leads }, sequences] = await Promise.all([getLeads(tenantId), getEstimateFollowupSequencesForTenant(tenantId)]);
   return computeEstimateLifecycleReadModel(leads, sequences);

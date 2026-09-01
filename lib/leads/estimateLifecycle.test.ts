@@ -6,6 +6,7 @@ import {
   buildEstimateSentIdempotencyKey,
   type MarkEstimateSentDeps,
 } from "./estimateLifecycle";
+import { enrollLeadInFollowup } from "@/lib/modules/estimateFollowup/service";
 
 function makeLead(overrides: Partial<PlumbingLead> = {}): PlumbingLead {
   return {
@@ -150,5 +151,25 @@ describe("markEstimateSent", () => {
     const { deps, emitLifecycleEvent } = makeDeps({ enrolled: true });
     await markEstimateSent(makeLead({ status: "Estimate Sent" }), "tenant-1", false, null, deps);
     expect(emitLifecycleEvent).toHaveBeenCalledWith(expect.objectContaining({ actorUserId: null }));
+  });
+});
+
+describe("structural safety: marking Estimate Sent never sends SMS by itself", () => {
+  it("enrollLeadInFollowup's own source never references sendSms/Twilio — sending lives ONLY in processSequence (the deterministic cron), never the enrollment trigger", () => {
+    // A behavioral mock-based test can't distinguish "doesn't call sendSms"
+    // from "the mock happens not to be exercised" — inspecting the actual
+    // function source is the only proof that enrollment is structurally
+    // incapable of sending anything, matching this codebase's existing
+    // "structural invariant" precedent (e.g. shadowRunner.ts's "no toolPlan
+    // parameter anywhere in its signature").
+    const source = enrollLeadInFollowup.toString();
+    expect(source).not.toMatch(/sendSms/i);
+    expect(source).not.toMatch(/twilio/i);
+  });
+
+  it("markEstimateSent's own source never references sendSms/Twilio either", async () => {
+    const mod = await import("./estimateLifecycle");
+    expect(mod.markEstimateSent.toString()).not.toMatch(/sendSms/i);
+    expect(mod.markEstimateSent.toString()).not.toMatch(/twilio/i);
   });
 });

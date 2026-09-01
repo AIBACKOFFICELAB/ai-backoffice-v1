@@ -7,7 +7,7 @@ import { LEAD_STATUSES, STATUS_STYLES, normalizeStatus } from "@/components/ui/S
 import { Button } from "@/components/ui/Button";
 import { Input, Label, Textarea, FieldError } from "@/components/ui/Field";
 
-export default function LeadEditForm({ lead }: { lead: PlumbingLead }) {
+export default function LeadEditForm({ lead, followupEnabled }: { lead: PlumbingLead; followupEnabled: boolean }) {
   const router = useRouter();
 
   const [status, setStatus] = useState<LeadStatus>(normalizeStatus(lead.status));
@@ -78,6 +78,13 @@ export default function LeadEditForm({ lead }: { lead: PlumbingLead }) {
               </option>
             ))}
           </select>
+          {status === "Estimate Sent" && (
+            <p className="mt-1.5 text-xs text-ink-500">
+              {followupEnabled
+                ? "This enrolls the customer in your Day 1/3/7 follow-up — automated SMS may be sent unless they reply or the status changes."
+                : "Your Estimate Follow-up automation is currently OFF for this account — no automated messages will be sent."}
+            </p>
+          )}
         </div>
 
         <div>

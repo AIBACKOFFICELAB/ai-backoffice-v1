@@ -18,6 +18,8 @@ import {
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateClosing/evaluationReadModel";
+import { getEstimateFollowupSequencesForTenant } from "@/lib/modules/estimateFollowup/service";
+import { computeEstimateLifecycleReadModel } from "@/lib/leads/estimateLifecycleReadModel";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -117,6 +119,15 @@ export type RevenueCommandCenterData = {
    * link into /agentic/estimate-closing; the dashboard itself stays a
    * thin summary, not an evaluation console (P1 Sprint 3 directive §10). */
   estimateClosingRecommendationsReviewed: number;
+  /** P1 Sprint 4 §13 — estimates past their full Day 1/3/7 follow-up window
+   * with no reply, i.e. Shadow-eligible right now. Deliberately the ONE new
+   * dashboard figure this sprint adds: "At-Risk Estimate Value" above
+   * already equals lib/leads/estimateLifecycleReadModel.ts's
+   * openEstimateValue (same computation, same leads), so repeating it here
+   * would be redundant, not "modest high-value visibility" (directive
+   * §13). Independent of whether Shadow Mode is enabled/active — this
+   * reflects real follow-up state, not the agent's own on/off status. */
+  stalledEstimatesCount: number;
 };
 
 /** Exported for unit testing (dashboard/attention.test.ts) — the same
@@ -150,6 +161,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     directRevenueRecoveredUsd,
     stalledEvents,
     recommendationsResult,
+    followupSequences,
   ] = await Promise.all([
     getLeads(tenantId),
     getMissedCallAnalytics(tenantId),
@@ -164,6 +176,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     // is safely excluded rather than trusted or crashing the page. See
     // recommendationReadModel.ts.
     listEstimateClosingRecommendations(tenantId),
+    getEstimateFollowupSequencesForTenant(tenantId),
   ]);
 
   // P1 Sprint 3 — bounded review-count only; the dashboard links to
@@ -180,6 +193,12 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
   );
 
   const metrics = buildLeadMetrics(leads);
+  // Reuses the SAME leads array already fetched above — never a duplicate
+  // getLeads() call — and the SAME checkEstimateEligibility/isEstimateStalled
+  // functions Shadow Mode itself uses (via estimateLifecycleReadModel.ts),
+  // so this figure can never disagree with what Shadow will actually treat
+  // as stalled, and no Day 7 threshold is duplicated.
+  const stalledEstimatesCount = computeEstimateLifecycleReadModel(leads, followupSequences).stalledEligible;
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
   const agentNameById = new Map(agents.map((a) => [a.id, a.name]));
   const estimateClosingAgentStatus = resolveEstimateClosingAgentStatus(agents);
@@ -316,5 +335,6 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     estimateClosingShadowEnabled,
     estimateClosingSummary,
     estimateClosingRecommendationsReviewed: reviewsResult.reviews.length,
+    stalledEstimatesCount,
   };
 }
