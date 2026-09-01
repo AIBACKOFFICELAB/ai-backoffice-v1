@@ -73,6 +73,15 @@ export type EstimateLifecycleLeadView = {
 
 export type EstimateLifecycleReadModel = {
   estimatesSent: number;
+  /** Sequences whose status is "active" AND whose lead is CURRENTLY still
+   * "Estimate Sent" — deliberately excludes an active sequence orphaned by
+   * a status change the module never stopped (see
+   * sequence_without_estimate_sent_status / terminal_lead_with_active_sequence
+   * diagnostics below): that sequence can never become Shadow-eligible
+   * (checkEstimateEligibility refuses any lead not at "Estimate Sent"), so
+   * counting it here would inflate buildShadowReadinessLines' "each
+   * becomes Shadow-eligible..." claim into something not actually true for
+   * every counted estimate (Codex review finding on PR #23). */
   activeFollowupSequences: number;
   replied: number;
   completedDay7: number;
@@ -84,6 +93,16 @@ export type EstimateLifecycleReadModel = {
    * lib/leads/repository.ts::buildLeadMetrics's atRiskEstimateValue, which
    * this figure intentionally matches). */
   openEstimateValue: number;
+  /** Won/Lost leads that are actually ESTIMATE-BACKED — i.e. a
+   * estimate_followup_sequences row exists (or ever existed) for them,
+   * proving a real estimate genuinely went through this lifecycle at some
+   * point. Deliberately excludes a lead that reached Won/Lost without ever
+   * having a tracked estimate (e.g. New -> Won directly) — counting every
+   * system-wide Won/Lost lead on an "Estimate Pipeline" page would
+   * misrepresent them as estimate outcomes (Codex review finding on PR
+   * #23). */
+  won: number;
+  lost: number;
   diagnostics: EstimateLifecycleDiagnostic[];
   leads: EstimateLifecycleLeadView[];
 };
@@ -154,20 +173,29 @@ export function computeEstimateLifecycleReadModel(leads: PlumbingLead[], sequenc
 
   const diagnostics: EstimateLifecycleDiagnostic[] = [];
 
+  let won = 0;
+  let lost = 0;
+
   for (const seq of sequences) {
-    if (seq.status === "active") activeFollowupSequences += 1;
-    else if (seq.status === "replied") replied += 1;
+    if (seq.status === "replied") replied += 1;
     else if (seq.status === "completed") completedDay7 += 1;
     else if (seq.status === "stopped") stopped += 1;
 
     const lead = leadsById.get(seq.leadId);
     if (!lead) continue; // orphaned sequence (lead deleted) — nothing further to check against it
 
+    // Only an active sequence whose lead is STILL "Estimate Sent" counts as
+    // "in deterministic follow-up" — see the field doc comment above.
+    if (seq.status === "active" && lead.status === "Estimate Sent") activeFollowupSequences += 1;
+
     if (TERMINAL_STATUSES.has(lead.status) && seq.status === "active") {
       diagnostics.push({ code: "terminal_lead_with_active_sequence", leadId: lead.id, sequenceId: seq.id });
     } else if (lead.status !== "Estimate Sent" && !TERMINAL_STATUSES.has(lead.status)) {
       diagnostics.push({ code: "sequence_without_estimate_sent_status", leadId: lead.id, sequenceId: seq.id });
     }
+
+    if (lead.status === "Won") won += 1;
+    else if (lead.status === "Lost") lost += 1;
   }
 
   let estimatesSent = 0;
@@ -222,6 +250,8 @@ export function computeEstimateLifecycleReadModel(leads: PlumbingLead[], sequenc
     stopped,
     stalledEligible,
     openEstimateValue,
+    won,
+    lost,
     diagnostics,
     leads: leadViews,
   };

@@ -57,6 +57,7 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
   // after the fact (see lib/leads/estimateLifecycle.ts's doc comment and
   // the PR's Gate 2 audit for why this path needed hardening).
   let wasAlreadyEstimateSent = false;
+  let expectedCurrentStatus: string | undefined;
   if (transitioningToEstimateSent) {
     const { lead: existing } = await getLeadById(id, tenant.tenantId);
     if (!existing) {
@@ -76,16 +77,30 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
       }
       return NextResponse.json({ error: `This lead is already ${existing.status} and cannot be marked Estimate Sent.` }, { status: 409 });
     }
+    // Compare-and-swap: only apply this write if the lead's status in
+    // Supabase still matches what was just validated against — see
+    // lib/leads/supabase.ts::updateLeadInDb's doc comment. Prevents a
+    // concurrent request that closes the lead (Won/Lost/Completed) between
+    // the read above and this write from being silently overwritten back
+    // to "Estimate Sent" (Codex review finding on PR #23).
+    expectedCurrentStatus = existing.status;
   }
 
-  let updatedLead = await updateLead(id, payload, tenant.tenantId);
+  let updatedLead = await updateLead(id, payload, tenant.tenantId, transitioningToEstimateSent ? { expectedCurrentStatus } : {});
 
-  // Lead exists in Google Sheets but not yet in Supabase — shadow-write it into this tenant
   if (!updatedLead) {
-    const { lead: sourceLead } = await getLeadById(id, tenant.tenantId);
+    const { lead: sourceLead, source: sourceLeadSource } = await getLeadById(id, tenant.tenantId);
     if (!sourceLead) {
       return NextResponse.json({ error: "Lead not found" }, { status: 404 });
     }
+    if (transitioningToEstimateSent && sourceLeadSource === "supabase") {
+      // The lead DOES exist in Supabase — the CAS write above matched zero
+      // rows because its status changed concurrently since validation, not
+      // because it needs a Google-Sheets shadow-write. Refuse rather than
+      // silently applying a stale transition.
+      return NextResponse.json({ error: "This lead's status changed since you loaded it — please refresh and try again." }, { status: 409 });
+    }
+    // Lead exists in Google Sheets but not yet in Supabase — shadow-write it into this tenant
     updatedLead = await createLead({ ...sourceLead, ...payload, id }, tenant.tenantId);
   }
 

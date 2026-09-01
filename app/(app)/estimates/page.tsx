@@ -4,7 +4,6 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import { Wallet, Send, Clock, MessageSquareReply, Sparkles, Trophy, XCircle, Bot } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
-import { getLeads } from "@/lib/leads/repository";
 import { getEstimateLifecycleReadModel } from "@/lib/leads/estimateLifecycleReadModel";
 import type { EstimateLifecycleDiagnosticCode } from "@/lib/leads/estimateLifecycleReadModel";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -60,10 +59,7 @@ export default async function EstimatesPage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [model, { leads: allLeads }] = await Promise.all([getEstimateLifecycleReadModel(tenant.tenantId), getLeads(tenant.tenantId)]);
-
-  const won = allLeads.filter((lead) => lead.status === "Won").length;
-  const lost = allLeads.filter((lead) => lead.status === "Lost").length;
+  const model = await getEstimateLifecycleReadModel(tenant.tenantId);
 
   const diagnosticsByCode = new Map<EstimateLifecycleDiagnosticCode, string[]>();
   for (const diag of model.diagnostics) {
@@ -95,8 +91,8 @@ export default async function EstimatesPage() {
             tone={model.stalledEligible > 0 ? "warning" : "default"}
             href="/agentic/estimate-closing"
           />
-          <MetricCard label="Won" value={won} icon={<Trophy className="h-4 w-4" />} />
-          <MetricCard label="Lost" value={lost} icon={<XCircle className="h-4 w-4" />} />
+          <MetricCard label="Won" value={model.won} helpText="Estimate-backed wins only" icon={<Trophy className="h-4 w-4" />} />
+          <MetricCard label="Lost" value={model.lost} helpText="Estimate-backed losses only" icon={<XCircle className="h-4 w-4" />} />
         </div>
       </section>
 

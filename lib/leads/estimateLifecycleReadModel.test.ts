@@ -61,6 +61,8 @@ describe("computeEstimateLifecycleReadModel — zero state", () => {
       stopped: 0,
       stalledEligible: 0,
       openEstimateValue: 0,
+      won: 0,
+      lost: 0,
       diagnostics: [],
       leads: [],
     });
@@ -94,6 +96,40 @@ describe("computeEstimateLifecycleReadModel — totals", () => {
     expect(model.replied).toBe(1);
     expect(model.completedDay7).toBe(1);
     expect(model.stopped).toBe(1);
+  });
+
+  it("excludes an active sequence whose lead has moved off Estimate Sent from activeFollowupSequences (Codex review finding on PR #23) — it can never become Shadow-eligible, so counting it would make buildShadowReadinessLines' claim false", () => {
+    const leads = [makeLead("l1", "Contacted")]; // reverted by hand after being sent
+    const sequences = [makeSequence("s1", "l1", { status: "active" })];
+    const model = computeEstimateLifecycleReadModel(leads, sequences, NOW);
+    expect(model.activeFollowupSequences).toBe(0);
+    expect(model.diagnostics).toContainEqual({ code: "sequence_without_estimate_sent_status", leadId: "l1", sequenceId: "s1" });
+  });
+
+  it("excludes an active sequence whose lead is now terminal (Won/Lost/Completed but not yet stopped) from activeFollowupSequences", () => {
+    const leads = [makeLead("l1", "Won")];
+    const sequences = [makeSequence("s1", "l1", { status: "active" })];
+    const model = computeEstimateLifecycleReadModel(leads, sequences, NOW);
+    expect(model.activeFollowupSequences).toBe(0);
+  });
+
+  it("counts won/lost only for leads that are actually estimate-backed (have/had a follow-up sequence) — never a lead that reached Won/Lost with no tracked estimate (Codex review finding on PR #23)", () => {
+    const leads = [
+      makeLead("l1", "Won"), // estimate-backed: has a sequence
+      makeLead("l2", "Won"), // NOT estimate-backed: no sequence at all (e.g. New -> Won directly)
+      makeLead("l3", "Lost"), // estimate-backed
+      makeLead("l4", "Lost"), // NOT estimate-backed
+    ];
+    const sequences = [makeSequence("s1", "l1", { status: "stopped" }), makeSequence("s3", "l3", { status: "stopped" })];
+    const model = computeEstimateLifecycleReadModel(leads, sequences, NOW);
+    expect(model.won).toBe(1);
+    expect(model.lost).toBe(1);
+  });
+
+  it("counts an estimate-backed won/lost lead regardless of its sequence's own terminal sub-status", () => {
+    const leads = [makeLead("l1", "Won")];
+    const model = computeEstimateLifecycleReadModel(leads, [makeSequence("s1", "l1", { status: "completed" })], NOW);
+    expect(model.won).toBe(1);
   });
 
   it("never conflates estimate value with revenue — openEstimateValue is a plain sum, not a claimed outcome", () => {

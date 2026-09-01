@@ -7,7 +7,19 @@ import { LEAD_STATUSES, STATUS_STYLES, normalizeStatus } from "@/components/ui/S
 import { Button } from "@/components/ui/Button";
 import { Input, Label, Textarea, FieldError } from "@/components/ui/Field";
 
-export default function LeadEditForm({ lead, followupEnabled }: { lead: PlumbingLead; followupEnabled: boolean }) {
+/**
+ * "unknown" is deliberately distinct from "disabled": it means the tenant's
+ * automation setting could not be confirmed right now (a genuine query/RLS
+ * error), NOT that it's confirmed off — never collapsed together, since a
+ * later cron run reads the real setting regardless of what this page could
+ * show (Codex review finding on PR #23). Inlined here (not imported from
+ * lib/modules/estimateFollowup/service.ts) to keep this "use client"
+ * component's props boundary free of any transitive next/headers import,
+ * matching this repo's established reviewTypes.ts-style precedent.
+ */
+type FollowupAutomationStatus = "enabled" | "disabled" | "unknown";
+
+export default function LeadEditForm({ lead, followupStatus }: { lead: PlumbingLead; followupStatus: FollowupAutomationStatus }) {
   const router = useRouter();
 
   const [status, setStatus] = useState<LeadStatus>(normalizeStatus(lead.status));
@@ -80,9 +92,11 @@ export default function LeadEditForm({ lead, followupEnabled }: { lead: Plumbing
           </select>
           {status === "Estimate Sent" && (
             <p className="mt-1.5 text-xs text-ink-500">
-              {followupEnabled
+              {followupStatus === "enabled"
                 ? "This enrolls the customer in your Day 1/3/7 follow-up — automated SMS may be sent unless they reply or the status changes."
-                : "Your Estimate Follow-up automation is currently OFF for this account — no automated messages will be sent."}
+                : followupStatus === "disabled"
+                  ? "Your Estimate Follow-up automation is currently OFF for this account — no automated messages will be sent."
+                  : "We couldn't confirm your Follow-up automation status right now — check Settings before assuming messages will or won't send."}
             </p>
           )}
         </div>

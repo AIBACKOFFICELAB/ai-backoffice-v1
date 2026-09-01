@@ -35,6 +35,30 @@ export async function getEstimateFollowupSettings(tenantId: string): Promise<Est
   };
 }
 
+export type FollowupAutomationStatus = "enabled" | "disabled" | "unknown";
+
+/**
+ * P1 Sprint 4 — distinguishes "we genuinely know it's off" from "we don't
+ * know" (a real query/RLS error), unlike getEstimateFollowupSettings above,
+ * which deliberately collapses BOTH a query error and a missing settings
+ * row into the same `null` for its EXISTING callers (processSequence,
+ * recordReplyForPhone) — that collapse is the CORRECT fail-safe direction
+ * for a SENDING decision (never send when we can't confirm the setting).
+ * A UI claim about whether messages WILL be sent needs the opposite
+ * fail-safe direction: never confidently tell an owner "no automated
+ * messages will be sent" when the truth is merely unknown right now — a
+ * later cron run reads the real setting and may still send (Codex review
+ * finding on PR #23, P1). Used only by app/(app)/leads/[id]/page.tsx's
+ * display copy; every existing SENDING-decision call site is untouched.
+ */
+export async function getFollowupAutomationStatus(tenantId: string): Promise<FollowupAutomationStatus> {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase.from("estimate_followup_settings").select("enabled").eq("tenant_id", tenantId).maybeSingle();
+  if (error) return "unknown";
+  if (!data) return "disabled"; // no settings row for this tenant genuinely means the module has never been configured — the same fact processSequence's "module-disabled" skip reason reflects.
+  return data.enabled ? "enabled" : "disabled";
+}
+
 export async function updateEstimateFollowupSettings(tenantId: string, update: Partial<Omit<EstimateFollowupSettings, "tenantId">>) {
   const supabase = await createServerSupabaseClient();
   const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
