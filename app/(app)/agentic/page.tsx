@@ -1,6 +1,7 @@
 export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import { Bot, CircleCheck, Target, Sparkles, ShieldAlert } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
 import { PageHeader } from "@/components/ui/PageHeader";
@@ -106,7 +107,14 @@ export default async function AgenticActivityPage() {
                   : "Nothing is sent to customers. Every recommendation below is observation only."}
               </p>
             </div>
-            {estimateClosingAgentStatus === "active" && estimateClosingShadowEnabled && <AIStatusBadge mode="shadow" />}
+            <div className="flex items-center gap-3">
+              {estimateClosingAgentStatus === "active" && estimateClosingShadowEnabled && <AIStatusBadge mode="shadow" />}
+              {estimateClosingAgentStatus !== "not_registered" && (
+                <Link href="/agentic/estimate-closing" className="text-sm font-semibold text-brand-700 hover:text-brand-800">
+                  Open workspace &rarr;
+                </Link>
+              )}
+            </div>
           </div>
         </CardHeader>
         <CardBody>

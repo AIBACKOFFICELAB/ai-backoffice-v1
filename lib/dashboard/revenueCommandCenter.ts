@@ -17,6 +17,7 @@ import {
   EstimateClosingRecommendationSummary,
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
+import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateClosing/evaluationReadModel";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -111,6 +112,11 @@ export type RevenueCommandCenterData = {
    * bounded recent window, not a lifetime total, and why they must never
    * be presented as recovered/won revenue. */
   estimateClosingSummary: EstimateClosingRecommendationSummary;
+  /** P1 Sprint 3 — how many of the (bounded) recent recommendations the
+   * owner has already reviewed. Powers the "Review Shadow intelligence"
+   * link into /agentic/estimate-closing; the dashboard itself stays a
+   * thin summary, not an evaluation console (P1 Sprint 3 directive §10). */
+  estimateClosingRecommendationsReviewed: number;
 };
 
 /** Exported for unit testing (dashboard/attention.test.ts) — the same
@@ -144,6 +150,7 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     directRevenueRecoveredUsd,
     stalledEvents,
     recommendationsResult,
+    reviewsResult,
   ] = await Promise.all([
     getLeads(tenantId),
     getMissedCallAnalytics(tenantId),
@@ -158,6 +165,11 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     // is safely excluded rather than trusted or crashing the page. See
     // recommendationReadModel.ts.
     listEstimateClosingRecommendations(tenantId),
+    // P1 Sprint 3 — bounded review-count only; the dashboard links to
+    // /agentic/estimate-closing for the full evaluation console rather
+    // than duplicating it here (directive §10: "Do not make Dashboard a
+    // giant evaluation console").
+    listEstimateClosingRecommendationReviews(tenantId),
   ]);
 
   const metrics = buildLeadMetrics(leads);
@@ -296,5 +308,6 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     estimateClosingAgentStatus,
     estimateClosingShadowEnabled,
     estimateClosingSummary,
+    estimateClosingRecommendationsReviewed: reviewsResult.reviews.length,
   };
 }
