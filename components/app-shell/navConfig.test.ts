@@ -14,6 +14,7 @@ describe("resolveNavGroups", () => {
     expect(hrefs).toContain("/lead-inbox");
     expect(hrefs).toContain("/follow-ups");
     expect(hrefs).toContain("/agentic");
+    expect(hrefs).toContain("/approvals");
     expect(hrefs).toContain("/prospects");
     expect(hrefs).toContain("/review-requests");
   });
@@ -29,6 +30,7 @@ describe("resolveNavGroups", () => {
     expect(hrefs).toContain("/lead-inbox");
     expect(hrefs).toContain("/follow-ups");
     expect(hrefs).toContain("/agentic");
+    expect(hrefs).toContain("/approvals");
     expect(hrefs).toContain("/prospects");
     expect(hrefs).toContain("/review-requests");
   });
@@ -39,6 +41,7 @@ describe("resolveNavGroups", () => {
       "/lead-inbox",
       "/follow-ups",
       "/agentic",
+      "/approvals",
       "/prospects",
       "/review-requests",
       "/settings",
@@ -105,6 +108,7 @@ describe("Server -> Client boundary serializability (production hotfix, digest 1
     "target",
     "star",
     "settings",
+    "shield",
   ]);
 
   /**
