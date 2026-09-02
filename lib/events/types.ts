@@ -90,6 +90,18 @@ export const KNOWN_EVENT_TYPES = [
    * lib/agents/estimateClosing/review.ts, the only writer. Enumerated
    * feedback only: verdict/wouldAct/reasonCodes, no free text, no PII. */
   "estimate.closing_recommendation_reviewed",
+  /** P1 Sprint 5: durable, tenant-scoped OPERATIONAL heartbeat for the
+   * Estimate Closing scan cron — emitted once per relevant (registered AND
+   * active) tenant every time the scan actually runs, INCLUDING a tenant
+   * with zero candidates that sweep. Closes the "cron ran and found
+   * nothing" vs. "cron never ran" observability gap — never an agent run,
+   * never a recommendation, never an outcome. See
+   * lib/agents/estimateClosing/scanTelemetry.ts, the only writer. */
+  "estimate.closing_scan_completed",
+  /** P1 Sprint 5: sanitized, tenant-scoped record of a SCAN-level failure
+   * (the candidate read itself threw) — a fixed error category only, never
+   * raw error text. See lib/agents/estimateClosing/scanTelemetry.ts. */
+  "estimate.closing_scan_failed",
   "job.created",
   "job.completed",
   "invoice.created",

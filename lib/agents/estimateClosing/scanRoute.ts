@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runEstimateClosingShadowSweep } from "./stalledScan";
+import { runEstimateClosingShadowSweepWithTelemetry } from "./stalledScan";
 import { isEstimateClosingShadowEnabled } from "./featureFlag";
 
 /**
@@ -40,12 +40,12 @@ export function isAuthorizedCron(request: NextRequest): boolean {
 
 export type ScanRouteDeps = {
   isEnabled?: () => boolean;
-  runSweep?: typeof runEstimateClosingShadowSweep;
+  runSweep?: typeof runEstimateClosingShadowSweepWithTelemetry;
 };
 
 export async function handleScanRequest(request: NextRequest, deps: ScanRouteDeps = {}): Promise<NextResponse> {
   const isEnabled = deps.isEnabled ?? isEstimateClosingShadowEnabled;
-  const runSweep = deps.runSweep ?? runEstimateClosingShadowSweep;
+  const runSweep = deps.runSweep ?? runEstimateClosingShadowSweepWithTelemetry;
 
   if (!isAuthorizedCron(request)) {
     return NextResponse.json({ ok: false, reason: "unauthorized" }, { status: 401 });
@@ -55,7 +55,23 @@ export async function handleScanRequest(request: NextRequest, deps: ScanRouteDep
     return NextResponse.json({ ok: true, fired: false, reason: "estimate_closing_shadow_disabled" });
   }
 
+  // P1 Sprint 5: the sweep itself now records durable, tenant-scoped scan
+  // telemetry (see stalledScan.ts::runEstimateClosingShadowSweepWithTelemetry
+  // and scanTelemetry.ts) — this route's own job stays exactly what it was:
+  // authorize, gate on the feature flag, run the sweep, report a bounded,
+  // PII-free HTTP summary. Telemetry recording can never turn a real scan
+  // failure into an HTTP success (result.ok reflects the SCAN's own
+  // success/failure, never telemetry's) and can never turn a real success
+  // into a failure (a telemetry write failure surfaces only as
+  // telemetryWriteFailures > 0 on an otherwise-`ok: true` response).
   const result = await runSweep();
+
+  if (!result.ok) {
+    return NextResponse.json(
+      { ok: false, fired: true, scanId: result.scanId, errorCategory: result.errorCategory, telemetryWriteFailures: result.telemetryWriteFailures },
+      { status: 500 }
+    );
+  }
 
   // Deliberately summary-only: no rationale, no recommendation payload
   // detail, no customer identifiers beyond what's already an id — this
@@ -64,10 +80,12 @@ export async function handleScanRequest(request: NextRequest, deps: ScanRouteDep
   return NextResponse.json({
     ok: true,
     fired: true,
-    candidatesScanned: result.scan.candidatesScanned,
-    stalledFound: result.scan.stalledFound,
-    newEventsThisSweep: result.scan.stalledCandidates.filter((c) => c.isNewEvent).length,
-    shadowAttempts: result.shadowOutcomes.length,
-    outcomes: result.shadowOutcomes.map(({ outcome }) => outcome.status),
+    scanId: result.scanId,
+    candidatesScanned: result.sweep.scan.candidatesScanned,
+    stalledFound: result.sweep.scan.stalledFound,
+    newEventsThisSweep: result.sweep.scan.stalledCandidates.filter((c) => c.isNewEvent).length,
+    shadowAttempts: result.sweep.shadowOutcomes.length,
+    outcomes: result.sweep.shadowOutcomes.map(({ outcome }) => outcome.status),
+    telemetryWriteFailures: result.telemetryWriteFailures,
   });
 }

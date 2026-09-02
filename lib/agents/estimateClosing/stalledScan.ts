@@ -1,3 +1,4 @@
+import { randomUUID } from "crypto";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { emitEvent } from "@/lib/events/service";
 import { BusinessEventStore, SupabaseBusinessEventStore } from "@/lib/events/store";
@@ -5,6 +6,15 @@ import { isEstimateStalled } from "./eligibility";
 import { triggerEstimateClosingShadow, EstimateClosingShadowDeps, EstimateClosingShadowOutcome } from "./shadowRunner";
 import { EstimateClosingLeadContext, EstimateFollowupSequenceContext } from "./types";
 import { LeadStatus } from "@/data/leadModel";
+import { AgentStore, SupabaseAgentStore } from "../agentStore";
+import {
+  computeTenantScanSummaries,
+  emitScanCompletedTelemetry,
+  emitScanFailedTelemetry,
+  categorizeScanFailure,
+  TenantScanSummary,
+  ScanTelemetryDeps,
+} from "./scanTelemetry";
 
 /**
  * P1A trigger layer — finds stalled estimates and wires them into the
@@ -114,6 +124,13 @@ export type StalledEmission = {
 
 export type StalledScanResult = {
   candidatesScanned: number;
+  /** P1 Sprint 5 — the same global `candidatesScanned` total, broken down
+   * by tenant. Purely a derived summary computed from the same loop that
+   * already iterates `candidates` below — zero extra reads, and never used
+   * to change candidate selection or stall determination. Exists so scan
+   * TELEMETRY (scanTelemetry.ts) can report a truthful per-tenant
+   * candidate count, including a tenant whose count is legitimately zero. */
+  candidatesScannedByTenant: Record<string, number>;
   stalledFound: number;
   /** Every currently-stalled candidate, whether its estimate.stalled event
    * was newly emitted by this run or already existed from a previous one.
@@ -143,9 +160,11 @@ export async function scanForStalledEstimates(deps: StalledScanDeps = {}): Promi
 
   const candidates = await reader.listCandidates();
   const stalledCandidates: StalledEmission[] = [];
+  const candidatesScannedByTenant: Record<string, number> = {};
   let stalledFound = 0;
 
   for (const { sequence, lead } of candidates) {
+    candidatesScannedByTenant[sequence.tenantId] = (candidatesScannedByTenant[sequence.tenantId] ?? 0) + 1;
     if (!isEstimateStalled({ tenantId: sequence.tenantId, lead, sequence }, now)) continue;
     stalledFound += 1;
 
@@ -174,7 +193,7 @@ export async function scanForStalledEstimates(deps: StalledScanDeps = {}): Promi
     stalledCandidates.push({ tenantId: sequence.tenantId, eventId: event.id, lead, sequence, isNewEvent: !deduped });
   }
 
-  return { candidatesScanned: candidates.length, stalledFound, stalledCandidates };
+  return { candidatesScanned: candidates.length, candidatesScannedByTenant, stalledFound, stalledCandidates };
 }
 
 export type ShadowSweepResult = {
@@ -206,4 +225,81 @@ export async function runEstimateClosingShadowSweep(
   }
 
   return { scan, shadowOutcomes };
+}
+
+export type RunSweepWithTelemetryDeps = {
+  agentStore?: Pick<AgentStore, "listActiveByType">;
+  runSweep?: typeof runEstimateClosingShadowSweep;
+  telemetry?: ScanTelemetryDeps;
+  /** Injectable clock for deterministic duration assertions in tests. */
+  now?: () => number;
+};
+
+export type ScanSweepWithTelemetryResult =
+  | {
+      ok: true;
+      scanId: string;
+      sweep: ShadowSweepResult;
+      tenantSummaries: TenantScanSummary[];
+      telemetryWriteFailures: number;
+    }
+  | {
+      ok: false;
+      scanId: string;
+      errorCategory: ReturnType<typeof categorizeScanFailure>;
+      /** null when the relevant-tenant set itself could not be resolved —
+       * see the doc comment below on why NO failure telemetry is attempted
+       * in that case (Gate 8: never pretend a failure event can always be
+       * persisted). */
+      telemetryWriteFailures: number | null;
+    };
+
+/**
+ * P1 Sprint 5 — wraps the EXISTING, UNCHANGED runEstimateClosingShadowSweep
+ * with durable scan telemetry. This function is entirely NEW; it never
+ * alters candidate selection, stall determination, event idempotency,
+ * eligibility, retry behavior, or model-call behavior — it only observes
+ * the existing sweep's own result and records a summary of it. Never
+ * throws: every failure mode (including one this function cannot safely
+ * record telemetry for) is reported through the discriminated return type,
+ * so app/api/agents/estimate-closing/scan/route.ts can decide the HTTP
+ * response without a try/catch of its own.
+ */
+export async function runEstimateClosingShadowSweepWithTelemetry(
+  scanDeps: StalledScanDeps = {},
+  shadowDeps: EstimateClosingShadowDeps = {},
+  deps: RunSweepWithTelemetryDeps = {}
+): Promise<ScanSweepWithTelemetryResult> {
+  const agentStore = deps.agentStore ?? new SupabaseAgentStore();
+  const runSweep = deps.runSweep ?? runEstimateClosingShadowSweep;
+  const now = deps.now ?? (() => Date.now());
+  const scanId = randomUUID();
+  const startedAt = now();
+
+  let relevantTenantIds: string[];
+  try {
+    const relevantAgents = await agentStore.listActiveByType("estimate_closing");
+    relevantTenantIds = relevantAgents.map((a) => a.tenantId);
+  } catch (error) {
+    // Cannot even identify which tenants are relevant — there is no safe
+    // tenant to attempt failure telemetry for (Gate 8: "if the underlying
+    // DB/event system itself is unavailable, do not pretend a failure
+    // event can always be persisted"). telemetryWriteFailures is `null`,
+    // not 0, so a caller can tell "zero attempted because none were
+    // possible" apart from "attempted N, all failed."
+    return { ok: false, scanId, errorCategory: categorizeScanFailure(error), telemetryWriteFailures: null };
+  }
+
+  try {
+    const sweep = await runSweep(scanDeps, shadowDeps);
+    const durationMs = now() - startedAt;
+    const tenantSummaries = computeTenantScanSummaries(sweep.scan, sweep.shadowOutcomes, relevantTenantIds);
+    const writeResults = await emitScanCompletedTelemetry(scanId, tenantSummaries, durationMs, deps.telemetry);
+    return { ok: true, scanId, sweep, tenantSummaries, telemetryWriteFailures: writeResults.filter((r) => !r.ok).length };
+  } catch (error) {
+    const durationMs = now() - startedAt;
+    const errorCategory = categorizeScanFailure(error);
+    const writeResults = await emitScanFailedTelemetry(scanId, relevantTenantIds, errorCategory, durationMs, deps.telemetry);
+    return { ok: false, scanId, errorCategory, telemetryWriteFailures: writeResults.filter((r) => !r.ok).length };
+  }
 }

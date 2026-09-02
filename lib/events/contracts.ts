@@ -117,6 +117,65 @@ function validateReviewPayloadShape(payload: unknown): EventPayloadValidation {
  * already reserved in lib/events/types.ts's KNOWN_EVENT_TYPES since P0 but
  * never actually emitted until this sprint.
  */
+
+const SCAN_COMPLETED_NUMERIC_FIELDS = [
+  "candidatesScanned",
+  "stalledFound",
+  "newlyStalled",
+  "shadowAttempts",
+  "succeeded",
+  "alreadyProcessed",
+  "skipped",
+  "failed",
+] as const;
+
+/**
+ * P1 Sprint 5 — strict shape check for the scan-completed operational
+ * heartbeat (see lib/agents/estimateClosing/scanTelemetry.ts, the only
+ * writer). Every count field must be a genuine non-negative number — never
+ * silently coerced — and reuses forbidRawEstimatePii as defense in depth,
+ * even though this payload's own fields could never legitimately carry any
+ * of those (a scan-telemetry payload has no path to a customer record at
+ * all).
+ */
+function validateScanCompletedPayloadShape(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  if (typeof payload.scanId !== "string" || !payload.scanId) {
+    return { ok: false, errors: ["payload must include scanId"] };
+  }
+  for (const field of SCAN_COMPLETED_NUMERIC_FIELDS) {
+    const value = payload[field];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      return { ok: false, errors: [`payload.${field} must be a non-negative number`] };
+    }
+  }
+  if (payload.durationMs !== null && (typeof payload.durationMs !== "number" || !Number.isFinite(payload.durationMs) || payload.durationMs < 0)) {
+    return { ok: false, errors: ["payload.durationMs must be null or a non-negative number"] };
+  }
+  return forbidRawEstimatePii(payload);
+}
+
+/**
+ * P1 Sprint 5 — strict shape check for the scan-failed telemetry event.
+ * `errorCategory` is a fixed, bounded taxonomy string (see
+ * ScanFailureCategory in scanTelemetry.ts) — this check only confirms it is
+ * a non-empty string, not a specific enum, so a future category never needs
+ * a contract change; the taxonomy itself is enforced in code, not here.
+ */
+function validateScanFailedPayloadShape(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  if (typeof payload.scanId !== "string" || !payload.scanId) {
+    return { ok: false, errors: ["payload must include scanId"] };
+  }
+  if (typeof payload.errorCategory !== "string" || !payload.errorCategory) {
+    return { ok: false, errors: ["payload must include errorCategory"] };
+  }
+  if (payload.durationMs !== null && (typeof payload.durationMs !== "number" || !Number.isFinite(payload.durationMs) || payload.durationMs < 0)) {
+    return { ok: false, errors: ["payload.durationMs must be null or a non-negative number"] };
+  }
+  return forbidRawEstimatePii(payload);
+}
+
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "call.missed": {
     eventType: "call.missed",
@@ -192,6 +251,23 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
     // original row rather than creating a second one.
     idempotency: "required",
     validatePayload: validateReviewPayloadShape,
+  },
+  "estimate.closing_scan_completed": {
+    eventType: "estimate.closing_scan_completed",
+    schemaVersion: 1,
+    // Not applicable: each scan invocation is its own genuine observation,
+    // not a redeliverable external signal — unlike estimate.stalled (which
+    // MUST collapse a re-scan to the original event to avoid a duplicate
+    // model call), two real cron invocations producing two completed-scan
+    // records is correct, not a duplicate to be deduped.
+    idempotency: "not_applicable",
+    validatePayload: validateScanCompletedPayloadShape,
+  },
+  "estimate.closing_scan_failed": {
+    eventType: "estimate.closing_scan_failed",
+    schemaVersion: 1,
+    idempotency: "not_applicable",
+    validatePayload: validateScanFailedPayloadShape,
   },
 };
 
