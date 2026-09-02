@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   scanForStalledEstimates,
   runEstimateClosingShadowSweep,
+  runEstimateClosingShadowSweepWithTelemetry,
   InMemorySequenceWithLeadReader,
   buildStalledIdempotencyKey,
 } from "./stalledScan";
@@ -244,5 +245,198 @@ describe("runEstimateClosingShadowSweep", () => {
     );
     expect(attempt2.shadowOutcomes[0].outcome.status).toBe("succeeded");
     expect((await runStore.listByTenant(TENANT_A)).length).toBe(1);
+  });
+});
+
+describe("runEstimateClosingShadowSweepWithTelemetry (P1 Sprint 5)", () => {
+  async function activeAgentStore(tenantId = TENANT_A) {
+    const agentStore = new InMemoryAgentStore();
+    await agentStore.create({
+      tenantId,
+      agentType: "estimate_closing",
+      name: "Estimate Closing Agent",
+      status: "active",
+      allowedTools: [],
+      readScopes: [],
+      writeScopes: [],
+    });
+    return agentStore;
+  }
+
+  it("active tenant + zero candidates creates exactly one durable estimate.closing_scan_completed record, and zero agent_run/model_invocation/recommendation/tool_call/approval/outcome", async () => {
+    const reader = new InMemorySequenceWithLeadReader([]); // zero candidates
+    const eventStore = new InMemoryBusinessEventStore();
+    const runStore = new InMemoryAgentRunStore();
+    const agentStore = await activeAgentStore();
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader, eventStore, now: NOW },
+      { agentStore, runStore, eventStore, isEnabled: () => true },
+      { agentStore, telemetry: { eventStore } }
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.sweep.scan.candidatesScanned).toBe(0);
+    expect(result.sweep.shadowOutcomes.length).toBe(0);
+    expect(result.tenantSummaries).toEqual([
+      { tenantId: TENANT_A, candidatesScanned: 0, stalledFound: 0, newlyStalled: 0, shadowAttempts: 0, succeeded: 0, alreadyProcessed: 0, skipped: 0, failed: 0 },
+    ]);
+    expect(result.telemetry).toEqual({ status: "recorded", attemptedTenantIds: [TENANT_A] });
+
+    const completedEvents = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_completed" });
+    expect(completedEvents.length).toBe(1);
+    expect(completedEvents[0].payload.candidatesScanned).toBe(0);
+    expect(completedEvents[0].correlationId).toBe(result.scanId);
+
+    // Structural zero-touch proof — nothing here has a store to create any
+    // of these in, but assert the counts explicitly regardless.
+    expect((await runStore.listByTenant(TENANT_A)).length).toBe(0);
+    const recommendationEvents = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_recommendation_generated" });
+    expect(recommendationEvents.length).toBe(0);
+  });
+
+  it("multi-tenant: an active tenant with zero candidates and an active tenant with a real stalled candidate each get their OWN isolated telemetry record in the same sweep", async () => {
+    const rowB = candidate({ lead: { tenantId: TENANT_B, id: "lead-b" }, sequence: { tenantId: TENANT_B, leadId: "lead-b", id: "seq-b" } });
+    const reader = new InMemorySequenceWithLeadReader([rowB]); // only tenant B has a candidate
+    const eventStore = new InMemoryBusinessEventStore();
+    const runStore = new InMemoryAgentRunStore();
+    const agentStore = new InMemoryAgentStore();
+    await agentStore.create({ tenantId: TENANT_A, agentType: "estimate_closing", name: "A", status: "active", allowedTools: [], readScopes: [], writeScopes: [] });
+    await agentStore.create({ tenantId: TENANT_B, agentType: "estimate_closing", name: "B", status: "active", allowedTools: [], readScopes: [], writeScopes: [] });
+    const gateway = new AiGateway({ chatProviders: { mock: new FixedTextProvider(VALID_RESPONSE) }, invocationStore: new InMemoryModelInvocationStore() });
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader, eventStore, now: NOW },
+      { agentStore, runStore, eventStore, gateway, isEnabled: () => true },
+      { agentStore, telemetry: { eventStore } }
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.tenantSummaries).not.toBeNull();
+    const byTenant = new Map((result.tenantSummaries ?? []).map((s) => [s.tenantId, s]));
+    expect(byTenant.get(TENANT_A)?.candidatesScanned).toBe(0);
+    expect(byTenant.get(TENANT_A)?.shadowAttempts).toBe(0);
+    expect(byTenant.get(TENANT_B)?.candidatesScanned).toBe(1);
+    expect(byTenant.get(TENANT_B)?.stalledFound).toBe(1);
+    expect(byTenant.get(TENANT_B)?.succeeded).toBe(1);
+
+    const completedA = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_completed" });
+    const completedB = await eventStore.listByTenant(TENANT_B, { eventType: "estimate.closing_scan_completed" });
+    expect(completedA.length).toBe(1);
+    expect(completedB.length).toBe(1);
+    expect(completedA[0].payload.candidatesScanned).toBe(0);
+    expect(completedB[0].payload.candidatesScanned).toBe(1);
+    expect(completedB[0].payload.succeeded).toBe(1);
+  });
+
+  it("a telemetry write failure does not re-run the scan, does not trigger a second model call, and does not convert a successful scan into a failure — reported as 'partial'", async () => {
+    const reader = new InMemorySequenceWithLeadReader([candidate()]);
+    const eventStore = new InMemoryBusinessEventStore();
+    const runStore = new InMemoryAgentRunStore();
+    const agentStore = await activeAgentStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new FixedTextProvider(VALID_RESPONSE) }, invocationStore: new InMemoryModelInvocationStore() });
+
+    // A telemetry-only event store whose insert always fails — the REAL
+    // scan/shadow path still uses the healthy `eventStore` above.
+    const failingTelemetryStore = new InMemoryBusinessEventStore();
+    vi.spyOn(failingTelemetryStore, "insert").mockRejectedValue(new Error("telemetry db unavailable"));
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader, eventStore, now: NOW },
+      { agentStore, runStore, eventStore, gateway, isEnabled: () => true },
+      { agentStore, telemetry: { eventStore: failingTelemetryStore } }
+    );
+
+    expect(result.ok).toBe(true); // the SCAN succeeded — telemetry failure never flips this
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.telemetry).toEqual({ status: "partial", attemptedTenantIds: [TENANT_A], failedTenantIds: [TENANT_A] });
+    expect(result.sweep.shadowOutcomes.length).toBe(1);
+    expect(result.sweep.shadowOutcomes[0].outcome.status).toBe("succeeded");
+    // Exactly one run, one recommendation — the failed telemetry write never
+    // caused a retry of the reasoning itself.
+    expect((await runStore.listByTenant(TENANT_A)).length).toBe(1);
+    const recommendationEvents = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_recommendation_generated" });
+    expect(recommendationEvents.length).toBe(1);
+  });
+
+  it("a genuine scan failure (candidate read throws) is reported as ok:false with a sanitized error category, and still attempts tenant-scoped failure telemetry for already-known relevant tenants", async () => {
+    const eventStore = new InMemoryBusinessEventStore();
+    const agentStore = await activeAgentStore();
+    const failingReader = { listCandidates: vi.fn().mockRejectedValue(new Error("[estimate-closing] stalled scan read failed: connection reset")) };
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader: failingReader, eventStore, now: NOW },
+      { eventStore, isEnabled: () => true },
+      { agentStore, telemetry: { eventStore } }
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errorCategory).toBe("read_failed");
+    expect(result.telemetry).toEqual({ status: "recorded", attemptedTenantIds: [TENANT_A] }); // one relevant tenant, one successful failure-telemetry write
+
+    const failedEvents = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_failed" });
+    expect(failedEvents.length).toBe(1);
+    expect(failedEvents[0].payload).toEqual({ scanId: result.scanId, errorCategory: "read_failed", durationMs: expect.any(Number) });
+  });
+
+  // --- Founder review, PR #24: TELEMETRY MUST NEVER GATE SHADOW EXECUTION ---
+
+  it("tenant-discovery failure + otherwise-successful scan: the sweep STILL runs exactly once, the successful Shadow outcome is preserved, and telemetry is honestly reported unavailable — never a fabricated tenant, never a blocked scan", async () => {
+    const reader = new InMemorySequenceWithLeadReader([candidate()]);
+    const eventStore = new InMemoryBusinessEventStore();
+    const runStore = new InMemoryAgentRunStore();
+    const agentStore = await activeAgentStore();
+    const gateway = new AiGateway({ chatProviders: { mock: new FixedTextProvider(VALID_RESPONSE) }, invocationStore: new InMemoryModelInvocationStore() });
+    const failingDiscoveryStore = { listActiveByType: vi.fn().mockRejectedValue(new Error("agents table unavailable")) };
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader, eventStore, now: NOW },
+      { agentStore, runStore, eventStore, gateway, isEnabled: () => true },
+      { agentStore: failingDiscoveryStore, telemetry: { eventStore } }
+    );
+
+    // The real Shadow scan ran and genuinely succeeded — a telemetry-only
+    // infrastructure failure (can't enumerate relevant tenants) must NEVER
+    // prevent the actual reasoning path from running or being reported.
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("expected ok");
+    expect(result.sweep.shadowOutcomes.length).toBe(1);
+    expect(result.sweep.shadowOutcomes[0].outcome.status).toBe("succeeded");
+    expect(result.tenantSummaries).toBeNull(); // nothing to compute per-tenant summaries from
+    expect(result.telemetry).toEqual({ status: "unavailable" });
+
+    // Exactly one run — proving the sweep was attempted exactly once, not
+    // retried because telemetry discovery failed first.
+    expect((await runStore.listByTenant(TENANT_A)).length).toBe(1);
+    const recommendationEvents = await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_recommendation_generated" });
+    expect(recommendationEvents.length).toBe(1);
+
+    // No fabricated telemetry event of either kind for any tenant.
+    expect((await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_completed" })).length).toBe(0);
+    expect((await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_failed" })).length).toBe(0);
+  });
+
+  it("tenant-discovery failure + a genuine scan failure: the scan still runs exactly once, its failure is preserved (never masked as success), and telemetry is honestly reported unavailable", async () => {
+    const eventStore = new InMemoryBusinessEventStore();
+    const failingReader = { listCandidates: vi.fn().mockRejectedValue(new Error("[estimate-closing] stalled scan read failed: connection reset")) };
+    const failingDiscoveryStore = { listActiveByType: vi.fn().mockRejectedValue(new Error("agents table unavailable")) };
+
+    const result = await runEstimateClosingShadowSweepWithTelemetry(
+      { reader: failingReader, eventStore, now: NOW },
+      { eventStore, isEnabled: () => true },
+      { agentStore: failingDiscoveryStore, telemetry: { eventStore } }
+    );
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected failure");
+    expect(result.errorCategory).toBe("read_failed"); // the SCAN's own failure category, not the discovery failure's
+    expect(result.telemetry).toEqual({ status: "unavailable" });
+    expect(failingReader.listCandidates).toHaveBeenCalledTimes(1); // the scan was genuinely attempted, exactly once
+
+    // No tenant is known, so no fabricated failure event anywhere.
+    expect((await eventStore.listByTenant(TENANT_A, { eventType: "estimate.closing_scan_failed" })).length).toBe(0);
   });
 });

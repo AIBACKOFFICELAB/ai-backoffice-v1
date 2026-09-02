@@ -103,6 +103,43 @@ agents, but nothing fabricates data for any of them today.
 - `lib/agents/runtime.test.ts` — an outcome recorded against a completed
   `agent_run`, closing the P0 exit-criteria chain.
 
+## Scan telemetry, recommendations, and owner reviews are NOT outcomes (P1 Sprint 5)
+
+P1 Sprint 5 adds durable scan telemetry (`estimate.closing_scan_completed`/
+`estimate.closing_scan_failed` — see `EVENT_SYSTEM.md`) and a first-
+recommendation evidence packet
+(`lib/agents/estimateClosing/recommendationEvidence.ts`). Neither writes,
+nor is ever conflated with, a canonical `outcomes` row:
+
+- **A scan-completed event** proves the scheduled scan invocation ran and
+  what it observed — an operational fact about the *system*, never a claim
+  about the *business*. It carries no `outcome_value`, no
+  `attribution_confidence`, and is never read by any outcome-summing code
+  path.
+- **A recommendation** (`estimate.closing_recommendation_generated`) proves
+  the model reasoned about a stalled estimate — this was already true since
+  P1 Sprint 2 (see "Wired into a real workflow" above) and remains
+  unchanged. `recommendation generated != customer acted != job won !=
+  revenue recovered`.
+- **An owner review** (`estimate.closing_recommendation_reviewed`, P1
+  Sprint 3) proves a human evaluated the recommendation's quality — this is
+  evaluation EVIDENCE, not evidence the recommendation was ever acted on.
+  The owner saying "would act" does not itself create `estimate_won`,
+  `estimate_reengaged`, or `revenue_recovered` — no code path in this
+  sprint, or any prior one, does that.
+
+The Recommendation Detail experience
+(`app/(app)/agentic/estimate-closing/recommendations/[eventId]/page.tsx`)
+makes this explicit with a restrained evidence ladder: *AI recommendation:
+RECORDED · Owner review: RECORDED/NOT YET · Customer response evidence: NOT
+OBSERVED · Revenue attribution: NOT ESTABLISHED*. This is evidence-STATE
+UX — it displays facts about what has and hasn't been observed, and
+creates or infers no outcome, ever. `opportunityValue` (the estimate's own
+dollar amount, carried through a recommendation) remains, as always, an
+observation of what AI noticed — never a claim of recovered or won
+revenue; nothing in this sprint changes that boundary or adds a new dollar
+figure anywhere.
+
 ## Deferred
 
 - No revenue dashboard yet (P1 — "Prove measurable business ROI with the

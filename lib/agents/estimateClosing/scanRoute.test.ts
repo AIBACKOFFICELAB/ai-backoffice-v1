@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { NextRequest } from "next/server";
 import { isAuthorizedCron, handleScanRequest } from "./scanRoute";
-import { ShadowSweepResult } from "./stalledScan";
+import { ScanSweepWithTelemetryResult } from "./stalledScan";
 
 const URL = "http://localhost/api/agents/estimate-closing/scan";
 
@@ -9,9 +9,12 @@ function requestWithHeaders(headers: Record<string, string> = {}) {
   return new NextRequest(URL, { headers });
 }
 
-const EMPTY_SWEEP_RESULT: ShadowSweepResult = {
-  scan: { candidatesScanned: 0, stalledFound: 0, stalledCandidates: [] },
-  shadowOutcomes: [],
+const EMPTY_SWEEP_RESULT: ScanSweepWithTelemetryResult = {
+  ok: true,
+  scanId: "scan-empty",
+  sweep: { scan: { candidatesScanned: 0, candidatesScannedByTenant: {}, stalledFound: 0, stalledCandidates: [] }, shadowOutcomes: [] },
+  tenantSummaries: [],
+  telemetry: { status: "recorded", attemptedTenantIds: [] },
 };
 
 describe("isAuthorizedCron", () => {
@@ -46,12 +49,12 @@ describe("isAuthorizedCron", () => {
   });
 });
 
-describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", () => {
+describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6, extended P1 Sprint 5)", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
   });
 
-  it("unauthorized request is denied (401) regardless of feature flag state", async () => {
+  it("unauthorized request is denied (401) regardless of feature flag state — zero DB/telemetry activity, the sweep function is never called", async () => {
     vi.stubEnv("CRON_SECRET", "s3cret");
     const runSweep = vi.fn();
     const res = await handleScanRequest(requestWithHeaders(), { isEnabled: () => true, runSweep });
@@ -69,7 +72,7 @@ describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", (
     expect(runSweep).not.toHaveBeenCalled();
   });
 
-  it("feature flag false -> returns before any scan/read/model/event work — the sweep function is never called", async () => {
+  it("feature flag false -> returns before any scan/read/model/event/telemetry work — the sweep function is never called", async () => {
     vi.stubEnv("CRON_SECRET", "s3cret");
     const runSweep = vi.fn();
     const res = await handleScanRequest(requestWithHeaders({ authorization: "Bearer s3cret" }), { isEnabled: () => false, runSweep });
@@ -80,7 +83,7 @@ describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", (
     expect(runSweep).not.toHaveBeenCalled();
   });
 
-  it("feature flag true -> calls the sweep exactly once and reports its result", async () => {
+  it("feature flag true -> calls the sweep exactly once and reports its result, including the scanId and telemetry write count", async () => {
     vi.stubEnv("CRON_SECRET", "s3cret");
     const runSweep = vi.fn().mockResolvedValue(EMPTY_SWEEP_RESULT);
     const res = await handleScanRequest(requestWithHeaders({ authorization: "Bearer s3cret" }), { isEnabled: () => true, runSweep });
@@ -90,66 +93,77 @@ describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", (
     const body = await res.json();
     expect(body.ok).toBe(true);
     expect(body.fired).toBe(true);
+    expect(body.scanId).toBe("scan-empty");
+    expect(body.telemetryStatus).toBe("recorded");
   });
 
   it("response is summary-only and PII-safe — only bounded counts/statuses, never recommendation detail, rationale, or customer identifiers", async () => {
     vi.stubEnv("CRON_SECRET", "s3cret");
-    const sweepResult: ShadowSweepResult = {
-      scan: {
-        candidatesScanned: 5,
-        stalledFound: 2,
-        stalledCandidates: [
+    const sweepResult: ScanSweepWithTelemetryResult = {
+      ok: true,
+      scanId: "scan-1",
+      sweep: {
+        scan: {
+          candidatesScanned: 5,
+          candidatesScannedByTenant: { "tenant-1": 5 },
+          stalledFound: 2,
+          stalledCandidates: [
+            {
+              tenantId: "tenant-1",
+              eventId: "evt-1",
+              isNewEvent: true,
+              lead: { id: "lead-1", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 4200, serviceType: "Repipe", leadSource: "Google", urgency: "This Week" },
+              sequence: { id: "seq-1", tenantId: "tenant-1", leadId: "lead-1", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            },
+            {
+              tenantId: "tenant-1",
+              eventId: "evt-2",
+              isNewEvent: false,
+              lead: { id: "lead-2", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 900, serviceType: "Drain Cleaning", leadSource: "Referral", urgency: "Flexible" },
+              sequence: { id: "seq-2", tenantId: "tenant-1", leadId: "lead-2", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            },
+          ],
+        },
+        shadowOutcomes: [
           {
-            tenantId: "tenant-1",
-            eventId: "evt-1",
-            isNewEvent: true,
-            lead: { id: "lead-1", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 4200, serviceType: "Repipe", leadSource: "Google", urgency: "This Week" },
-            sequence: { id: "seq-1", tenantId: "tenant-1", leadId: "lead-1", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            emission: {
+              tenantId: "tenant-1",
+              eventId: "evt-1",
+              isNewEvent: true,
+              lead: { id: "lead-1", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 4200, serviceType: "Repipe", leadSource: "Google", urgency: "This Week" },
+              sequence: { id: "seq-1", tenantId: "tenant-1", leadId: "lead-1", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            },
+            outcome: {
+              status: "succeeded",
+              agentRunId: "run-1",
+              recommendationEventId: "evt-3",
+              recommendation: {
+                recommendation: "follow_up",
+                confidence: 0.7,
+                reasonCodes: ["no_response_since_sent"],
+                suggestedChannel: "sms",
+                suggestedTiming: "within_24_hours",
+                opportunityValue: 4200,
+                rationaleLength: 250,
+              },
+            },
           },
           {
-            tenantId: "tenant-1",
-            eventId: "evt-2",
-            isNewEvent: false,
-            lead: { id: "lead-2", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 900, serviceType: "Drain Cleaning", leadSource: "Referral", urgency: "Flexible" },
-            sequence: { id: "seq-2", tenantId: "tenant-1", leadId: "lead-2", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            emission: {
+              tenantId: "tenant-1",
+              eventId: "evt-2",
+              isNewEvent: false,
+              lead: { id: "lead-2", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 900, serviceType: "Drain Cleaning", leadSource: "Referral", urgency: "Flexible" },
+              sequence: { id: "seq-2", tenantId: "tenant-1", leadId: "lead-2", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
+            },
+            outcome: { status: "skipped", reason: "already_processed" },
           },
         ],
       },
-      shadowOutcomes: [
-        {
-          emission: {
-            tenantId: "tenant-1",
-            eventId: "evt-1",
-            isNewEvent: true,
-            lead: { id: "lead-1", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 4200, serviceType: "Repipe", leadSource: "Google", urgency: "This Week" },
-            sequence: { id: "seq-1", tenantId: "tenant-1", leadId: "lead-1", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
-          },
-          outcome: {
-            status: "succeeded",
-            agentRunId: "run-1",
-            recommendationEventId: "evt-3",
-            recommendation: {
-              recommendation: "follow_up",
-              confidence: 0.7,
-              reasonCodes: ["no_response_since_sent"],
-              suggestedChannel: "sms",
-              suggestedTiming: "within_24_hours",
-              opportunityValue: 4200,
-              rationaleLength: 250,
-            },
-          },
-        },
-        {
-          emission: {
-            tenantId: "tenant-1",
-            eventId: "evt-2",
-            isNewEvent: false,
-            lead: { id: "lead-2", tenantId: "tenant-1", status: "Estimate Sent", estimateAmount: 900, serviceType: "Drain Cleaning", leadSource: "Referral", urgency: "Flexible" },
-            sequence: { id: "seq-2", tenantId: "tenant-1", leadId: "lead-2", status: "active", estimateSentAt: "2026-08-01T00:00:00.000Z", day7DueAt: "2026-08-08T00:00:00.000Z", lastReplyAt: null },
-          },
-          outcome: { status: "skipped", reason: "already_processed" },
-        },
+      tenantSummaries: [
+        { tenantId: "tenant-1", candidatesScanned: 5, stalledFound: 2, newlyStalled: 1, shadowAttempts: 2, succeeded: 1, alreadyProcessed: 1, skipped: 0, failed: 0 },
       ],
+      telemetry: { status: "recorded", attemptedTenantIds: ["tenant-1"] },
     };
     const runSweep = vi.fn().mockResolvedValue(sweepResult);
     const res = await handleScanRequest(requestWithHeaders({ authorization: "Bearer s3cret" }), { isEnabled: () => true, runSweep });
@@ -158,11 +172,13 @@ describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", (
     expect(body).toEqual({
       ok: true,
       fired: true,
+      scanId: "scan-1",
       candidatesScanned: 5,
       stalledFound: 2,
       newEventsThisSweep: 1,
       shadowAttempts: 2,
       outcomes: ["succeeded", "skipped"],
+      telemetryStatus: "recorded",
     });
 
     // Explicitly assert nothing customer-identifying, no rationale, and no
@@ -174,5 +190,32 @@ describe("handleScanRequest — fail-closed feature gating (P1 Sprint 2 §6)", (
     expect(serialized).not.toContain("rationale");
     expect(serialized).not.toContain("reasonCodes");
     expect(serialized).not.toContain("opportunityValue");
+  });
+
+  it("a genuine scan failure preserves HTTP failure semantics — a 500, not a disguised 200 — and surfaces the sanitized error category", async () => {
+    vi.stubEnv("CRON_SECRET", "s3cret");
+    const failureResult: ScanSweepWithTelemetryResult = {
+      ok: false,
+      scanId: "scan-fail-1",
+      errorCategory: "read_failed",
+      telemetry: { status: "recorded", attemptedTenantIds: ["tenant-1"] },
+    };
+    const runSweep = vi.fn().mockResolvedValue(failureResult);
+    const res = await handleScanRequest(requestWithHeaders({ authorization: "Bearer s3cret" }), { isEnabled: () => true, runSweep });
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body).toEqual({ ok: false, fired: true, scanId: "scan-fail-1", errorCategory: "read_failed", telemetryStatus: "recorded" });
+  });
+
+  it("a scan failure where even the relevant-tenant set couldn't be resolved still returns an HTTP failure, with telemetryStatus reported as 'unavailable' rather than a fabricated tenant", async () => {
+    vi.stubEnv("CRON_SECRET", "s3cret");
+    const failureResult: ScanSweepWithTelemetryResult = { ok: false, scanId: "scan-fail-2", errorCategory: "unknown", telemetry: { status: "unavailable" } };
+    const runSweep = vi.fn().mockResolvedValue(failureResult);
+    const res = await handleScanRequest(requestWithHeaders({ authorization: "Bearer s3cret" }), { isEnabled: () => true, runSweep });
+
+    expect(res.status).toBe(500);
+    const body = await res.json();
+    expect(body.telemetryStatus).toBe("unavailable");
   });
 });

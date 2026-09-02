@@ -26,6 +26,21 @@ export interface AgentStore {
    * row, since multiple custom agents per tenant must remain possible.
    */
   createIfAbsent(input: CreateAgentInput): Promise<{ agent: Agent; created: boolean }>;
+  /**
+   * P1 Sprint 5 — the ONE cross-tenant, unfiltered-by-tenant read in this
+   * store. Deliberately mirrors the same trust boundary
+   * lib/modules/estimateFollowup/service.ts::processDueFollowups() already
+   * uses for its own cron (a service-role query with no `.eq("tenant_id",
+   * ...)` filter, because the caller genuinely needs every tenant's rows —
+   * see that function's own doc comment). Exists so the Estimate Closing
+   * scan telemetry (lib/agents/estimateClosing/scanTelemetry.ts) can
+   * identify which tenants are "relevant" (registered AND active — the
+   * exact same criterion shadowRunner.ts's own per-candidate gate already
+   * requires before any model call) WITHOUT hardcoding a tenant id or
+   * inventing a fake "global tenant." Never used by any per-tenant page or
+   * API route — every other caller in this codebase remains tenant-scoped.
+   */
+  listActiveByType(agentType: AgentType): Promise<Agent[]>;
 }
 
 function mapRow(row: Record<string, any>): Agent {
@@ -142,6 +157,13 @@ export class SupabaseAgentStore implements AgentStore {
     if (error) throw new Error(`[agents] update failed: ${error.message}`);
     return mapRow(data);
   }
+
+  async listActiveByType(agentType: AgentType): Promise<Agent[]> {
+    const supabase = await createServerSupabaseClient();
+    const { data, error } = await supabase.from("agents").select("*").eq("agent_type", agentType).eq("status", "active");
+    if (error) throw new Error(`[agents] listActiveByType failed: ${error.message}`);
+    return (data ?? []).map(mapRow);
+  }
 }
 
 export class InMemoryAgentStore implements AgentStore {
@@ -224,5 +246,9 @@ export class InMemoryAgentStore implements AgentStore {
     }
     Object.assign(existing, patch, { updatedAt: new Date().toISOString() });
     return existing;
+  }
+
+  async listActiveByType(agentType: AgentType): Promise<Agent[]> {
+    return this.rows.filter((r) => r.agentType === agentType && r.status === "active");
   }
 }

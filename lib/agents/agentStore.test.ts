@@ -62,3 +62,33 @@ describe("AgentStore.update — instructionsVersion advances only on an actual i
     expect(updated.instructionsVersion).toBe(2);
   });
 });
+
+/**
+ * P1 Sprint 5 — the one cross-tenant read in this store, added so Estimate
+ * Closing scan telemetry can identify "relevant" tenants (registered AND
+ * active — the exact criterion shadowRunner.ts's own per-candidate gate
+ * already requires) without hardcoding a tenant id. See
+ * lib/agents/estimateClosing/scanTelemetry.ts.
+ */
+describe("AgentStore.listActiveByType — cross-tenant, no tenant filter", () => {
+  it("returns only active agents of the given type, across every tenant", async () => {
+    const store = new InMemoryAgentStore();
+    await store.create({ tenantId: "t1", agentType: "estimate_closing", name: "A", status: "active", allowedTools: [], readScopes: [], writeScopes: [] });
+    await store.create({ tenantId: "t2", agentType: "estimate_closing", name: "B", status: "active", allowedTools: [], readScopes: [], writeScopes: [] });
+    await store.create({ tenantId: "t3", agentType: "estimate_closing", name: "C", status: "inactive", allowedTools: [], readScopes: [], writeScopes: [] });
+    await store.create({ tenantId: "t1", agentType: "dev_test", name: "D", status: "active" });
+
+    const result = await store.listActiveByType("estimate_closing");
+    const tenantIds = result.map((a) => a.tenantId).sort();
+
+    expect(tenantIds).toEqual(["t1", "t2"]);
+    expect(result.every((a) => a.status === "active" && a.agentType === "estimate_closing")).toBe(true);
+  });
+
+  it("returns an empty array when no tenant has a matching active agent", async () => {
+    const store = new InMemoryAgentStore();
+    await store.create({ tenantId: "t1", agentType: "estimate_closing", name: "A", status: "inactive", allowedTools: [], readScopes: [], writeScopes: [] });
+
+    expect(await store.listActiveByType("estimate_closing")).toEqual([]);
+  });
+});

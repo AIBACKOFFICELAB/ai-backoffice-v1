@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isOverdueFollowUp, isUnresolvedEmergency } from "./revenueCommandCenter";
+import { isOverdueFollowUp, isUnresolvedEmergency, countUnreviewedRecommendations } from "./revenueCommandCenter";
 import { PlumbingLead } from "@/data/leadModel";
 
 function makeLead(overrides: Partial<PlumbingLead> = {}): PlumbingLead {
@@ -65,5 +65,30 @@ describe("isUnresolvedEmergency", () => {
     expect(isUnresolvedEmergency(makeLead({ emergency: "Yes", status: "Won" }))).toBe(false);
     expect(isUnresolvedEmergency(makeLead({ emergency: "Yes", status: "Lost" }))).toBe(false);
     expect(isUnresolvedEmergency(makeLead({ emergency: "Yes", status: "Completed" }))).toBe(false);
+  });
+});
+
+/** P1 Sprint 5 §14 — first-recommendation attention state. */
+describe("countUnreviewedRecommendations", () => {
+  it("is zero when no recommendations exist — no fake notification when count is 0", () => {
+    expect(countUnreviewedRecommendations([], [])).toBe(0);
+  });
+
+  it("is zero when every recommendation has a matching review", () => {
+    const recs = [{ recommendationEventId: "r1" }, { recommendationEventId: "r2" }];
+    const reviews = [{ recommendationEventId: "r1" }, { recommendationEventId: "r2" }];
+    expect(countUnreviewedRecommendations(recs, reviews)).toBe(0);
+  });
+
+  it("counts only recommendations with no matching review", () => {
+    const recs = [{ recommendationEventId: "r1" }, { recommendationEventId: "r2" }, { recommendationEventId: "r3" }];
+    const reviews = [{ recommendationEventId: "r1" }];
+    expect(countUnreviewedRecommendations(recs, reviews)).toBe(2);
+  });
+
+  it("a review for a recommendation not in the window does not affect the count", () => {
+    const recs = [{ recommendationEventId: "r1" }];
+    const reviews = [{ recommendationEventId: "some-other-recommendation" }];
+    expect(countUnreviewedRecommendations(recs, reviews)).toBe(1);
   });
 });
