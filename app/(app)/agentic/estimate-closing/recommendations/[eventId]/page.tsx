@@ -59,6 +59,13 @@ export default async function RecommendationEvidencePage({ params }: { params: P
   const { lead } = evidence.recommendation.leadId ? await getLeadById(evidence.recommendation.leadId, tenant.tenantId) : { lead: undefined };
   const serviceLabel = lead ? `${lead.customerName} — ${lead.serviceType}` : "Estimate";
   const timingLabel = labelTiming(evidence.recommendation.suggestedTiming);
+  // A recorded reply (already shown under "Reply received" in Lifecycle
+  // context above) IS customer response evidence — showing it there while
+  // the Attribution ladder unconditionally claimed "NOT OBSERVED" was
+  // self-contradictory (Codex review finding on PR #24, P2). Revenue
+  // attribution stays explicitly unestablished regardless — a reply alone
+  // never implies the job was won or revenue recovered.
+  const customerResponseObserved = evidence.sequence?.lastReplyAt != null;
 
   return (
     <div className="space-y-8">
@@ -192,7 +199,9 @@ export default async function RecommendationEvidencePage({ params }: { params: P
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Customer response evidence</dt>
-              <dd className="mt-1 text-sm font-bold text-ink-500">NOT OBSERVED</dd>
+              <dd className={`mt-1 text-sm font-bold ${customerResponseObserved ? "text-success-700" : "text-ink-500"}`}>
+                {customerResponseObserved ? "OBSERVED" : "NOT OBSERVED"}
+              </dd>
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Revenue attribution</dt>

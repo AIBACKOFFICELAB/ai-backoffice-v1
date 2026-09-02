@@ -59,16 +59,18 @@ export async function handleScanRequest(request: NextRequest, deps: ScanRouteDep
   // telemetry (see stalledScan.ts::runEstimateClosingShadowSweepWithTelemetry
   // and scanTelemetry.ts) — this route's own job stays exactly what it was:
   // authorize, gate on the feature flag, run the sweep, report a bounded,
-  // PII-free HTTP summary. Telemetry recording can never turn a real scan
-  // failure into an HTTP success (result.ok reflects the SCAN's own
-  // success/failure, never telemetry's) and can never turn a real success
-  // into a failure (a telemetry write failure surfaces only as
-  // telemetryWriteFailures > 0 on an otherwise-`ok: true` response).
+  // PII-free HTTP summary. `result.ok` reflects the SCAN's own success/
+  // failure ONLY — telemetry (including a failed relevant-tenant lookup)
+  // can never flip it either direction; it can only ever change
+  // `telemetry.status` ("recorded" | "partial" | "unavailable") on an
+  // otherwise-unaffected response. See stalledScan.ts's own doc comment on
+  // why tenant-discovery failure must never prevent the sweep from running
+  // (founder review finding on PR #24, P1).
   const result = await runSweep();
 
   if (!result.ok) {
     return NextResponse.json(
-      { ok: false, fired: true, scanId: result.scanId, errorCategory: result.errorCategory, telemetryWriteFailures: result.telemetryWriteFailures },
+      { ok: false, fired: true, scanId: result.scanId, errorCategory: result.errorCategory, telemetryStatus: result.telemetry.status },
       { status: 500 }
     );
   }
@@ -86,6 +88,6 @@ export async function handleScanRequest(request: NextRequest, deps: ScanRouteDep
     newEventsThisSweep: result.sweep.scan.stalledCandidates.filter((c) => c.isNewEvent).length,
     shadowAttempts: result.sweep.shadowOutcomes.length,
     outcomes: result.sweep.shadowOutcomes.map(({ outcome }) => outcome.status),
-    telemetryWriteFailures: result.telemetryWriteFailures,
+    telemetryStatus: result.telemetry.status,
   });
 }

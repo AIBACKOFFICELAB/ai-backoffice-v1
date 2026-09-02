@@ -207,6 +207,19 @@ export type TenantTelemetryWriteResult = { tenantId: string; ok: boolean };
  * and never affects any other tenant's write (Gate 8). Returns per-tenant
  * ok/fail so the caller can report (never silently swallow) how many
  * writes actually landed, without ever including PII in that report.
+ *
+ * Every tenant's write runs CONCURRENTLY (Promise.all), not one-at-a-time
+ * (Codex review finding on PR #24, P1): emitEventSafely's own per-call
+ * deadline (TELEMETRY_DEADLINE_MS) already bounds ONE write's worst case,
+ * but a serial loop still multiplies that bound by the tenant count during
+ * a real event-store outage — with enough active tenants, that could
+ * exceed the scan route's own Vercel function time budget, and every
+ * tenant after the point of exhaustion would receive no telemetry attempt
+ * at all, not even a recorded failure. Promise.all keeps each tenant's
+ * write independent and bounded by the SAME single per-call deadline
+ * regardless of how many tenants are being scanned, and still returns
+ * results in the same order as `summaries` (Promise.all preserves input
+ * order, not completion order).
  */
 export async function emitScanCompletedTelemetry(
   scanId: string,
@@ -214,32 +227,32 @@ export async function emitScanCompletedTelemetry(
   durationMs: number,
   deps: ScanTelemetryDeps = {}
 ): Promise<TenantTelemetryWriteResult[]> {
-  const results: TenantTelemetryWriteResult[] = [];
-  for (const summary of summaries) {
-    const event = await emitEventSafely(
-      {
-        tenantId: summary.tenantId,
-        eventType: "estimate.closing_scan_completed",
-        actorType: "system",
-        correlationId: scanId,
-        payload: {
-          scanId,
-          candidatesScanned: summary.candidatesScanned,
-          stalledFound: summary.stalledFound,
-          newlyStalled: summary.newlyStalled,
-          shadowAttempts: summary.shadowAttempts,
-          succeeded: summary.succeeded,
-          alreadyProcessed: summary.alreadyProcessed,
-          skipped: summary.skipped,
-          failed: summary.failed,
-          durationMs,
+  return Promise.all(
+    summaries.map(async (summary): Promise<TenantTelemetryWriteResult> => {
+      const event = await emitEventSafely(
+        {
+          tenantId: summary.tenantId,
+          eventType: "estimate.closing_scan_completed",
+          actorType: "system",
+          correlationId: scanId,
+          payload: {
+            scanId,
+            candidatesScanned: summary.candidatesScanned,
+            stalledFound: summary.stalledFound,
+            newlyStalled: summary.newlyStalled,
+            shadowAttempts: summary.shadowAttempts,
+            succeeded: summary.succeeded,
+            alreadyProcessed: summary.alreadyProcessed,
+            skipped: summary.skipped,
+            failed: summary.failed,
+            durationMs,
+          },
         },
-      },
-      deps.eventStore
-    );
-    results.push({ tenantId: summary.tenantId, ok: event !== null });
-  }
-  return results;
+        deps.eventStore
+      );
+      return { tenantId: summary.tenantId, ok: event !== null };
+    })
+  );
 }
 
 /**
@@ -268,6 +281,12 @@ export function categorizeScanFailure(error: unknown): ScanFailureCategory {
  * resolution itself failed, this function is never called — there is no
  * tenant list to attempt telemetry for, and Gate 8 explicitly forbids
  * pretending a failure event can always be persisted.
+ *
+ * Concurrent per-tenant writes (Codex review finding on PR #24, P1) — same
+ * reasoning as emitScanCompletedTelemetry above: a serial loop multiplies
+ * one write's worst-case latency by the tenant count during a real
+ * event-store outage, which is exactly the scenario a SCAN failure is
+ * already occurring alongside.
  */
 export async function emitScanFailedTelemetry(
   scanId: string,
@@ -276,19 +295,19 @@ export async function emitScanFailedTelemetry(
   durationMs: number,
   deps: ScanTelemetryDeps = {}
 ): Promise<TenantTelemetryWriteResult[]> {
-  const results: TenantTelemetryWriteResult[] = [];
-  for (const tenantId of relevantTenantIds) {
-    const event = await emitEventSafely(
-      {
-        tenantId,
-        eventType: "estimate.closing_scan_failed",
-        actorType: "system",
-        correlationId: scanId,
-        payload: { scanId, errorCategory, durationMs },
-      },
-      deps.eventStore
-    );
-    results.push({ tenantId, ok: event !== null });
-  }
-  return results;
+  return Promise.all(
+    relevantTenantIds.map(async (tenantId): Promise<TenantTelemetryWriteResult> => {
+      const event = await emitEventSafely(
+        {
+          tenantId,
+          eventType: "estimate.closing_scan_failed",
+          actorType: "system",
+          correlationId: scanId,
+          payload: { scanId, errorCategory, durationMs },
+        },
+        deps.eventStore
+      );
+      return { tenantId, ok: event !== null };
+    })
+  );
 }

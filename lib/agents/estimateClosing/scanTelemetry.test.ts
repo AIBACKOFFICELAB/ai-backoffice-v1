@@ -8,8 +8,10 @@ import {
 } from "./scanTelemetry";
 import { StalledEmission } from "./stalledScan";
 import { EstimateClosingShadowOutcome } from "./shadowRunner";
-import { InMemoryBusinessEventStore } from "@/lib/events/store";
+import { InMemoryBusinessEventStore, BusinessEventStore } from "@/lib/events/store";
+import { BusinessEvent } from "@/lib/events/types";
 import { EstimateClosingLeadContext, EstimateFollowupSequenceContext } from "./types";
+import { randomUUID } from "crypto";
 
 const TENANT_A = "tenant-a"; // active agent, zero candidates
 const TENANT_B = "tenant-b"; // active agent, one candidate before Day 7 (not stalled)
@@ -269,6 +271,72 @@ describe("emitScanCompletedTelemetry", () => {
     const [event] = await eventStore.listByTenant(TENANT_C, { eventType: "estimate.closing_scan_completed" });
     const serialized = JSON.stringify(event.payload);
     expect(serialized).not.toMatch(/customerName|phone|email|serviceAddress|jobDescription|customerNotes|internalNotes|rationale/i);
+  });
+
+  it("writes every tenant's telemetry CONCURRENTLY, not serially (Codex review finding on PR #24, P1)", async () => {
+    // Deterministic proof, not a timing assertion: an insert that only
+    // resolves once every expected caller has entered proves overlap
+    // without depending on wall-clock thresholds (which would be flaky in
+    // CI). A serial (for-await) implementation would deadlock here — the
+    // second insert() call would never even START until the first one's
+    // Promise resolves, and it can't resolve until a SECOND call has
+    // already entered.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const releasers: Array<() => void> = [];
+    const eventStore: BusinessEventStore = {
+      async insert(input) {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise<void>((resolve) => releasers.push(resolve));
+        inFlight -= 1;
+        const now = new Date().toISOString();
+        const event: BusinessEvent = {
+          id: randomUUID(),
+          tenantId: input.tenantId,
+          eventType: input.eventType,
+          actorType: input.actorType ?? "system",
+          actorId: input.actorId ?? null,
+          entityType: input.entityType ?? null,
+          entityId: input.entityId ?? null,
+          correlationId: input.correlationId ?? randomUUID(),
+          causationId: input.causationId ?? null,
+          idempotencyKey: input.idempotencyKey ?? null,
+          payload: input.payload ?? {},
+          metadata: input.metadata ?? {},
+          occurredAt: now,
+          createdAt: now,
+        };
+        return { event, deduped: false };
+      },
+      async listByTenant() {
+        return [];
+      },
+      async getById() {
+        return null;
+      },
+    };
+
+    const summaries: TenantScanSummary[] = [TENANT_A, TENANT_B, TENANT_C].map((tenantId) => ({
+      tenantId,
+      candidatesScanned: 0,
+      stalledFound: 0,
+      newlyStalled: 0,
+      shadowAttempts: 0,
+      succeeded: 0,
+      alreadyProcessed: 0,
+      skipped: 0,
+      failed: 0,
+    }));
+
+    const pending = emitScanCompletedTelemetry("scan-concurrent", summaries, 10, { eventStore });
+    // Give the event loop a tick to let every concurrent insert() actually
+    // start before releasing any of them.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(maxInFlight).toBe(3); // all 3 tenants' writes were in flight simultaneously
+    releasers.forEach((release) => release());
+    const results = await pending;
+    expect(results.map((r) => r.ok)).toEqual([true, true, true]);
   });
 });
 

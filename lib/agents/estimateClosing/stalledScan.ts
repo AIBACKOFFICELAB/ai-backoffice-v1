@@ -14,6 +14,7 @@ import {
   categorizeScanFailure,
   TenantScanSummary,
   ScanTelemetryDeps,
+  ScanFailureCategory,
 } from "./scanTelemetry";
 
 /**
@@ -235,23 +236,40 @@ export type RunSweepWithTelemetryDeps = {
   now?: () => number;
 };
 
+/**
+ * P1 Sprint 5 hardening (founder review, PR #24) — explicit, typed
+ * telemetry state, replacing the earlier ambiguous
+ * `telemetryWriteFailures: number | null`:
+ *   - "recorded"    — relevant-tenant discovery succeeded AND every
+ *                      intended telemetry write landed.
+ *   - "partial"      — relevant-tenant discovery succeeded but one or more
+ *                      writes failed or timed out (attemptedTenantIds is
+ *                      the full relevant set; failedTenantIds names which
+ *                      of those specifically did not land).
+ *   - "unavailable"  — relevant-tenant discovery itself failed, so no
+ *                      safe tenant-scoped telemetry could be generated at
+ *                      all. Never fabricates a tenant.
+ */
+export type TelemetryOutcome =
+  | { status: "recorded"; attemptedTenantIds: string[] }
+  | { status: "partial"; attemptedTenantIds: string[]; failedTenantIds: string[] }
+  | { status: "unavailable" };
+
 export type ScanSweepWithTelemetryResult =
   | {
       ok: true;
       scanId: string;
       sweep: ShadowSweepResult;
-      tenantSummaries: TenantScanSummary[];
-      telemetryWriteFailures: number;
+      /** Non-null exactly when telemetry.status !== "unavailable" — a
+       * failed tenant-discovery leaves nothing to compute summaries from. */
+      tenantSummaries: TenantScanSummary[] | null;
+      telemetry: TelemetryOutcome;
     }
   | {
       ok: false;
       scanId: string;
       errorCategory: ReturnType<typeof categorizeScanFailure>;
-      /** null when the relevant-tenant set itself could not be resolved —
-       * see the doc comment below on why NO failure telemetry is attempted
-       * in that case (Gate 8: never pretend a failure event can always be
-       * persisted). */
-      telemetryWriteFailures: number | null;
+      telemetry: TelemetryOutcome;
     };
 
 /**
@@ -264,6 +282,20 @@ export type ScanSweepWithTelemetryResult =
  * record telemetry for) is reported through the discriminated return type,
  * so app/api/agents/estimate-closing/scan/route.ts can decide the HTTP
  * response without a try/catch of its own.
+ *
+ * TELEMETRY MUST NEVER GATE SHADOW EXECUTION (founder review finding on
+ * PR #24, P1, self-corrected before merge): an earlier version of this
+ * function resolved relevant-tenant discovery FIRST and returned early —
+ * `ok: false`, sweep never called — if THAT alone failed, even though the
+ * primary scan/reasoning path has no dependency on it at all. Discovery
+ * failure is caught locally and reduced to `relevantTenantIds = null`
+ * (never re-thrown, never allowed to prevent the call below); `runSweep`
+ * is always attempted exactly once, unconditionally, and its own
+ * success/failure is the ONLY thing that decides `ok`. A tenant-discovery
+ * failure can only ever downgrade the resulting `telemetry` field to
+ * `"unavailable"` — it can never flip a successful scan to `ok: false`,
+ * never triggers a second sweep, and never fabricates a tenant to attempt
+ * telemetry for.
  */
 export async function runEstimateClosingShadowSweepWithTelemetry(
   scanDeps: StalledScanDeps = {},
@@ -276,30 +308,49 @@ export async function runEstimateClosingShadowSweepWithTelemetry(
   const scanId = randomUUID();
   const startedAt = now();
 
-  let relevantTenantIds: string[];
+  // Resolve relevant-tenant discovery WITHOUT ever throwing past this
+  // point — a failure here degrades telemetry only, never the scan below.
+  let relevantTenantIds: string[] | null;
   try {
     const relevantAgents = await agentStore.listActiveByType("estimate_closing");
     relevantTenantIds = relevantAgents.map((a) => a.tenantId);
-  } catch (error) {
-    // Cannot even identify which tenants are relevant — there is no safe
-    // tenant to attempt failure telemetry for (Gate 8: "if the underlying
-    // DB/event system itself is unavailable, do not pretend a failure
-    // event can always be persisted"). telemetryWriteFailures is `null`,
-    // not 0, so a caller can tell "zero attempted because none were
-    // possible" apart from "attempted N, all failed."
-    return { ok: false, scanId, errorCategory: categorizeScanFailure(error), telemetryWriteFailures: null };
+  } catch {
+    relevantTenantIds = null;
   }
 
+  async function recordCompletedTelemetry(sweep: ShadowSweepResult, durationMs: number): Promise<{ tenantSummaries: TenantScanSummary[] | null; telemetry: TelemetryOutcome }> {
+    if (relevantTenantIds === null) {
+      return { tenantSummaries: null, telemetry: { status: "unavailable" } };
+    }
+    const tenantSummaries = computeTenantScanSummaries(sweep.scan, sweep.shadowOutcomes, relevantTenantIds);
+    const writeResults = await emitScanCompletedTelemetry(scanId, tenantSummaries, durationMs, deps.telemetry);
+    const failedTenantIds = writeResults.filter((r) => !r.ok).map((r) => r.tenantId);
+    return {
+      tenantSummaries,
+      telemetry: failedTenantIds.length === 0 ? { status: "recorded", attemptedTenantIds: relevantTenantIds } : { status: "partial", attemptedTenantIds: relevantTenantIds, failedTenantIds },
+    };
+  }
+
+  async function recordFailedTelemetry(errorCategory: ScanFailureCategory, durationMs: number): Promise<TelemetryOutcome> {
+    if (relevantTenantIds === null) {
+      return { status: "unavailable" };
+    }
+    const writeResults = await emitScanFailedTelemetry(scanId, relevantTenantIds, errorCategory, durationMs, deps.telemetry);
+    const failedTenantIds = writeResults.filter((r) => !r.ok).map((r) => r.tenantId);
+    return failedTenantIds.length === 0 ? { status: "recorded", attemptedTenantIds: relevantTenantIds } : { status: "partial", attemptedTenantIds: relevantTenantIds, failedTenantIds };
+  }
+
+  // The primary scan/reasoning path — called EXACTLY ONCE, unconditionally,
+  // regardless of whether relevant-tenant discovery above succeeded.
   try {
     const sweep = await runSweep(scanDeps, shadowDeps);
     const durationMs = now() - startedAt;
-    const tenantSummaries = computeTenantScanSummaries(sweep.scan, sweep.shadowOutcomes, relevantTenantIds);
-    const writeResults = await emitScanCompletedTelemetry(scanId, tenantSummaries, durationMs, deps.telemetry);
-    return { ok: true, scanId, sweep, tenantSummaries, telemetryWriteFailures: writeResults.filter((r) => !r.ok).length };
+    const { tenantSummaries, telemetry } = await recordCompletedTelemetry(sweep, durationMs);
+    return { ok: true, scanId, sweep, tenantSummaries, telemetry };
   } catch (error) {
     const durationMs = now() - startedAt;
     const errorCategory = categorizeScanFailure(error);
-    const writeResults = await emitScanFailedTelemetry(scanId, relevantTenantIds, errorCategory, durationMs, deps.telemetry);
-    return { ok: false, scanId, errorCategory, telemetryWriteFailures: writeResults.filter((r) => !r.ok).length };
+    const telemetry = await recordFailedTelemetry(errorCategory, durationMs);
+    return { ok: false, scanId, errorCategory, telemetry };
   }
 }
