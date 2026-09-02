@@ -32,6 +32,7 @@ const ATTENTION_TONE: Record<AttentionItemKind, ActionCardTone> = {
   overdue_follow_up: "warning",
   stalled_estimate: "warning",
   pending_approval: "info",
+  recommendation_review: "info",
 };
 
 const ATTENTION_LABEL: Record<AttentionItemKind, string> = {
@@ -40,6 +41,7 @@ const ATTENTION_LABEL: Record<AttentionItemKind, string> = {
   stalled_estimate: "Stalled estimate",
   pending_approval: "Approval needed",
   agent_failure: "Agent issue",
+  recommendation_review: "AI recommendation",
 };
 
 export default async function DashboardPage() {

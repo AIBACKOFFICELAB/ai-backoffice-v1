@@ -116,6 +116,59 @@ same key is independent per tenant.
   tenant-filtering/idempotency semantics) as `SupabaseBusinessEventStore` —
   dependency-injected everywhere so tests never touch the live database.
 
+## Scan telemetry — operational evidence, not reasoning evidence (P1 Sprint 5)
+
+`estimate.closing_scan_completed` and `estimate.closing_scan_failed`
+(`lib/agents/estimateClosing/scanTelemetry.ts`, the only writer) close a
+specific observability gap: before P1 Sprint 5, a scheduled Estimate
+Closing scan that found zero stalled estimates left **no durable record at
+all** — "the cron ran and found nothing" was indistinguishable in the
+application database from "the cron never ran," visible only by manually
+inspecting Vercel's own HTTP logs.
+
+**These are heartbeats, not agent runs.** A scan-completed event answers
+"did the scheduled scan invocation that produced this record actually
+execute, and what did it observe" — it is emitted once per tenant with a
+registered AND active `estimate_closing` agent, every time the scan runs,
+**including a tenant with zero candidates that sweep**. It is emitted from
+`lib/agents/estimateClosing/stalledScan.ts::runEstimateClosingShadowSweepWithTelemetry`
+(a wrapper around the pre-existing, unchanged
+`runEstimateClosingShadowSweep`) — never from a page render, matching this
+codebase's existing "never generate a business event from a GET request"
+discipline. Multiple tenants scanned in the same sweep get their own
+isolated, tenant-scoped record; a tenant not registered for Estimate
+Closing at all gets none, even if the cross-tenant candidate query happened
+to touch its rows.
+
+**Telemetry is secondary to the scan it describes** — a telemetry write
+failure (via `emitEventSafely`, the same compatibility-adapter convention
+`lib/modules/missedCallRecovery/service.ts` already uses) can never cause
+the scan to re-run, never triggers a second model call, and never flips a
+successful scan into an apparent failure or vice versa. Conversely, a
+genuine scan-level failure (the candidate read itself throws) always
+preserves HTTP failure semantics on the route — telemetry recording is a
+side effect of that failure, never a way to paper over it.
+
+**Privacy contract**: both event types carry only bounded counts, a
+`scanId` (correlating every telemetry record from one sweep), and — for a
+failure — a fixed, sanitized error category (never the raw thrown error
+text; see `lib/ai/gateway.ts::normalizeProviderError`'s identical
+discipline). Both contracts reuse `forbidRawEstimatePii` (see
+`lib/events/contracts.ts`) as defense in depth, even though a scan-
+telemetry payload has no path to a customer record at all. Idempotency is
+`"not_applicable"` for both — unlike `estimate.stalled`, which must
+collapse a re-scan to one permanent event, two genuine cron invocations
+producing two completed-scan records is correct, not a duplicate.
+
+The read side (`lib/agents/estimateClosing/operationsReadModel.ts`) never
+renders an empty telemetry window as "healthy" — absence of evidence is not
+evidence of success. It reports one of three honest states:
+`"no_telemetry"` (nothing has ever been recorded), `"observed"` (the most
+recent telemetry event is a completed scan), or `"failure_recorded"` (the
+most recent telemetry event is a genuine scan failure) — whichever
+telemetry type is more recent wins, so a failure recorded after a prior
+success is never masked by that earlier success.
+
 ## Migration strategy
 
 Per the directive: *"Do not migrate every current workflow immediately if

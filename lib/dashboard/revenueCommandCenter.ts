@@ -59,7 +59,7 @@ const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
 // below, which are intentionally windowed views, but was never correct
 // for a lifetime headline total.
 
-export type AttentionItemKind = "emergency_lead" | "overdue_follow_up" | "stalled_estimate" | "pending_approval" | "agent_failure";
+export type AttentionItemKind = "emergency_lead" | "overdue_follow_up" | "stalled_estimate" | "pending_approval" | "agent_failure" | "recommendation_review";
 
 export type AttentionItem = {
   kind: AttentionItemKind;
@@ -142,6 +142,20 @@ export function isOverdueFollowUp(lead: PlumbingLead, today: string): boolean {
  * attention once it reaches a terminal status. */
 export function isUnresolvedEmergency(lead: PlumbingLead): boolean {
   return lead.emergency === "Yes" && !["Completed", "Lost", "Won"].includes(lead.status);
+}
+
+/** P1 Sprint 5 §14 — exported for unit testing. Pure: counts recommendations
+ * in the given (already-fetched, already-bounded) window that have no
+ * matching review yet. Mirrors evaluationReadModel.ts's own
+ * pairRecommendationsWithReviews matching logic (by recommendationEventId),
+ * kept separate here since the dashboard only needs the COUNT, not the
+ * full pairing. */
+export function countUnreviewedRecommendations(
+  recommendations: Array<{ recommendationEventId: string }>,
+  reviews: Array<{ recommendationEventId: string }>
+): number {
+  const reviewedIds = new Set(reviews.map((r) => r.recommendationEventId));
+  return recommendations.filter((r) => !reviewedIds.has(r.recommendationEventId)).length;
 }
 
 export async function buildRevenueCommandCenterData(tenantId: string, tenantName: string): Promise<RevenueCommandCenterData> {
@@ -249,6 +263,22 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
       value: amount != null ? `$${amount.toLocaleString()}` : undefined,
       href: `/leads/${lead.id}`,
       occurredAt: event.occurredAt,
+    });
+  }
+
+  // P1 Sprint 5 §14 — first-recommendation attention state. ONE aggregate
+  // item, never one per recommendation (would flood this list once real
+  // volume exists) — internal product-attention only, never an email/SMS/
+  // push/approval (directive: "Do NOT send email/SMS/push notify
+  // externally/create an approval"). Never shown when the count is 0.
+  const unreviewedRecommendationsCount = countUnreviewedRecommendations(recommendationsResult.recommendations, reviewsResult.reviews);
+  if (unreviewedRecommendationsCount > 0) {
+    attentionItems.push({
+      kind: "recommendation_review",
+      title: "AI recommendations awaiting review",
+      description: `${unreviewedRecommendationsCount} Shadow recommendation${unreviewedRecommendationsCount === 1 ? "" : "s"} ${unreviewedRecommendationsCount === 1 ? "hasn't" : "haven't"} been reviewed yet`,
+      href: "/agentic/estimate-closing",
+      occurredAt: estimateClosingSummary.latestRecommendationAt ?? new Date().toISOString(),
     });
   }
 

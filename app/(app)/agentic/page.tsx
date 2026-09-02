@@ -23,6 +23,7 @@ import {
   selectFeaturedRecommendations,
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
+import { getEstimateClosingOperations } from "@/lib/agents/estimateClosing/operationsReadModel";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { MetricCard } from "@/components/dashboard/MetricCard";
 
@@ -56,7 +57,7 @@ export default async function AgenticActivityPage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [events, agents, agentRuns, approvals, outcomes, recommendationsResult] = await Promise.all([
+  const [events, agents, agentRuns, approvals, outcomes, recommendationsResult, operations] = await Promise.all([
     new SupabaseBusinessEventStore().listByTenant(tenant.tenantId, { limit: 15 }),
     new SupabaseAgentStore().listByTenant(tenant.tenantId),
     new SupabaseAgentRunStore().listByTenant(tenant.tenantId, { limit: 10 }),
@@ -65,6 +66,9 @@ export default async function AgenticActivityPage() {
     // Dedicated, validated read model (P1 Sprint 2) — see
     // lib/agents/estimateClosing/recommendationReadModel.ts.
     listEstimateClosingRecommendations(tenant.tenantId),
+    // P1 Sprint 5 — "is AI running, and did anything happen?" See
+    // lib/agents/estimateClosing/operationsReadModel.ts.
+    getEstimateClosingOperations(tenant.tenantId),
   ]);
 
   const toolCallStore = new SupabaseToolCallStore();
@@ -161,6 +165,25 @@ export default async function AgenticActivityPage() {
                   value={estimateClosingSummary.latestRecommendationAt ?? "—"}
                   icon={<Bot className="h-4 w-4" />}
                 />
+              </div>
+
+              {/* P1 Sprint 5 §15 — is the scan itself running, does
+                  anything need review, did it ever touch a customer? Kept
+                  deliberately compact — see the Estimate Closing workspace
+                  for the full Operations section. */}
+              <div className="mt-4 grid gap-4 sm:grid-cols-3">
+                <MetricCard
+                  label="Last durable scan"
+                  value={operations.lastScanAt ?? (operations.scanTelemetryStatus === "no_telemetry" ? "No telemetry yet" : "—")}
+                  tone={operations.scanTelemetryStatus === "failure_recorded" ? "warning" : "default"}
+                />
+                <MetricCard
+                  label="Recommendations awaiting review"
+                  value={operations.recommendationsAwaitingReview}
+                  href="/agentic/estimate-closing"
+                  tone={operations.recommendationsAwaitingReview > 0 ? "warning" : "default"}
+                />
+                <MetricCard label="Customer actions taken" value={operations.customerActionsAttributable} helpText="Always 0 in Shadow Mode" />
               </div>
 
               {estimateClosingFailures.length > 0 && (

@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { Bot, ArrowLeft, Sparkles, Target, ShieldAlert, ThumbsUp } from "lucide-react";
+import { Bot, ArrowLeft, Sparkles, Target, ShieldAlert, ThumbsUp, Clock, Radar } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
 import { getLeads } from "@/lib/leads/repository";
 import { SupabaseAgentStore } from "@/lib/agents/agentStore";
@@ -17,6 +17,7 @@ import { ApprovalReadinessEvidence } from "@/components/ai/ApprovalReadinessEvid
 import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
 import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { getEstimateClosingEvaluation } from "@/lib/agents/estimateClosing/evaluationReadModel";
+import { getEstimateClosingOperations } from "@/lib/agents/estimateClosing/operationsReadModel";
 import { getEstimateLifecycleReadModel, buildShadowReadinessLines } from "@/lib/leads/estimateLifecycleReadModel";
 
 /**
@@ -31,11 +32,12 @@ export default async function EstimateClosingWorkspacePage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [agents, evaluation, { leads }, lifecycle] = await Promise.all([
+  const [agents, evaluation, { leads }, lifecycle, operations] = await Promise.all([
     new SupabaseAgentStore().listByTenant(tenant.tenantId),
     getEstimateClosingEvaluation(tenant.tenantId),
     getLeads(tenant.tenantId),
     getEstimateLifecycleReadModel(tenant.tenantId),
+    getEstimateClosingOperations(tenant.tenantId),
   ]);
   const readinessLines = buildShadowReadinessLines(lifecycle);
 
@@ -118,6 +120,66 @@ export default async function EstimateClosingWorkspacePage() {
         </CardBody>
       </Card>
 
+      {/* Operations (P1 Sprint 5 §16) — is the scheduled scan actually
+          running, and what did it observe? Distinct from Shadow Performance
+          below: this section is about SCAN activity (a heartbeat), not
+          recommendation quality. */}
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Radar className="h-4 w-4 text-ink-400" aria-hidden="true" />
+            <h2 className="font-semibold text-ink-900">Operations</h2>
+          </div>
+          <p className="mt-0.5 text-sm text-ink-500">
+            Whether the scheduled scan actually ran, and what it found. Expected schedule: daily. Absence of a recorded scan is not evidence it ran.
+          </p>
+        </CardHeader>
+        <CardBody>
+          {operations.scanTelemetryStatus === "no_telemetry" ? (
+            <EmptyState
+              icon={<Clock className="h-8 w-8" />}
+              title="No durable scan telemetry has been recorded yet"
+              description="The scheduled scan hasn't produced a durable record for this account yet."
+            />
+          ) : (
+            <>
+              {operations.scanTelemetryStatus === "failure_recorded" && (
+                <Alert tone="danger" className="mb-4" title="The last scan attempt failed">
+                  {`Error category: ${operations.latestScanFailureCategory ?? "unknown"}. No customer action was possible either way.`}
+                </Alert>
+              )}
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <MetricCard label="Last durable scan" value={operations.lastScanAt ?? "—"} icon={<Clock className="h-4 w-4" />} />
+                <MetricCard label="Candidates scanned" value={operations.latestScanCounts?.candidatesScanned ?? "—"} />
+                <MetricCard label="Stalled found" value={operations.latestScanCounts?.stalledFound ?? "—"} />
+                <MetricCard label="Shadow attempts" value={operations.latestScanCounts?.shadowAttempts ?? "—"} />
+                <MetricCard label="Recommendation successes" value={operations.latestScanCounts?.succeeded ?? "—"} />
+                <MetricCard
+                  label="Failures (latest scan)"
+                  value={operations.latestScanCounts?.failed ?? "—"}
+                  tone={(operations.latestScanCounts?.failed ?? 0) > 0 ? "warning" : "default"}
+                />
+                <MetricCard
+                  label="Pending owner reviews"
+                  value={operations.recommendationsAwaitingReview}
+                  icon={<ThumbsUp className="h-4 w-4" />}
+                  tone={operations.recommendationsAwaitingReview > 0 ? "warning" : "default"}
+                />
+                <MetricCard
+                  label="Model/run failures"
+                  value={operations.modelFailureCount}
+                  helpText={operations.latestModelFailureCategory ? `Latest: ${operations.latestModelFailureCategory}` : undefined}
+                  tone={operations.modelFailureCount > 0 ? "warning" : "default"}
+                />
+              </div>
+              {operations.malformedScanTelemetryCount > 0 && (
+                <p className="mt-4 text-xs text-ink-400">{operations.malformedScanTelemetryCount} telemetry record(s) could not be read and were excluded.</p>
+              )}
+            </>
+          )}
+        </CardBody>
+      </Card>
+
       {agentStatus === "active" && (
         <>
           {/* B. Shadow Performance */}
@@ -166,22 +228,29 @@ export default async function EstimateClosingWorkspacePage() {
                   {evaluation.recommendationsWithReviewStatus.map(({ recommendation, review }) => {
                     const lead = recommendation.leadId ? leadsById.get(recommendation.leadId) : undefined;
                     return (
-                      <RecommendationReviewCard
-                        key={recommendation.recommendationEventId}
-                        recommendationEventId={recommendation.recommendationEventId}
-                        recommendation={{
-                          recommendation: recommendation.recommendation,
-                          confidence: recommendation.confidence,
-                          reasonCodes: recommendation.reasonCodes,
-                          suggestedChannel: recommendation.suggestedChannel,
-                          suggestedTiming: recommendation.suggestedTiming,
-                          opportunityValue: recommendation.opportunityValue,
-                          rationaleLength: 0,
-                        }}
-                        serviceType={lead ? `${lead.customerName} — ${lead.serviceType}` : "Estimate"}
-                        occurredAt={recommendation.occurredAt}
-                        existingReview={review}
-                      />
+                      <div key={recommendation.recommendationEventId} className="space-y-1.5">
+                        <RecommendationReviewCard
+                          recommendationEventId={recommendation.recommendationEventId}
+                          recommendation={{
+                            recommendation: recommendation.recommendation,
+                            confidence: recommendation.confidence,
+                            reasonCodes: recommendation.reasonCodes,
+                            suggestedChannel: recommendation.suggestedChannel,
+                            suggestedTiming: recommendation.suggestedTiming,
+                            opportunityValue: recommendation.opportunityValue,
+                            rationaleLength: 0,
+                          }}
+                          serviceType={lead ? `${lead.customerName} — ${lead.serviceType}` : "Estimate"}
+                          occurredAt={recommendation.occurredAt}
+                          existingReview={review}
+                        />
+                        <Link
+                          href={`/agentic/estimate-closing/recommendations/${encodeURIComponent(recommendation.recommendationEventId)}`}
+                          className="inline-block text-xs font-semibold text-brand-700 hover:text-brand-800"
+                        >
+                          View full evidence &rarr;
+                        </Link>
+                      </div>
                     );
                   })}
                 </div>
