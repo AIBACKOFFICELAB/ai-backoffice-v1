@@ -18,11 +18,9 @@ import {
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateClosing/evaluationReadModel";
-import { resolveCurrentFollowThroughByRecommendation } from "@/lib/agents/estimateClosing/commercialEvidence";
+import { resolveCurrentFollowThroughByRecommendation, fetchFollowThroughEventsForRecommendations } from "@/lib/agents/estimateClosing/commercialEvidence";
 import { getEstimateFollowupSequencesForTenant } from "@/lib/modules/estimateFollowup/service";
 import { computeEstimateLifecycleReadModel } from "@/lib/leads/estimateLifecycleReadModel";
-
-const FOLLOWTHROUGH_EVENT_TYPE = "estimate.closing_recommendation_followthrough_recorded";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -229,12 +227,14 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
   const [reviewsResult, followThroughEvents] = await Promise.all([
     listEstimateClosingRecommendationReviews(tenantId, recommendationIds, { eventStore }),
     // P1 Sprint 6 — scoped by causationIdIn, the SAME strictly-correct
-    // linkage discipline reviewsResult above already uses (never an
-    // independent recency `limit`, which can silently mismatch — see
-    // evaluationReadModel.ts's own doc comment on this exact class of bug).
-    recommendationIds.length > 0
-      ? eventStore.listByTenant(tenantId, { eventType: FOLLOWTHROUGH_EVENT_TYPE, causationIdIn: recommendationIds })
-      : Promise.resolve([]),
+    // linkage discipline reviewsResult above already uses. MUST go through
+    // fetchFollowThroughEventsForRecommendations (an explicit, generous
+    // limit), never a bare listByTenant call — that store call's own
+    // causationIdIn default assumes at most one row per recommendation,
+    // which holds for reviews but NOT for follow-through's deliberately
+    // multi-row corrections (Codex review finding on PR #25, P1 — see that
+    // function's own doc comment in commercialEvidence.ts).
+    fetchFollowThroughEventsForRecommendations(tenantId, recommendationIds, eventStore),
   ]);
   const { current: followThroughByRecommendation } = resolveCurrentFollowThroughByRecommendation(
     followThroughEvents.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload }))

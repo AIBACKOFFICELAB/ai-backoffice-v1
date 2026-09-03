@@ -213,18 +213,47 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     expect(store.all()).toHaveLength(1); // only the seeded recommendation event
   });
 
-  it("an EXACT duplicate retry (same recommendation, same four answers) dedupes to the original — idempotent, no duplicate row", async () => {
+  it("an EXACT duplicate retry within the same dedupe window (same recommendation, same four answers, same moment) dedupes to the original — idempotent, no duplicate row", async () => {
     const store = new InMemoryBusinessEventStore();
     const rec = await seedRecommendationEvent(store);
     const input = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "pending" as const };
+    const sameMoment = () => 1_000_000_000;
 
-    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store });
-    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store });
+    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store, now: sameMoment });
+    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store, now: sameMoment });
 
     expect(first.ok && !first.deduped).toBe(true);
     expect(second.ok && second.deduped).toBe(true);
     if (first.ok && second.ok) expect(second.followThrough).toEqual(first.followThrough);
     expect(store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded")).toHaveLength(1);
+  });
+
+  it("a correction that reverts to an EARLIER answer is never silently dropped — A -> B -> A each lands as its own current event, not deduped to the original A (Codex review finding on PR #25, P1)", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+    const stateA = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "pending" as const };
+    const stateB = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
+    // Each submission is far enough apart (well beyond the 5s dedupe
+    // window) to be unambiguously a distinct, later submission, never an
+    // accidental retry of the previous one.
+    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateA, { eventStore: store, now: () => 1_000_000_000 });
+    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateB, { eventStore: store, now: () => 1_000_020_000 });
+    // The third submission's CONTENT is byte-identical to the first (A
+    // again) — this is exactly the case a pure content-hash key would
+    // wrongly collide on.
+    const third = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateA, { eventStore: store, now: () => 1_000_040_000 });
+
+    expect(first.ok && !first.deduped).toBe(true);
+    expect(second.ok && !second.deduped).toBe(true);
+    expect(third.ok && !third.deduped).toBe(true); // NOT deduped to the first A
+
+    const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
+    expect(recorded).toHaveLength(3); // all three evidence rows survive, append-only
+
+    // The "current" (latest-by-occurredAt) resolved value must be the
+    // THIRD submission's own occurredAt — not the first A's stale one.
+    const latest = recorded.reduce((a, b) => (b.occurredAt > a.occurredAt ? b : a));
+    expect(latest.payload).toEqual({ recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "pending" });
   });
 
   it("a genuine CORRECTION (a different answer for the same recommendation) creates a NEW, additional row — append-only, never overwritten", async () => {
@@ -333,21 +362,37 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
 });
 
 describe("buildFollowThroughIdempotencyKey", () => {
-  it("is deterministic — the same recommendation + same answers always produces the same key", () => {
+  const NOW = 1_700_000_000_000;
+
+  it("is deterministic — the same recommendation + same answers + same time bucket always produces the same key", () => {
     const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    expect(buildFollowThroughIdempotencyKey("rec-1", value)).toBe(buildFollowThroughIdempotencyKey("rec-1", { ...value }));
+    expect(buildFollowThroughIdempotencyKey("rec-1", value, NOW)).toBe(buildFollowThroughIdempotencyKey("rec-1", { ...value }, NOW));
   });
 
   it("differs when any one of the four answers differs", () => {
     const base = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    const key = buildFollowThroughIdempotencyKey("rec-1", base);
-    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, actionTaken: "no", actionChannel: null })).not.toBe(key);
-    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, businessDisposition: "lost" })).not.toBe(key);
+    const key = buildFollowThroughIdempotencyKey("rec-1", base, NOW);
+    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, actionTaken: "no", actionChannel: null }, NOW)).not.toBe(key);
+    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, businessDisposition: "lost" }, NOW)).not.toBe(key);
   });
 
-  it("differs across recommendations even with identical answers", () => {
+  it("differs across recommendations even with identical answers and identical time", () => {
     const value = { recommendationEventId: "irrelevant", actionTaken: "no" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const };
-    expect(buildFollowThroughIdempotencyKey("rec-1", value)).not.toBe(buildFollowThroughIdempotencyKey("rec-2", value));
+    expect(buildFollowThroughIdempotencyKey("rec-1", value, NOW)).not.toBe(buildFollowThroughIdempotencyKey("rec-2", value, NOW));
+  });
+
+  it("differs across time buckets even with identical recommendation and identical answers — the fix for the A -> B -> A collision (Codex review finding on PR #25, P1)", () => {
+    const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
+    const keyAtT0 = buildFollowThroughIdempotencyKey("rec-1", value, NOW);
+    const keyMuchLater = buildFollowThroughIdempotencyKey("rec-1", value, NOW + 60_000); // 60s later — a different bucket
+    expect(keyAtT0).not.toBe(keyMuchLater);
+  });
+
+  it("does NOT differ within the same short dedupe window — an accidental double-click or network retry still collapses to one key", () => {
+    const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
+    const keyAtT0 = buildFollowThroughIdempotencyKey("rec-1", value, NOW);
+    const keyMomentsLater = buildFollowThroughIdempotencyKey("rec-1", value, NOW + 50); // 50ms later — same bucket
+    expect(keyAtT0).toBe(keyMomentsLater);
   });
 });
 

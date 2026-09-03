@@ -150,8 +150,25 @@ export function validateFollowThroughInput(
  * produces the SAME key (a true retry dedupes), while a DIFFERENT answer
  * (a genuine correction) always produces a DIFFERENT key (a new, additional
  * evidence row is created, never an in-place mutation). See this module's
- * top-level doc comment for the full architectural decision. */
-export function buildFollowThroughIdempotencyKey(recommendationEventId: string, value: EstimateClosingRecommendationFollowThrough): string {
+ * top-level doc comment for the full architectural decision.
+ *
+ * TIME-BUCKETED, not purely content-derived (Codex review finding on PR
+ * #25, P1): a pure content hash breaks the very sequence this design exists
+ * to support — owner records A, corrects to B, later corrects BACK to A.
+ * That third submission's content is byte-identical to the FIRST, so a
+ * content-only key would collide with the original A event's key; the
+ * unique index would then dedupe the third submission to that stale row
+ * (with the ORIGINAL, now-wrong occurredAt), and the "latest wins" reader
+ * would keep reporting B — an HTTP success that silently failed to record
+ * the correction. Bucketing `nowMs` into the key (a coarse, injectable
+ * clock) fixes this: two submissions of the same content within the SAME
+ * short window (an accidental double-click, a network-level retry) still
+ * dedupe to one row, but any later resubmission — even with identical
+ * content — falls in a different bucket and is correctly treated as its
+ * own new, current event. */
+const FOLLOWTHROUGH_DEDUPE_WINDOW_MS = 5000;
+
+export function buildFollowThroughIdempotencyKey(recommendationEventId: string, value: EstimateClosingRecommendationFollowThrough, nowMs: number): string {
   const digest = createHash("sha256")
     .update(
       JSON.stringify({
@@ -163,7 +180,8 @@ export function buildFollowThroughIdempotencyKey(recommendationEventId: string, 
     )
     .digest("hex")
     .slice(0, 16);
-  return `estimate.closing_recommendation_followthrough_recorded:${recommendationEventId}:${digest}`;
+  const bucket = Math.floor(nowMs / FOLLOWTHROUGH_DEDUPE_WINDOW_MS);
+  return `estimate.closing_recommendation_followthrough_recorded:${recommendationEventId}:${digest}:${bucket}`;
 }
 
 /**
@@ -188,9 +206,10 @@ export async function recordEstimateClosingRecommendationFollowThrough(
   tenantId: string,
   actorUserId: string,
   input: RecordFollowThroughInput,
-  deps: { eventStore?: BusinessEventStore } = {}
+  deps: { eventStore?: BusinessEventStore; now?: () => number } = {}
 ): Promise<RecordFollowThroughResult> {
   const eventStore = deps.eventStore ?? new SupabaseBusinessEventStore();
+  const now = deps.now ?? (() => Date.now());
 
   const validated = validateFollowThroughInput(input);
   if (!validated.ok) return validated;
@@ -215,6 +234,11 @@ export async function recordEstimateClosingRecommendationFollowThrough(
     businessDisposition: validated.value.businessDisposition,
   };
 
+  // A single clock read, used consistently for both the idempotency-key
+  // bucket and the persisted occurredAt — never two independent reads that
+  // could otherwise drift apart across a bucket boundary.
+  const nowMs = now();
+
   const { event: persistedEvent, deduped } = await emitEvent(
     {
       tenantId,
@@ -224,7 +248,8 @@ export async function recordEstimateClosingRecommendationFollowThrough(
       entityType: recommendationEvent.entityType,
       entityId: recommendationEvent.entityId,
       causationId: recommendationEvent.id,
-      idempotencyKey: buildFollowThroughIdempotencyKey(recommendationEvent.id, followThrough),
+      idempotencyKey: buildFollowThroughIdempotencyKey(recommendationEvent.id, followThrough, nowMs),
+      occurredAt: new Date(nowMs).toISOString(),
       payload: followThrough as unknown as Record<string, unknown>,
     },
     eventStore

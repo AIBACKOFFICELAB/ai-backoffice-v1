@@ -238,6 +238,48 @@ export function computeEstimateClosingCommercialEvidence(input: {
   };
 }
 
+/**
+ * Bounded read for the follow-through causationIdIn query below — see
+ * fetchFollowThroughEventsForRecommendations's own doc comment for why an
+ * EXPLICIT limit is required here, not the store's own causationIdIn
+ * default (Codex review finding on PR #25, P1).
+ */
+export const FOLLOWTHROUGH_EVENTS_FETCH_LIMIT = 2000;
+
+/**
+ * Fetches every estimate.closing_recommendation_followthrough_recorded
+ * event caused by any of `recommendationIds`. MUST pass an explicit
+ * `limit`, never rely on BusinessEventStore.listByTenant's own
+ * causationIdIn default (`opts.limit ?? opts.causationIdIn?.length ?? 50`
+ * — see lib/events/store.ts): that default assumes AT MOST ONE row per
+ * causation id, an invariant estimate.closing_recommendation_reviewed
+ * genuinely has (idempotency: "required", one canonical review per
+ * recommendation) but follow-through deliberately does NOT — this event
+ * type permits multiple append-only correction rows per recommendation
+ * (see followThrough.ts). Without an explicit limit, once ANY
+ * recommendation in a bounded batch has accumulated more than one
+ * correction, the implicit `causationIdIn.length` cap can silently crowd
+ * OTHER recommendations' follow-through rows out of the result entirely —
+ * making a recommendation that genuinely HAS follow-through read back as
+ * if it had none (undercounting coverage on both the workspace's
+ * Commercial Evidence section and the Dashboard's attention item). Shared
+ * by getEstimateClosingCommercialEvidence below and
+ * lib/dashboard/revenueCommandCenter.ts's analogous query — one
+ * implementation, not two independently-drifting limits.
+ */
+export async function fetchFollowThroughEventsForRecommendations(
+  tenantId: string,
+  recommendationIds: string[],
+  eventStore: BusinessEventStore
+): Promise<BusinessEvent[]> {
+  if (recommendationIds.length === 0) return [];
+  return eventStore.listByTenant(tenantId, {
+    eventType: FOLLOWTHROUGH_EVENT_TYPE,
+    causationIdIn: recommendationIds,
+    limit: FOLLOWTHROUGH_EVENTS_FETCH_LIMIT,
+  });
+}
+
 export type CommercialEvidenceDeps = {
   eventStore?: BusinessEventStore;
   getLeadsForTenant?: typeof getLeads;
@@ -252,9 +294,7 @@ export async function getEstimateClosingCommercialEvidence(tenantId: string, dep
 
   const [reviewsResult, followThroughEvents, { leads }] = await Promise.all([
     listEstimateClosingRecommendationReviews(tenantId, recommendationIds, { eventStore }),
-    recommendationIds.length > 0
-      ? eventStore.listByTenant(tenantId, { eventType: FOLLOWTHROUGH_EVENT_TYPE, causationIdIn: recommendationIds })
-      : Promise.resolve([]),
+    fetchFollowThroughEventsForRecommendations(tenantId, recommendationIds, eventStore),
     getLeadsForTenant(tenantId),
   ]);
 

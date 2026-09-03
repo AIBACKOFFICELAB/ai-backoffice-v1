@@ -3,9 +3,59 @@ import {
   computeEstimateClosingCommercialEvidence,
   resolveCurrentFollowThroughByRecommendation,
   resolveEstimateClosingAttributionState,
+  getEstimateClosingCommercialEvidence,
+  fetchFollowThroughEventsForRecommendations,
 } from "./commercialEvidence";
 import { EstimateClosingRecommendationView } from "./recommendationReadModel";
 import { EstimateClosingRecommendationReviewView } from "./evaluationReadModel";
+import { InMemoryBusinessEventStore } from "@/lib/events/store";
+
+const TENANT = "tenant-1";
+
+const VALID_RECOMMENDATION_PAYLOAD = {
+  recommendation: "follow_up",
+  confidence: 0.8,
+  reasonCodes: [],
+  suggestedChannel: "sms",
+  suggestedTiming: "within_24_hours",
+  opportunityValue: 4200,
+  rationaleLength: 0,
+  agentRunId: null,
+  sequenceId: null,
+};
+
+async function seedRecommendationEvent(store: InMemoryBusinessEventStore, entityId: string) {
+  const { event } = await store.insert({
+    tenantId: TENANT,
+    eventType: "estimate.closing_recommendation_generated",
+    actorType: "agent",
+    entityType: "lead",
+    entityId,
+    payload: VALID_RECOMMENDATION_PAYLOAD,
+  });
+  return event;
+}
+
+async function seedFollowThroughEvent(
+  store: InMemoryBusinessEventStore,
+  causationId: string,
+  overrides: { occurredAt?: string; businessDisposition?: string } = {}
+) {
+  await store.insert({
+    tenantId: TENANT,
+    eventType: "estimate.closing_recommendation_followthrough_recorded",
+    actorType: "user",
+    causationId,
+    occurredAt: overrides.occurredAt,
+    payload: {
+      recommendationEventId: causationId,
+      actionTaken: "yes",
+      actionChannel: "phone",
+      customerResponse: "observed",
+      businessDisposition: overrides.businessDisposition ?? "pending",
+    },
+  });
+}
 
 function rec(overrides: Partial<EstimateClosingRecommendationView> = {}): EstimateClosingRecommendationView {
   return {
@@ -276,5 +326,54 @@ describe("resolveEstimateClosingAttributionState — the pure evidence-ladder re
   it("businessDisposition 'unknown' does not advance to BUSINESS_DISPOSITION_OBSERVED — 'unknown' is not an observation", () => {
     const state = resolveEstimateClosingAttributionState({ hasReview: true, actionTaken: "yes", customerResponse: "observed", businessDisposition: "unknown" });
     expect(state.evidenceStage).toBe("CUSTOMER_RESPONSE_OBSERVED");
+  });
+});
+
+describe("fetchFollowThroughEventsForRecommendations / getEstimateClosingCommercialEvidence — the causationIdIn truncation fix (Codex review finding on PR #25, P1)", () => {
+  it("one recommendation with many correction events does not crowd another recommendation's single follow-through record out of the batch fetch", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const recA = await seedRecommendationEvent(store, "lead-a");
+    const recB = await seedRecommendationEvent(store, "lead-b");
+
+    // Recommendation A accumulates many corrections — deliberately more
+    // than the number of recommendations in this batch (2), which is
+    // exactly the count the store's own causationIdIn default would have
+    // capped the WHOLE query at before this fix.
+    for (let i = 0; i < 5; i++) {
+      await seedFollowThroughEvent(store, recA.id, { occurredAt: `2026-01-0${i + 1}T00:00:00.000Z` });
+    }
+    // Recommendation B has exactly one, older than several of A's rows —
+    // the case that used to get silently dropped.
+    await seedFollowThroughEvent(store, recB.id, { occurredAt: "2026-01-01T00:00:00.000Z", businessDisposition: "won" });
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [recA.id, recB.id], store);
+    const { current } = resolveCurrentFollowThroughByRecommendation(
+      events.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload }))
+    );
+
+    expect(current.has(recA.id)).toBe(true);
+    expect(current.has(recB.id)).toBe(true); // previously could be missing
+    expect(current.get(recB.id)?.followThrough.businessDisposition).toBe("won");
+  });
+
+  it("getEstimateClosingCommercialEvidence end-to-end: follow-through coverage is correct even when one recommendation has many corrections and another has one", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const recA = await seedRecommendationEvent(store, "lead-a");
+    const recB = await seedRecommendationEvent(store, "lead-b");
+    const recC = await seedRecommendationEvent(store, "lead-c"); // no follow-through at all
+
+    for (let i = 0; i < 5; i++) {
+      await seedFollowThroughEvent(store, recA.id, { occurredAt: `2026-01-0${i + 1}T00:00:00.000Z` });
+    }
+    await seedFollowThroughEvent(store, recB.id, { occurredAt: "2026-01-01T00:00:00.000Z" });
+
+    const result = await getEstimateClosingCommercialEvidence(TENANT, {
+      eventStore: store,
+      getLeadsForTenant: async () => ({ leads: [], source: "supabase" as const }),
+    });
+
+    expect(result.recommendationsGenerated).toBe(3);
+    expect(result.followthroughRecorded).toBe(2); // A and B, not undercounted to 1
+    expect(result.recommendationsWithoutFollowthrough).toBe(1); // only C
   });
 });
