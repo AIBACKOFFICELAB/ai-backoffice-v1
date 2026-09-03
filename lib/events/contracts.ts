@@ -176,6 +176,59 @@ function validateScanFailedPayloadShape(payload: unknown): EventPayloadValidatio
   return forbidRawEstimatePii(payload);
 }
 
+const FOLLOWTHROUGH_ACTION_TAKEN_VALUES = ["yes", "no", "later"] as const;
+const FOLLOWTHROUGH_ACTION_CHANNEL_VALUES = ["phone", "sms", "email", "in_person", "other"] as const;
+const FOLLOWTHROUGH_CUSTOMER_RESPONSE_VALUES = ["observed", "not_observed", "unknown"] as const;
+const FOLLOWTHROUGH_BUSINESS_DISPOSITION_VALUES = ["won", "lost", "pending", "unknown"] as const;
+
+/**
+ * P1 Sprint 6: strict shape check for the follow-through evidence event —
+ * see lib/agents/estimateClosing/followThroughTypes.ts, whose
+ * parsePersistedFollowThroughPayload enforces this identical shape (deep
+ * validation, including the actionTaken/actionChannel coherence rule) —
+ * this contract is a shallow shape/privacy guard only, matching every other
+ * contract in this file. Reuses forbidRawEstimatePii as defense in depth
+ * (a follow-through payload has no legitimate path to a customer record at
+ * all — it is four bounded enums), and additionally rejects the same
+ * free-text fields validateReviewPayloadShape already forbids, since a
+ * future caller could otherwise be tempted to add "notes" here too.
+ */
+function validateFollowThroughPayloadShape(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  if (typeof payload.recommendationEventId !== "string" || !payload.recommendationEventId) {
+    return { ok: false, errors: ["payload must include recommendationEventId"] };
+  }
+  if (typeof payload.actionTaken !== "string" || !(FOLLOWTHROUGH_ACTION_TAKEN_VALUES as readonly string[]).includes(payload.actionTaken)) {
+    return { ok: false, errors: ["payload.actionTaken must be one of: yes, no, later"] };
+  }
+  if (
+    payload.actionChannel !== null &&
+    (typeof payload.actionChannel !== "string" || !(FOLLOWTHROUGH_ACTION_CHANNEL_VALUES as readonly string[]).includes(payload.actionChannel))
+  ) {
+    return { ok: false, errors: ["payload.actionChannel must be null or one of: phone, sms, email, in_person, other"] };
+  }
+  if (payload.actionTaken === "yes" && payload.actionChannel === null) {
+    return { ok: false, errors: ["payload.actionChannel is required when actionTaken is 'yes'"] };
+  }
+  if (payload.actionTaken !== "yes" && payload.actionChannel !== null) {
+    return { ok: false, errors: ["payload.actionChannel must be null unless actionTaken is 'yes'"] };
+  }
+  if (typeof payload.customerResponse !== "string" || !(FOLLOWTHROUGH_CUSTOMER_RESPONSE_VALUES as readonly string[]).includes(payload.customerResponse)) {
+    return { ok: false, errors: ["payload.customerResponse must be one of: observed, not_observed, unknown"] };
+  }
+  if (
+    typeof payload.businessDisposition !== "string" ||
+    !(FOLLOWTHROUGH_BUSINESS_DISPOSITION_VALUES as readonly string[]).includes(payload.businessDisposition)
+  ) {
+    return { ok: false, errors: ["payload.businessDisposition must be one of: won, lost, pending, unknown"] };
+  }
+  const present = FORBIDDEN_REVIEW_EVENT_FIELDS.filter((field) => field in payload);
+  if (present.length > 0) {
+    return { ok: false, errors: [`payload must not include free-text field(s): ${present.join(", ")} — see lib/events/contracts.ts`] };
+  }
+  return forbidRawEstimatePii(payload);
+}
+
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "call.missed": {
     eventType: "call.missed",
@@ -268,6 +321,20 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
     schemaVersion: 1,
     idempotency: "not_applicable",
     validatePayload: validateScanFailedPayloadShape,
+  },
+  "estimate.closing_recommendation_followthrough_recorded": {
+    eventType: "estimate.closing_recommendation_followthrough_recorded",
+    schemaVersion: 1,
+    // Required: every write always carries a computed idempotencyKey (see
+    // followThrough.ts::buildFollowThroughIdempotencyKey) — content-derived,
+    // not purely recommendation-derived, so an exact-duplicate retry
+    // dedupes to one row while a genuine correction (a different answer)
+    // is intentionally allowed to create a new, additional row. "Required"
+    // describes that every write IS keyed, not that only one row can ever
+    // exist per recommendation — see that file's own doc comment for the
+    // full append-only/correction decision.
+    idempotency: "required",
+    validatePayload: validateFollowThroughPayloadShape,
   },
 };
 
