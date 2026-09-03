@@ -97,9 +97,71 @@ describe("getEstimateClosingRecommendationEvidence", () => {
     expect(evidence.sequence?.status).toBe("completed");
     expect(evidence.leadStatus).toBe("Estimate Sent");
     expect(evidence.review).toBeNull();
+    expect(evidence.followThrough).toBeNull();
+    expect(evidence.followThroughOccurredAt).toBeNull();
+    expect(evidence.attributionState).toEqual({ evidenceStage: "RECOMMENDATION_RECORDED", attributionStage: "ATTRIBUTION_NOT_ESTABLISHED" });
     expect(evidence.toolCallExists).toBe(false);
     expect(evidence.approvalExists).toBe(false);
     expect(evidence.customerActionExists).toBe(false);
+  });
+
+  it("the owner's follow-through, when recorded, is correctly attached and advances the attribution evidence stage", async () => {
+    const seeded = await seedFullEvidence();
+    await seeded.eventStore.insert({
+      tenantId: TENANT_A,
+      eventType: "estimate.closing_recommendation_followthrough_recorded",
+      actorType: "user",
+      causationId: seeded.recommendationEventId,
+      idempotencyKey: "followthrough-key-1",
+      payload: { recommendationEventId: seeded.recommendationEventId, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+    });
+
+    const evidence = await getEstimateClosingRecommendationEvidence({ tenantId: TENANT_A, recommendationEventId: seeded.recommendationEventId }, seeded);
+    expect(evidence.found).toBe(true);
+    if (!evidence.found) throw new Error("expected found");
+    expect(evidence.followThrough).toEqual({
+      recommendationEventId: seeded.recommendationEventId,
+      actionTaken: "yes",
+      actionChannel: "phone",
+      customerResponse: "observed",
+      businessDisposition: "won",
+    });
+    expect(evidence.followThroughOccurredAt).toBeTruthy();
+    // No review was recorded in this scenario, but the follow-through
+    // itself carries action=yes + response=observed + disposition=won, so
+    // the ladder reaches its furthest evidence rung purely from
+    // follow-through — review and follow-through are independent evidence
+    // types, neither gates the other.
+    expect(evidence.attributionState.evidenceStage).toBe("BUSINESS_DISPOSITION_OBSERVED");
+    expect(evidence.attributionState.attributionStage).toBe("ATTRIBUTION_NOT_ESTABLISHED");
+  });
+
+  it("a follow-through CORRECTION (a later, different submission) is what the evidence packet reflects as current — the append-only history is never lost, but only the latest is surfaced", async () => {
+    const seeded = await seedFullEvidence();
+    await seeded.eventStore.insert({
+      tenantId: TENANT_A,
+      eventType: "estimate.closing_recommendation_followthrough_recorded",
+      actorType: "user",
+      causationId: seeded.recommendationEventId,
+      idempotencyKey: "followthrough-key-1",
+      occurredAt: "2026-09-02T00:00:00.000Z",
+      payload: { recommendationEventId: seeded.recommendationEventId, actionTaken: "later", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+    });
+    await seeded.eventStore.insert({
+      tenantId: TENANT_A,
+      eventType: "estimate.closing_recommendation_followthrough_recorded",
+      actorType: "user",
+      causationId: seeded.recommendationEventId,
+      idempotencyKey: "followthrough-key-2",
+      occurredAt: "2026-09-05T00:00:00.000Z",
+      payload: { recommendationEventId: seeded.recommendationEventId, actionTaken: "yes", actionChannel: "sms", customerResponse: "observed", businessDisposition: "won" },
+    });
+
+    const evidence = await getEstimateClosingRecommendationEvidence({ tenantId: TENANT_A, recommendationEventId: seeded.recommendationEventId }, seeded);
+    expect(evidence.found).toBe(true);
+    if (!evidence.found) throw new Error("expected found");
+    expect(evidence.followThrough?.actionTaken).toBe("yes");
+    expect(evidence.followThrough?.businessDisposition).toBe("won");
   });
 
   it("a cross-tenant recommendation is completely inaccessible — never distinguishable from 'doesn't exist'", async () => {
@@ -208,6 +270,29 @@ describe("getEstimateClosingRecommendationEvidence", () => {
     expect(evidence.found).toBe(true);
     if (!evidence.found) throw new Error("expected found");
     expect(evidence.review).toBeNull();
+  });
+
+  it("a follow-through record belonging to a DIFFERENT recommendation never leaks into this one's evidence (causationId scoping)", async () => {
+    const seeded = await seedFullEvidence();
+    const { event: otherRec } = await seeded.eventStore.insert({
+      tenantId: TENANT_A,
+      eventType: "estimate.closing_recommendation_generated",
+      entityType: "lead",
+      entityId: "lead-2",
+      payload: { recommendation: "wait", confidence: 0.4, reasonCodes: [], suggestedChannel: "none", suggestedTiming: null, opportunityValue: 500, agentRunId: null, sequenceId: null },
+    });
+    await seeded.eventStore.insert({
+      tenantId: TENANT_A,
+      eventType: "estimate.closing_recommendation_followthrough_recorded",
+      actorType: "user",
+      causationId: otherRec.id,
+      payload: { recommendationEventId: otherRec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+    });
+
+    const evidence = await getEstimateClosingRecommendationEvidence({ tenantId: TENANT_A, recommendationEventId: seeded.recommendationEventId }, seeded);
+    expect(evidence.found).toBe(true);
+    if (!evidence.found) throw new Error("expected found");
+    expect(evidence.followThrough).toBeNull();
   });
 
   it("never infers an outcome — the evidence shape carries no outcome/revenue field at all", async () => {
