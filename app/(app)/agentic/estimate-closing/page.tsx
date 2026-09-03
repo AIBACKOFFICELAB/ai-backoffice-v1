@@ -20,6 +20,7 @@ import { getEstimateClosingEvaluation } from "@/lib/agents/estimateClosing/evalu
 import { getEstimateClosingOperations } from "@/lib/agents/estimateClosing/operationsReadModel";
 import { getEstimateClosingCommercialEvidence } from "@/lib/agents/estimateClosing/commercialEvidence";
 import { getEstimateLifecycleReadModel, buildShadowReadinessLines } from "@/lib/leads/estimateLifecycleReadModel";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 
 /**
  * P1 Sprint 3 §9 — the dedicated Estimate Closing specialist workspace.
@@ -46,6 +47,10 @@ export default async function EstimateClosingWorkspacePage() {
   const agentStatus = resolveEstimateClosingAgentStatus(agents);
   const shadowEnabled = isEstimateClosingShadowEnabled();
   const leadsById = new Map(leads.map((lead) => [lead.id, lead]));
+  // P1 Sprint 6 visual acceptance hotfix — same raw-ISO presentation
+  // defect as /agentic's identical "Last durable scan" card, sourced from
+  // the same operations.lastScanAt value. Presentation only.
+  const formattedLastScanAt = formatOperationalTimestamp(operations.lastScanAt);
 
   return (
     <div className="space-y-8">
@@ -151,7 +156,12 @@ export default async function EstimateClosingWorkspacePage() {
                 </Alert>
               )}
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <MetricCard label="Last durable scan" value={operations.lastScanAt ?? "—"} icon={<Clock className="h-4 w-4" />} />
+                <MetricCard
+                  label="Last durable scan"
+                  value={formattedLastScanAt?.display ?? "—"}
+                  valueTitle={formattedLastScanAt?.title}
+                  icon={<Clock className="h-4 w-4" />}
+                />
                 <MetricCard label="Candidates scanned" value={operations.latestScanCounts?.candidatesScanned ?? "—"} />
                 <MetricCard label="Stalled found" value={operations.latestScanCounts?.stalledFound ?? "—"} />
                 <MetricCard label="Shadow attempts" value={operations.latestScanCounts?.shadowAttempts ?? "—"} />

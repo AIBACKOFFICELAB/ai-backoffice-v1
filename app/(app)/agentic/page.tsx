@@ -26,6 +26,7 @@ import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/
 import { getEstimateClosingOperations } from "@/lib/agents/estimateClosing/operationsReadModel";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { MetricCard } from "@/components/dashboard/MetricCard";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 
 /** Bounded — a small, scannable set of recent recommendation cards, not the
  * full read-model window. Matches the same discipline the dashboard's own
@@ -85,6 +86,12 @@ export default async function AgenticActivityPage() {
   const estimateClosingShadowEnabled = isEstimateClosingShadowEnabled();
   const estimateClosingSummary = summarizeEstimateClosingRecommendations(recommendationsResult.recommendations);
   const estimateClosingFailures = agentRuns.filter((run) => run.workflowId === ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID && run.status === "failed");
+  // P1 Sprint 6 visual acceptance hotfix — the raw Postgres ISO instant
+  // (e.g. "2026-09-03T11:11:54.002556+00:00") broke the compact "Last
+  // durable scan" metric card layout; format for display, keep the exact
+  // instant available as an accessible tooltip. Presentation only — does
+  // not touch operations.lastScanAt itself or any telemetry semantics.
+  const formattedLastScanAt = formatOperationalTimestamp(operations.lastScanAt);
 
   return (
     <div className="space-y-6">
@@ -174,7 +181,8 @@ export default async function AgenticActivityPage() {
               <div className="mt-4 grid gap-4 sm:grid-cols-3">
                 <MetricCard
                   label="Last durable scan"
-                  value={operations.lastScanAt ?? (operations.scanTelemetryStatus === "no_telemetry" ? "No telemetry yet" : "—")}
+                  value={formattedLastScanAt?.display ?? (operations.scanTelemetryStatus === "no_telemetry" ? "No telemetry yet" : "—")}
+                  valueTitle={formattedLastScanAt?.title}
                   tone={operations.scanTelemetryStatus === "failure_recorded" ? "warning" : "default"}
                 />
                 <MetricCard

@@ -13,6 +13,7 @@ import { Card } from "@/components/ui/Card";
 export function MetricCard({
   label,
   value,
+  valueTitle,
   helpText,
   href,
   icon,
@@ -20,6 +21,11 @@ export function MetricCard({
 }: {
   label: string;
   value: string | number;
+  /** Optional accessible tooltip (native `title` attribute) on the value —
+   * for a value rendered as concise display text, e.g. the exact raw
+   * timestamp behind a "Sep 3, 2026 · 11:11 AM UTC" display value. Never
+   * required; a bare number/string value simply has no tooltip. */
+  valueTitle?: string;
   helpText?: string;
   href?: string;
   icon?: ReactNode;
@@ -33,7 +39,9 @@ export function MetricCard({
         <p className="text-sm font-semibold text-ink-500">{label}</p>
         {icon && <span className="text-ink-400">{icon}</span>}
       </div>
-      <p className={`mt-2 text-[28px] font-bold leading-none ${valueClass}`}>{value}</p>
+      <p className={`mt-2 truncate text-[28px] font-bold leading-none ${valueClass}`} title={valueTitle}>
+        {value}
+      </p>
       {helpText && <p className="mt-2 text-xs text-ink-400">{helpText}</p>}
     </>
   );
