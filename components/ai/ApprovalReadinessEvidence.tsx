@@ -20,6 +20,9 @@ export function ApprovalReadinessEvidence({
   toolCallsAttributable,
   approvalsAttributable,
   customerActionsAttributable,
+  followthroughRecorded,
+  customerResponsesObserved,
+  ownerReportedDispositions,
 }: {
   recommendationsGenerated: number;
   recommendationsReviewed: number;
@@ -30,6 +33,14 @@ export function ApprovalReadinessEvidence({
   toolCallsAttributable: number;
   approvalsAttributable: number;
   customerActionsAttributable: number;
+  /** P1 Sprint 6 — additional evidence dimensions the directive names
+   * explicitly: follow-through coverage, observed customer responses, and
+   * observed business dispositions. Optional so this component still works
+   * for any caller that predates Sprint 6. Adding these is still just more
+   * FACTS — no threshold, no verdict, no change to the locked state below. */
+  followthroughRecorded?: number;
+  customerResponsesObserved?: number;
+  ownerReportedDispositions?: number;
 }) {
   const facts: Array<{ label: string; value: string }> = [
     { label: "Real recommendations generated", value: String(recommendationsGenerated) },
@@ -44,6 +55,9 @@ export function ApprovalReadinessEvidence({
     { label: "Customer actions taken", value: String(customerActionsAttributable) },
     { label: "Tool calls", value: String(toolCallsAttributable) },
     { label: "Approvals created", value: String(approvalsAttributable) },
+    ...(followthroughRecorded !== undefined ? [{ label: "Follow-through coverage", value: `${followthroughRecorded} actual-result record${followthroughRecorded === 1 ? "" : "s"}` }] : []),
+    ...(customerResponsesObserved !== undefined ? [{ label: "Observed customer responses", value: String(customerResponsesObserved) }] : []),
+    ...(ownerReportedDispositions !== undefined ? [{ label: "Observed business dispositions", value: String(ownerReportedDispositions) }] : []),
   ];
 
   return (

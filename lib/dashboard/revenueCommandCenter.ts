@@ -18,8 +18,11 @@ import {
 } from "@/lib/agents/estimateClosing/recommendationReadModel";
 import { resolveEstimateClosingAgentStatus, EstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateClosing/evaluationReadModel";
+import { resolveCurrentFollowThroughByRecommendation } from "@/lib/agents/estimateClosing/commercialEvidence";
 import { getEstimateFollowupSequencesForTenant } from "@/lib/modules/estimateFollowup/service";
 import { computeEstimateLifecycleReadModel } from "@/lib/leads/estimateLifecycleReadModel";
+
+const FOLLOWTHROUGH_EVENT_TYPE = "estimate.closing_recommendation_followthrough_recorded";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -59,7 +62,14 @@ const DASHBOARD_RECOMMENDATION_CARD_LIMIT = 4;
 // below, which are intentionally windowed views, but was never correct
 // for a lifetime headline total.
 
-export type AttentionItemKind = "emergency_lead" | "overdue_follow_up" | "stalled_estimate" | "pending_approval" | "agent_failure" | "recommendation_review";
+export type AttentionItemKind =
+  | "emergency_lead"
+  | "overdue_follow_up"
+  | "stalled_estimate"
+  | "pending_approval"
+  | "agent_failure"
+  | "recommendation_review"
+  | "followthrough_needed";
 
 export type AttentionItem = {
   kind: AttentionItemKind;
@@ -158,6 +168,21 @@ export function countUnreviewedRecommendations(
   return recommendations.filter((r) => !reviewedIds.has(r.recommendationEventId)).length;
 }
 
+/** P1 Sprint 6 §18 — exported for unit testing. Pure: counts recommendations
+ * in the given (already-fetched, already-bounded) window that have NO
+ * current follow-through record — independent of review status (a
+ * DIFFERENT gap: "was this recommendation good" vs. "did anything actually
+ * happen after it"). `followThroughRecommendationIds` is the set of
+ * recommendation ids that DO have a current follow-through record (already
+ * resolved by resolveCurrentFollowThroughByRecommendation), never
+ * re-derived here. */
+export function countRecommendationsMissingFollowThrough(
+  recommendations: Array<{ recommendationEventId: string }>,
+  followThroughRecommendationIds: Set<string>
+): number {
+  return recommendations.filter((r) => !followThroughRecommendationIds.has(r.recommendationEventId)).length;
+}
+
 export async function buildRevenueCommandCenterData(tenantId: string, tenantName: string): Promise<RevenueCommandCenterData> {
   const agentStore = new SupabaseAgentStore();
   const runStore = new SupabaseAgentRunStore();
@@ -200,10 +225,19 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
   // (never an independent recency limit — Codex review finding on PR #21:
   // that can under/over-count "reviewed" against recommendations actually
   // displayed), so it must run after recommendationsResult resolves.
-  const reviewsResult = await listEstimateClosingRecommendationReviews(
-    tenantId,
-    recommendationsResult.recommendations.map((r) => r.recommendationEventId),
-    { eventStore }
+  const recommendationIds = recommendationsResult.recommendations.map((r) => r.recommendationEventId);
+  const [reviewsResult, followThroughEvents] = await Promise.all([
+    listEstimateClosingRecommendationReviews(tenantId, recommendationIds, { eventStore }),
+    // P1 Sprint 6 — scoped by causationIdIn, the SAME strictly-correct
+    // linkage discipline reviewsResult above already uses (never an
+    // independent recency `limit`, which can silently mismatch — see
+    // evaluationReadModel.ts's own doc comment on this exact class of bug).
+    recommendationIds.length > 0
+      ? eventStore.listByTenant(tenantId, { eventType: FOLLOWTHROUGH_EVENT_TYPE, causationIdIn: recommendationIds })
+      : Promise.resolve([]),
+  ]);
+  const { current: followThroughByRecommendation } = resolveCurrentFollowThroughByRecommendation(
+    followThroughEvents.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload }))
   );
 
   const metrics = buildLeadMetrics(leads);
@@ -277,6 +311,24 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
       kind: "recommendation_review",
       title: "AI recommendations awaiting review",
       description: `${unreviewedRecommendationsCount} Shadow recommendation${unreviewedRecommendationsCount === 1 ? "" : "s"} ${unreviewedRecommendationsCount === 1 ? "hasn't" : "haven't"} been reviewed yet`,
+      href: "/agentic/estimate-closing",
+      occurredAt: estimateClosingSummary.latestRecommendationAt ?? new Date().toISOString(),
+    });
+  }
+
+  // P1 Sprint 6 §18 — a DIFFERENT gap from unreviewed recommendations
+  // above: recommendations with no OWNER-RECORDED actual-result follow-up
+  // yet, regardless of review status. One aggregate item, never one per
+  // recommendation; never shown at zero; never an email/SMS/push/approval.
+  const missingFollowThroughCount = countRecommendationsMissingFollowThrough(
+    recommendationsResult.recommendations,
+    new Set(followThroughByRecommendation.keys())
+  );
+  if (missingFollowThroughCount > 0) {
+    attentionItems.push({
+      kind: "followthrough_needed",
+      title: "AI recommendations still need actual-result follow-up",
+      description: `${missingFollowThroughCount} recommendation${missingFollowThroughCount === 1 ? " has" : "s have"} no recorded outcome yet`,
       href: "/agentic/estimate-closing",
       occurredAt: estimateClosingSummary.latestRecommendationAt ?? new Date().toISOString(),
     });
