@@ -239,33 +239,61 @@ export function computeEstimateClosingCommercialEvidence(input: {
 }
 
 /**
- * Bounded read for the follow-through causationIdIn query below — see
- * fetchFollowThroughEventsForRecommendations's own doc comment for why an
- * EXPLICIT limit is required here, not the store's own causationIdIn
- * default (Codex review finding on PR #25, P1).
+ * Page size for the exhaustive paged read below — see
+ * fetchFollowThroughEventsForRecommendations's own doc comment for why a
+ * SINGLE bounded fetch (even a generously large one) is never actually
+ * exhaustive (founder architecture review, PR #25 final hardening).
+ * 200-500 is the directive's own suggested range; 300 balances round-trip
+ * count against per-call payload size with no evidence either extreme is
+ * needed.
  */
-export const FOLLOWTHROUGH_EVENTS_FETCH_LIMIT = 2000;
+export const FOLLOWTHROUGH_EVENTS_PAGE_SIZE = 300;
+
+/** A defensive circuit breaker only — NOT a business truncation bound.
+ * Ordinary tenants will exhaust in a handful of pages; this exists purely
+ * to fail loudly (never silently drop rows) if a store implementation
+ * misbehaves (e.g. a broken pagination cursor that never returns a
+ * short page), rather than looping forever. 200 pages * 300/page = 60,000
+ * follow-through rows — far beyond any real tenant's history. */
+const FOLLOWTHROUGH_EVENTS_MAX_PAGES = 200;
 
 /**
- * Fetches every estimate.closing_recommendation_followthrough_recorded
- * event caused by any of `recommendationIds`. MUST pass an explicit
- * `limit`, never rely on BusinessEventStore.listByTenant's own
- * causationIdIn default (`opts.limit ?? opts.causationIdIn?.length ?? 50`
- * — see lib/events/store.ts): that default assumes AT MOST ONE row per
- * causation id, an invariant estimate.closing_recommendation_reviewed
- * genuinely has (idempotency: "required", one canonical review per
- * recommendation) but follow-through deliberately does NOT — this event
- * type permits multiple append-only correction rows per recommendation
- * (see followThrough.ts). Without an explicit limit, once ANY
- * recommendation in a bounded batch has accumulated more than one
- * correction, the implicit `causationIdIn.length` cap can silently crowd
- * OTHER recommendations' follow-through rows out of the result entirely —
- * making a recommendation that genuinely HAS follow-through read back as
- * if it had none (undercounting coverage on both the workspace's
- * Commercial Evidence section and the Dashboard's attention item). Shared
- * by getEstimateClosingCommercialEvidence below and
+ * Fetches EVERY estimate.closing_recommendation_followthrough_recorded
+ * event caused by any of `recommendationIds` — genuinely exhaustive, not
+ * bounded by any single fixed limit (founder architecture review, PR #25
+ * final hardening: an earlier version of this function used one large
+ * fixed `FOLLOWTHROUGH_EVENTS_FETCH_LIMIT = 2000` single-shot read, which
+ * fixed the original undercounting case but remained, by construction, a
+ * truncation bound — a tenant that genuinely accumulates more than 2000
+ * matching rows would silently lose the same class of coverage the
+ * original Codex finding caught). Pages through
+ * BusinessEventStore.listByTenant's `offset`/`limit`, requesting
+ * successive FOLLOWTHROUGH_EVENTS_PAGE_SIZE-row pages until a page returns
+ * FEWER than a full page (the exhaustion signal) or the defensive page-count
+ * ceiling is hit. Relies on listByTenant's now-STABLE (occurred_at DESC, id
+ * DESC) ordering (see lib/events/store.ts) so no row is skipped or
+ * duplicated at a page boundary, including when multiple rows share an
+ * identical occurred_at.
+ *
+ * MUST always pass causationIdIn explicitly, never rely on
+ * BusinessEventStore.listByTenant's own causationIdIn-derived default
+ * limit (`causationIdIn.length`, sized for AT MOST ONE row per causation
+ * id — true for reviews, deliberately false for follow-through's
+ * multi-row corrections; see followThrough.ts). Shared by
+ * getEstimateClosingCommercialEvidence below and
  * lib/dashboard/revenueCommandCenter.ts's analogous query — one
- * implementation, not two independently-drifting limits.
+ * implementation, not two independently-drifting bounds.
+ *
+ * Consistency boundary, stated honestly (P1 Sprint 6 final hardening
+ * directive §8): this is several SEQUENTIAL queries within one request,
+ * not one atomic snapshot. `business_events` is insert-only (never
+ * updated or deleted), and follow-through submissions are infrequent,
+ * human-initiated actions, so a row inserted concurrently, mid-pagination,
+ * by a genuinely simultaneous second request is an acceptable, negligible
+ * edge case for a historical evidence read — introducing a snapshot/
+ * transaction-isolation mechanism for it is not justified by any evidence
+ * of it mattering in practice, per the directive's own instruction not to
+ * add one without cause.
  */
 export async function fetchFollowThroughEventsForRecommendations(
   tenantId: string,
@@ -273,11 +301,28 @@ export async function fetchFollowThroughEventsForRecommendations(
   eventStore: BusinessEventStore
 ): Promise<BusinessEvent[]> {
   if (recommendationIds.length === 0) return [];
-  return eventStore.listByTenant(tenantId, {
-    eventType: FOLLOWTHROUGH_EVENT_TYPE,
-    causationIdIn: recommendationIds,
-    limit: FOLLOWTHROUGH_EVENTS_FETCH_LIMIT,
-  });
+
+  const all: BusinessEvent[] = [];
+  let offset = 0;
+  for (let page = 0; page < FOLLOWTHROUGH_EVENTS_MAX_PAGES; page++) {
+    const rows = await eventStore.listByTenant(tenantId, {
+      eventType: FOLLOWTHROUGH_EVENT_TYPE,
+      causationIdIn: recommendationIds,
+      limit: FOLLOWTHROUGH_EVENTS_PAGE_SIZE,
+      offset,
+    });
+    all.push(...rows);
+    if (rows.length < FOLLOWTHROUGH_EVENTS_PAGE_SIZE) {
+      return all; // exhausted — the store had no more rows to give us
+    }
+    offset += FOLLOWTHROUGH_EVENTS_PAGE_SIZE;
+  }
+  // Only reachable if a store implementation never returns a short page —
+  // fail loudly rather than silently returning a truncated result (the
+  // exact failure mode this function exists to eliminate).
+  throw new Error(
+    `[commercialEvidence] fetchFollowThroughEventsForRecommendations exceeded ${FOLLOWTHROUGH_EVENTS_MAX_PAGES} pages for tenant ${tenantId} — refusing to silently truncate`
+  );
 }
 
 export type CommercialEvidenceDeps = {

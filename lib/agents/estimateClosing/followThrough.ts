@@ -1,4 +1,3 @@
-import { createHash } from "crypto";
 import { BusinessEventStore, SupabaseBusinessEventStore } from "@/lib/events/store";
 import { emitEvent } from "@/lib/events/service";
 import {
@@ -49,16 +48,17 @@ export { parsePersistedFollowThroughPayload };
  * recommendation, exactly mirroring how scanTelemetry's "latest wins" read
  * discipline already works (operationsReadModel.ts).
  *
- * The idempotency key is content-derived — NOT simply
- * `<eventType>:<recommendationEventId>` (which would collapse every
- * correction to the SAME row, defeating the append-only design the
- * directive prefers) — so a genuine duplicate/retry (identical payload)
- * dedupes to one row, while an actual correction (different answer)
- * creates a new, additional row: `estimate.closing_recommendation_
- * followthrough_recorded:<recommendationEventId>:<sha256 of the four
- * submitted fields>`. This is a deliberate, reported architectural choice
- * (P1 Sprint 6 directive §8's "Report the decision"), not an ad hoc
- * mutation of the event system's own immutability contract.
+ * The idempotency key is REQUEST-IDENTITY-derived, not business-content-
+ * derived (P1 Sprint 6 final hardening, PR #25 — see buildFollowThroughIdempotencyKey's
+ * own doc comment for the full history: content-only, then content+time-
+ * bucketed, both proved to have a real collision case; a client-generated
+ * `submissionId` is the only approach that separates REQUEST identity from
+ * BUSINESS CONTENT cleanly). A genuine duplicate/retry of the exact same
+ * Save action (same submissionId) dedupes to one row; a new Save/correction
+ * action — even with byte-identical answers — always gets a NEW
+ * submissionId from the client and therefore always creates a new,
+ * additional row. This is a deliberate, reported architectural choice, not
+ * an ad hoc mutation of the event system's own immutability contract.
  */
 
 export type RecordFollowThroughInput = {
@@ -67,6 +67,14 @@ export type RecordFollowThroughInput = {
   actionChannel: unknown;
   customerResponse: unknown;
   businessDisposition: unknown;
+  /** Client-generated request/transport identity — NOT business content,
+   * NOT an authorization credential (tenant/recommendation ownership is
+   * independently verified regardless of this value). One value per
+   * explicit Save action; the client reuses it only when retrying that
+   * SAME action after a transport failure. See
+   * components/ai/FollowThroughControls.tsx and
+   * buildFollowThroughIdempotencyKey's doc comment. */
+  submissionId: unknown;
 };
 
 export type FollowThroughRecordError =
@@ -74,6 +82,7 @@ export type FollowThroughRecordError =
   | "invalid_action_channel"
   | "invalid_customer_response"
   | "invalid_business_disposition"
+  | "invalid_submission_id"
   | "recommendation_not_found"
   | "wrong_event_type";
 
@@ -146,42 +155,51 @@ export function validateFollowThroughInput(
   };
 }
 
-/** Deterministic — the SAME recommendation + the SAME four answers always
- * produces the SAME key (a true retry dedupes), while a DIFFERENT answer
- * (a genuine correction) always produces a DIFFERENT key (a new, additional
- * evidence row is created, never an in-place mutation). See this module's
- * top-level doc comment for the full architectural decision.
+/**
+ * History of this key's design (both prior attempts proved wrong by real
+ * regression cases, kept here so the final choice isn't re-litigated):
+ *   1. Pure content hash — collapsed a genuine A -> B -> A correction
+ *      sequence, because the third submission's content is byte-identical
+ *      to the first (Codex review finding on PR #25, P1).
+ *   2. Content hash + a coarse time bucket — fixed THAT case only when the
+ *      two A submissions land in different buckets; a legitimate RAPID
+ *      A -> B -> A within one bucket still collided (founder architecture
+ *      review, PR #25 final hardening).
+ *   3. THIS version — pure request identity. `submissionId` is a value the
+ *      CLIENT generates once per explicit Save action (see
+ *      components/ai/FollowThroughControls.tsx) and reuses ONLY when
+ *      retrying that same action after a transport failure. The server
+ *      never inspects business content or a clock to decide whether two
+ *      requests are "the same submission" — only whether `submissionId`
+ *      matches. This is the only design that cleanly separates REQUEST
+ *      identity from BUSINESS CONTENT: a true retry (same submissionId)
+ *      always dedupes, regardless of timing; a new Save/correction action
+ *      (a new submissionId) always creates a new, additional row,
+ *      regardless of how soon it follows or how similar its content is.
  *
- * TIME-BUCKETED, not purely content-derived (Codex review finding on PR
- * #25, P1): a pure content hash breaks the very sequence this design exists
- * to support — owner records A, corrects to B, later corrects BACK to A.
- * That third submission's content is byte-identical to the FIRST, so a
- * content-only key would collide with the original A event's key; the
- * unique index would then dedupe the third submission to that stale row
- * (with the ORIGINAL, now-wrong occurredAt), and the "latest wins" reader
- * would keep reporting B — an HTTP success that silently failed to record
- * the correction. Bucketing `nowMs` into the key (a coarse, injectable
- * clock) fixes this: two submissions of the same content within the SAME
- * short window (an accidental double-click, a network-level retry) still
- * dedupe to one row, but any later resubmission — even with identical
- * content — falls in a different bucket and is correctly treated as its
- * own new, current event. */
-const FOLLOWTHROUGH_DEDUPE_WINDOW_MS = 5000;
+ * `submissionId` is NEVER used for authorization — tenant/recommendation
+ * ownership is independently verified in
+ * recordEstimateClosingRecommendationFollowThrough regardless of this
+ * value; it is transport/idempotency identity only, never persisted as
+ * business evidence (it lives in the idempotency_key column, not in the
+ * payload — see the payload assembly below, which has no submissionId
+ * field).
+ */
+export function buildFollowThroughIdempotencyKey(recommendationEventId: string, submissionId: string): string {
+  return `estimate.closing_recommendation_followthrough_recorded:${recommendationEventId}:${submissionId}`;
+}
 
-export function buildFollowThroughIdempotencyKey(recommendationEventId: string, value: EstimateClosingRecommendationFollowThrough, nowMs: number): string {
-  const digest = createHash("sha256")
-    .update(
-      JSON.stringify({
-        actionTaken: value.actionTaken,
-        actionChannel: value.actionChannel,
-        customerResponse: value.customerResponse,
-        businessDisposition: value.businessDisposition,
-      })
-    )
-    .digest("hex")
-    .slice(0, 16);
-  const bucket = Math.floor(nowMs / FOLLOWTHROUGH_DEDUPE_WINDOW_MS);
-  return `estimate.closing_recommendation_followthrough_recorded:${recommendationEventId}:${digest}:${bucket}`;
+/** Bounded shape check only — this is transport identity, not a trust
+ * decision, so validation stays intentionally shallow: a non-empty string
+ * of reasonable length restricted to characters `crypto.randomUUID()` (or
+ * an equivalent UUID-shaped generator) actually produces. Never a strict
+ * UUID-v4 regex — the exact generator is a client concern (see
+ * FollowThroughControls.tsx), not a contract this server-side check should
+ * over-constrain. */
+const SUBMISSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+
+export function validateSubmissionId(value: unknown): value is string {
+  return typeof value === "string" && SUBMISSION_ID_PATTERN.test(value);
 }
 
 /**
@@ -214,6 +232,11 @@ export async function recordEstimateClosingRecommendationFollowThrough(
   const validated = validateFollowThroughInput(input);
   if (!validated.ok) return validated;
 
+  if (!validateSubmissionId(input.submissionId)) {
+    return { ok: false, error: "invalid_submission_id" };
+  }
+  const submissionId = input.submissionId;
+
   // Tenant-scoped by construction: BusinessEventStore.getById filters by
   // tenant_id, so a recommendationEventId belonging to another tenant (or
   // that doesn't exist at all) returns null either way — same
@@ -234,11 +257,6 @@ export async function recordEstimateClosingRecommendationFollowThrough(
     businessDisposition: validated.value.businessDisposition,
   };
 
-  // A single clock read, used consistently for both the idempotency-key
-  // bucket and the persisted occurredAt — never two independent reads that
-  // could otherwise drift apart across a bucket boundary.
-  const nowMs = now();
-
   const { event: persistedEvent, deduped } = await emitEvent(
     {
       tenantId,
@@ -248,16 +266,25 @@ export async function recordEstimateClosingRecommendationFollowThrough(
       entityType: recommendationEvent.entityType,
       entityId: recommendationEvent.entityId,
       causationId: recommendationEvent.id,
-      idempotencyKey: buildFollowThroughIdempotencyKey(recommendationEvent.id, followThrough, nowMs),
-      occurredAt: new Date(nowMs).toISOString(),
+      idempotencyKey: buildFollowThroughIdempotencyKey(recommendationEvent.id, submissionId),
+      occurredAt: new Date(now()).toISOString(),
       payload: followThrough as unknown as Record<string, unknown>,
     },
     eventStore
   );
 
-  // On the dedup path (an exact-content retry), reflect the ORIGINAL
-  // persisted event's own occurredAt/value rather than assuming this call's
-  // — same discipline as review.ts's identical dedup handling.
+  // On the dedup path — a true retry of the SAME submissionId — reflect
+  // the ORIGINAL persisted event's own occurredAt/value rather than
+  // assuming this call's own (possibly-altered) content ever landed; the
+  // idempotency key can never represent two different payloads, matching
+  // how every other idempotency-keyed event type in this codebase already
+  // behaves (see EVENT_SYSTEM.md) — same discipline as review.ts's
+  // identical dedup handling. A caller that reuses a submissionId with
+  // genuinely different content (a client bug, never expected in normal
+  // use — see FollowThroughControls.tsx's own contract) silently gets the
+  // FIRST submission's content back, never an error and never a mutation
+  // of what was actually persisted; it is the client's responsibility to
+  // mint a new submissionId for every new Save action.
   if (deduped) {
     const original = parsePersistedFollowThroughPayload(persistedEvent.payload);
     if (original.ok) {
@@ -278,6 +305,8 @@ export function describeFollowThroughError(error: FollowThroughRecordError): str
       return `customerResponse must be one of: ${FOLLOWTHROUGH_CUSTOMER_RESPONSE.join(", ")}`;
     case "invalid_business_disposition":
       return `businessDisposition must be one of: ${FOLLOWTHROUGH_BUSINESS_DISPOSITION.join(", ")}`;
+    case "invalid_submission_id":
+      return "submissionId is required and must be a bounded identifier";
     case "recommendation_not_found":
       return "recommendation not found";
     case "wrong_event_type":

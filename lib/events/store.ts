@@ -21,7 +21,19 @@ export interface BusinessEventStore {
    * by idempotency — so no separate `limit` is needed); both may be
    * combined but `limit` still applies to the reduced set if so.
    */
-  listByTenant(tenantId: string, opts?: { eventType?: string; limit?: number; causationIdIn?: string[] }): Promise<BusinessEvent[]>;
+  /**
+   * `offset`, when provided alongside `limit`, pages through results —
+   * added so a caller needing an EXHAUSTIVE read across more rows than any
+   * single bounded `limit` can safely request (e.g.
+   * lib/agents/estimateClosing/commercialEvidence.ts's
+   * fetchFollowThroughEventsForRecommendations, which must not silently
+   * truncate a tenant's accumulated follow-through corrections) can request
+   * successive pages instead. Ordering is always STABLE — `occurred_at`
+   * DESC, `id` DESC as a tiebreaker for rows sharing the same
+   * `occurred_at` — specifically so paging never skips or duplicates a row
+   * at a page boundary (see both implementations below).
+   */
+  listByTenant(tenantId: string, opts?: { eventType?: string; limit?: number; offset?: number; causationIdIn?: string[] }): Promise<BusinessEvent[]>;
   getById(tenantId: string, id: string): Promise<BusinessEvent | null>;
 }
 
@@ -95,7 +107,7 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
     return mapRow(data);
   }
 
-  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
+  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; offset?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
     const supabase = await createServerSupabaseClient();
     let query = supabase.from("business_events").select("*").eq("tenant_id", tenantId);
     if (opts.eventType) query = query.eq("event_type", opts.eventType);
@@ -105,8 +117,14 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
     }
     // Default limit is 50 for a plain recency read; a causationIdIn read's
     // own natural bound is the size of that id set (it can never match
-    // more rows than that) unless the caller narrows further.
-    query = query.order("occurred_at", { ascending: false }).limit(opts.limit ?? opts.causationIdIn?.length ?? 50);
+    // more rows than that) unless the caller narrows further. Secondary
+    // `id` DESC ordering is a stable tiebreaker — required for `offset`
+    // paging to be gap/duplicate-free across pages when multiple rows
+    // share an identical `occurred_at` (see the interface's own doc
+    // comment).
+    query = query.order("occurred_at", { ascending: false }).order("id", { ascending: false });
+    const limit = opts.limit ?? opts.causationIdIn?.length ?? 50;
+    query = opts.offset != null ? query.range(opts.offset, opts.offset + limit - 1) : query.limit(limit);
     const { data, error } = await query;
     if (error) throw new Error(`[business_events] list failed: ${error.message}`);
     return (data ?? []).map(mapRow);
@@ -152,18 +170,24 @@ export class InMemoryBusinessEventStore implements BusinessEventStore {
     return { event, deduped: false };
   }
 
-  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
+  async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; offset?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
     if (opts.causationIdIn && opts.causationIdIn.length === 0) return [];
     const causationIdSet = opts.causationIdIn ? new Set(opts.causationIdIn) : null;
-    return this.rows
+    const matched = this.rows
       .filter(
         (r) =>
           r.tenantId === tenantId &&
           (!opts.eventType || r.eventType === opts.eventType) &&
           (!causationIdSet || (r.causationId !== null && causationIdSet.has(r.causationId)))
       )
-      .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
-      .slice(0, opts.limit ?? causationIdSet?.size ?? 50);
+      // Same stable (occurredAt DESC, id DESC) ordering the Supabase store
+      // uses — required for offset-based paging to be gap/duplicate-free
+      // when rows share an identical occurredAt (a real possibility with
+      // this store's own millisecond-resolution default clock).
+      .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt) || b.id.localeCompare(a.id));
+    const limit = opts.limit ?? causationIdSet?.size ?? 50;
+    const offset = opts.offset ?? 0;
+    return matched.slice(offset, offset + limit);
   }
 
   async getById(tenantId: string, id: string): Promise<BusinessEvent | null> {

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   recordEstimateClosingRecommendationFollowThrough,
   validateFollowThroughInput,
+  validateSubmissionId,
   describeFollowThroughError,
   buildFollowThroughIdempotencyKey,
 } from "./followThrough";
@@ -40,6 +41,11 @@ async function seedRecommendationEvent(
   });
   return event;
 }
+
+const YES_PHONE = { actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "pending" as const };
+const YES_PHONE_WON = { ...YES_PHONE, businessDisposition: "won" as const };
+const NO_UNKNOWN = { actionTaken: "no" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const };
+const LATER_UNKNOWN = { actionTaken: "later" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const };
 
 describe("validateFollowThroughInput", () => {
   it("accepts actionTaken 'yes' with a valid channel", () => {
@@ -108,6 +114,37 @@ describe("validateFollowThroughInput", () => {
   });
 });
 
+describe("validateSubmissionId", () => {
+  it("accepts a UUID-shaped string", () => {
+    expect(validateSubmissionId("3fa85f64-5717-4562-b3fc-2c963f66afa6")).toBe(true);
+  });
+
+  it("accepts any bounded alphanumeric/dash/underscore string, not strictly UUID-v4", () => {
+    expect(validateSubmissionId("submission-abc_123")).toBe(true);
+  });
+
+  it("rejects an empty string", () => {
+    expect(validateSubmissionId("")).toBe(false);
+  });
+
+  it("rejects a non-string value", () => {
+    expect(validateSubmissionId(undefined)).toBe(false);
+    expect(validateSubmissionId(null)).toBe(false);
+    expect(validateSubmissionId(12345)).toBe(false);
+    expect(validateSubmissionId({})).toBe(false);
+  });
+
+  it("rejects a value longer than 100 characters (bounded shape only)", () => {
+    expect(validateSubmissionId("a".repeat(101))).toBe(false);
+    expect(validateSubmissionId("a".repeat(100))).toBe(true);
+  });
+
+  it("rejects characters outside the bounded set", () => {
+    expect(validateSubmissionId("has spaces")).toBe(false);
+    expect(validateSubmissionId("has;semicolon")).toBe(false);
+  });
+});
+
 describe("recordEstimateClosingRecommendationFollowThrough", () => {
   it("owner can record follow-through on a same-tenant recommendation", async () => {
     const store = new InMemoryBusinessEventStore();
@@ -116,19 +153,13 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     const result = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-1" },
       { eventStore: store }
     );
 
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.followThrough).toEqual({
-        recommendationEventId: rec.id,
-        actionTaken: "yes",
-        actionChannel: "phone",
-        customerResponse: "observed",
-        businessDisposition: "won",
-      });
+      expect(result.followThrough).toEqual({ recommendationEventId: rec.id, ...YES_PHONE_WON });
       expect(result.deduped).toBe(false);
     }
   });
@@ -140,7 +171,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "no", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: rec.id, ...NO_UNKNOWN, submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -149,6 +180,9 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     expect(recorded[0].actorType).toBe("user");
     expect(recorded[0].actorId).toBe("user-owner-1");
     expect(recorded[0].causationId).toBe(rec.id);
+    // submissionId is transport identity only — never persisted in the
+    // business payload.
+    expect(Object.keys(recorded[0].payload)).not.toContain("submissionId");
   });
 
   it("a cross-tenant recommendationEventId is refused as not_found (never distinguishes wrong-tenant from missing)", async () => {
@@ -158,7 +192,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     const result = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-B",
       "user-owner-2",
-      { recommendationEventId: rec.id, actionTaken: "no", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: rec.id, ...NO_UNKNOWN, submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -171,7 +205,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     const result = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: "does-not-exist", actionTaken: "no", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: "does-not-exist", ...NO_UNKNOWN, submissionId: "submission-1" },
       { eventStore: store }
     );
     expect(result).toEqual({ ok: false, error: "recommendation_not_found" });
@@ -191,7 +225,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     const result = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: wrongEvent.id, actionTaken: "no", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: wrongEvent.id, ...NO_UNKNOWN, submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -205,7 +239,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     const result = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "totally_did", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: rec.id, actionTaken: "totally_did", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending", submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -213,14 +247,37 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     expect(store.all()).toHaveLength(1); // only the seeded recommendation event
   });
 
-  it("an EXACT duplicate retry within the same dedupe window (same recommendation, same four answers, same moment) dedupes to the original — idempotent, no duplicate row", async () => {
+  it("refuses a missing/malformed submissionId — and business content is still validated first", async () => {
     const store = new InMemoryBusinessEventStore();
     const rec = await seedRecommendationEvent(store);
-    const input = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "pending" as const };
-    const sameMoment = () => 1_000_000_000;
 
-    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store, now: sameMoment });
-    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store, now: sameMoment });
+    const missing = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...NO_UNKNOWN, submissionId: undefined },
+      { eventStore: store }
+    );
+    expect(missing).toEqual({ ok: false, error: "invalid_submission_id" });
+
+    const malformed = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...NO_UNKNOWN, submissionId: "has spaces" },
+      { eventStore: store }
+    );
+    expect(malformed).toEqual({ ok: false, error: "invalid_submission_id" });
+
+    expect(store.all()).toHaveLength(1); // only the seeded recommendation event — nothing written
+  });
+
+  // --- A. same submissionId + same payload -> one event, second deduped ---
+  it("A. same submissionId + same payload: a true retry dedupes to the original — one event, no duplicate", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+    const input = { recommendationEventId: rec.id, ...YES_PHONE, submissionId: "submission-1" };
+
+    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store });
+    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", input, { eventStore: store });
 
     expect(first.ok && !first.deduped).toBe(true);
     expect(second.ok && second.deduped).toBe(true);
@@ -228,48 +285,142 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     expect(store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded")).toHaveLength(1);
   });
 
-  it("a correction that reverts to an EARLIER answer is never silently dropped — A -> B -> A each lands as its own current event, not deduped to the original A (Codex review finding on PR #25, P1)", async () => {
-    const store = new InMemoryBusinessEventStore();
-    const rec = await seedRecommendationEvent(store);
-    const stateA = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "pending" as const };
-    const stateB = { recommendationEventId: rec.id, actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    // Each submission is far enough apart (well beyond the 5s dedupe
-    // window) to be unambiguously a distinct, later submission, never an
-    // accidental retry of the previous one.
-    const first = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateA, { eventStore: store, now: () => 1_000_000_000 });
-    const second = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateB, { eventStore: store, now: () => 1_000_020_000 });
-    // The third submission's CONTENT is byte-identical to the first (A
-    // again) — this is exactly the case a pure content-hash key would
-    // wrongly collide on.
-    const third = await recordEstimateClosingRecommendationFollowThrough("tenant-1", "user-owner-1", stateA, { eventStore: store, now: () => 1_000_040_000 });
-
-    expect(first.ok && !first.deduped).toBe(true);
-    expect(second.ok && !second.deduped).toBe(true);
-    expect(third.ok && !third.deduped).toBe(true); // NOT deduped to the first A
-
-    const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
-    expect(recorded).toHaveLength(3); // all three evidence rows survive, append-only
-
-    // The "current" (latest-by-occurredAt) resolved value must be the
-    // THIRD submission's own occurredAt — not the first A's stale one.
-    const latest = recorded.reduce((a, b) => (b.occurredAt > a.occurredAt ? b : a));
-    expect(latest.payload).toEqual({ recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "pending" });
-  });
-
-  it("a genuine CORRECTION (a different answer for the same recommendation) creates a NEW, additional row — append-only, never overwritten", async () => {
+  // --- B. same submissionId + altered payload -> preserves original submission semantics ---
+  it("B. same submissionId + ALTERED payload: the idempotency key can never represent two payloads — the request dedupes to the ORIGINAL content, never a validation error, never a silent overwrite (documented choice, matching every other idempotency-keyed event type in this codebase)", async () => {
     const store = new InMemoryBusinessEventStore();
     const rec = await seedRecommendationEvent(store);
 
     const first = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "later", actionChannel: null, customerResponse: "unknown", businessDisposition: "pending" },
+      { recommendationEventId: rec.id, ...YES_PHONE, submissionId: "submission-1" },
+      { eventStore: store }
+    );
+    // A caller bug (or a malicious replay) reusing the SAME submissionId
+    // with genuinely different content.
+    const second = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-1" },
+      { eventStore: store }
+    );
+
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (first.ok && second.ok) {
+      expect(second.deduped).toBe(true);
+      // The FIRST submission's content wins — the second call's own
+      // (different) businessDisposition is never persisted.
+      expect(second.followThrough).toEqual(first.followThrough);
+      expect(second.followThrough.businessDisposition).toBe("pending");
+    }
+    expect(store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded")).toHaveLength(1);
+  });
+
+  // --- C. A -> B -> A with THREE different submissionIds -> 3 events, current resolves final A ---
+  it("C. A -> B -> A with three distinct submissionIds, all within the same instant: 3 persisted events, current state resolves the final A (Codex + founder review findings on PR #25, P1 — the fix)", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+    const sameInstant = () => 1_000_000_000; // identical clock reading for all three — proves dedup no longer depends on timing at all
+
+    const first = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE, submissionId: "submission-A1" },
+      { eventStore: store, now: sameInstant }
+    );
+    const second = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-B" },
+      { eventStore: store, now: sameInstant }
+    );
+    const third = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE, submissionId: "submission-A2" },
+      { eventStore: store, now: sameInstant }
+    );
+
+    expect(first.ok && !first.deduped).toBe(true);
+    expect(second.ok && !second.deduped).toBe(true);
+    expect(third.ok && !third.deduped).toBe(true); // NOT deduped, despite identical content AND identical timestamp
+
+    const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
+    expect(recorded).toHaveLength(3);
+  });
+
+  // --- D. A -> B -> A with identical timestamps: request identity still distinguishes ---
+  it("D. identical occurredAt across all three submissions (store permits it): request identity alone still keeps them as 3 distinct rows", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+    const frozen = () => 1_700_000_000_000;
+
+    for (const submissionId of ["s1", "s2", "s3"]) {
+      await recordEstimateClosingRecommendationFollowThrough(
+        "tenant-1",
+        "user-owner-1",
+        { recommendationEventId: rec.id, ...YES_PHONE, submissionId },
+        { eventStore: store, now: frozen }
+      );
+    }
+
+    const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
+    expect(recorded).toHaveLength(3);
+    expect(new Set(recorded.map((e) => e.occurredAt)).size).toBe(1); // genuinely identical timestamps
+  });
+
+  // --- E. transport retry of B using same submissionId -> only one B event ---
+  it("E. a transport retry of a correction (same submissionId reused after a simulated failure) creates only ONE event for that correction", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+
+    // The "first" submission (A) succeeds normally.
+    await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE, submissionId: "submission-A" },
+      { eventStore: store }
+    );
+
+    // The owner corrects to B. The client mints "submission-B" and the
+    // request appears to fail on the wire (simulated: caller code retries
+    // with the SAME submissionId, exactly as FollowThroughControls.tsx
+    // does on a transport error).
+    const bAttempt1 = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-B" },
+      { eventStore: store }
+    );
+    const bAttempt2 = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-B" },
+      { eventStore: store }
+    );
+
+    expect(bAttempt1.ok && !bAttempt1.deduped).toBe(true);
+    expect(bAttempt2.ok && bAttempt2.deduped).toBe(true);
+
+    const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
+    expect(recorded).toHaveLength(2); // the original A, and exactly one B (not two)
+  });
+
+  it("a genuine CORRECTION (a different answer, a NEW submissionId) creates a NEW, additional row — append-only, never overwritten", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store);
+
+    const first = await recordEstimateClosingRecommendationFollowThrough(
+      "tenant-1",
+      "user-owner-1",
+      { recommendationEventId: rec.id, ...LATER_UNKNOWN, submissionId: "submission-1" },
       { eventStore: store }
     );
     const second = await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "sms", customerResponse: "observed", businessDisposition: "won" },
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-2" },
       { eventStore: store }
     );
 
@@ -280,14 +431,13 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     expect(recorded).toHaveLength(2);
   });
 
-  it("follow-through is idempotent per-tenant — a different tenant with an equivalently-shaped submission is independent", async () => {
+  it("follow-through is idempotent per-tenant — a different tenant with an equivalently-shaped submission (even the same submissionId string) is independent", async () => {
     const store = new InMemoryBusinessEventStore();
     const recA = await seedRecommendationEvent(store, { tenantId: "tenant-A", entityId: "lead-A" });
     const recB = await seedRecommendationEvent(store, { tenantId: "tenant-B", entityId: "lead-B" });
-    const input = { actionTaken: "no" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const };
 
-    await recordEstimateClosingRecommendationFollowThrough("tenant-A", "user-A", { recommendationEventId: recA.id, ...input }, { eventStore: store });
-    await recordEstimateClosingRecommendationFollowThrough("tenant-B", "user-B", { recommendationEventId: recB.id, ...input }, { eventStore: store });
+    await recordEstimateClosingRecommendationFollowThrough("tenant-A", "user-A", { recommendationEventId: recA.id, ...NO_UNKNOWN, submissionId: "submission-shared" }, { eventStore: store });
+    await recordEstimateClosingRecommendationFollowThrough("tenant-B", "user-B", { recommendationEventId: recB.id, ...NO_UNKNOWN, submissionId: "submission-shared" }, { eventStore: store });
 
     const recorded = store.all().filter((e) => e.eventType === "estimate.closing_recommendation_followthrough_recorded");
     expect(recorded).toHaveLength(2);
@@ -302,10 +452,8 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
       "user-owner-1",
       {
         recommendationEventId: rec.id,
-        actionTaken: "yes",
-        actionChannel: "phone",
-        customerResponse: "observed",
-        businessDisposition: "won",
+        ...YES_PHONE_WON,
+        submissionId: "submission-1",
         // Deliberately smuggling extra fields a caller might send over
         // HTTP — RecordFollowThroughInput has no such fields.
         notes: "the customer said they'd think about it",
@@ -335,7 +483,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -351,7 +499,7 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
     await recordEstimateClosingRecommendationFollowThrough(
       "tenant-1",
       "user-owner-1",
-      { recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+      { recommendationEventId: rec.id, ...YES_PHONE_WON, submissionId: "submission-1" },
       { eventStore: store }
     );
 
@@ -362,37 +510,22 @@ describe("recordEstimateClosingRecommendationFollowThrough", () => {
 });
 
 describe("buildFollowThroughIdempotencyKey", () => {
-  const NOW = 1_700_000_000_000;
-
-  it("is deterministic — the same recommendation + same answers + same time bucket always produces the same key", () => {
-    const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    expect(buildFollowThroughIdempotencyKey("rec-1", value, NOW)).toBe(buildFollowThroughIdempotencyKey("rec-1", { ...value }, NOW));
+  it("is deterministic — the same recommendation + same submissionId always produces the same key", () => {
+    expect(buildFollowThroughIdempotencyKey("rec-1", "submission-1")).toBe(buildFollowThroughIdempotencyKey("rec-1", "submission-1"));
   });
 
-  it("differs when any one of the four answers differs", () => {
-    const base = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    const key = buildFollowThroughIdempotencyKey("rec-1", base, NOW);
-    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, actionTaken: "no", actionChannel: null }, NOW)).not.toBe(key);
-    expect(buildFollowThroughIdempotencyKey("rec-1", { ...base, businessDisposition: "lost" }, NOW)).not.toBe(key);
+  it("differs when the submissionId differs, even for the identical recommendation", () => {
+    expect(buildFollowThroughIdempotencyKey("rec-1", "submission-1")).not.toBe(buildFollowThroughIdempotencyKey("rec-1", "submission-2"));
   });
 
-  it("differs across recommendations even with identical answers and identical time", () => {
-    const value = { recommendationEventId: "irrelevant", actionTaken: "no" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const };
-    expect(buildFollowThroughIdempotencyKey("rec-1", value, NOW)).not.toBe(buildFollowThroughIdempotencyKey("rec-2", value, NOW));
+  it("differs across recommendations even with the identical submissionId", () => {
+    expect(buildFollowThroughIdempotencyKey("rec-1", "submission-1")).not.toBe(buildFollowThroughIdempotencyKey("rec-2", "submission-1"));
   });
 
-  it("differs across time buckets even with identical recommendation and identical answers — the fix for the A -> B -> A collision (Codex review finding on PR #25, P1)", () => {
-    const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    const keyAtT0 = buildFollowThroughIdempotencyKey("rec-1", value, NOW);
-    const keyMuchLater = buildFollowThroughIdempotencyKey("rec-1", value, NOW + 60_000); // 60s later — a different bucket
-    expect(keyAtT0).not.toBe(keyMuchLater);
-  });
-
-  it("does NOT differ within the same short dedupe window — an accidental double-click or network retry still collapses to one key", () => {
-    const value = { recommendationEventId: "rec-1", actionTaken: "yes" as const, actionChannel: "phone" as const, customerResponse: "observed" as const, businessDisposition: "won" as const };
-    const keyAtT0 = buildFollowThroughIdempotencyKey("rec-1", value, NOW);
-    const keyMomentsLater = buildFollowThroughIdempotencyKey("rec-1", value, NOW + 50); // 50ms later — same bucket
-    expect(keyAtT0).toBe(keyMomentsLater);
+  it("never depends on business content or a clock — content and timing are not parameters of this function at all", () => {
+    // Structural proof: the function only accepts (recommendationEventId,
+    // submissionId) — there is no third parameter for content or time.
+    expect(buildFollowThroughIdempotencyKey.length).toBe(2);
   });
 });
 
@@ -403,6 +536,7 @@ describe("describeFollowThroughError", () => {
       "invalid_action_channel",
       "invalid_customer_response",
       "invalid_business_disposition",
+      "invalid_submission_id",
       "recommendation_not_found",
       "wrong_event_type",
     ];

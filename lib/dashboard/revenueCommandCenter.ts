@@ -228,12 +228,13 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     listEstimateClosingRecommendationReviews(tenantId, recommendationIds, { eventStore }),
     // P1 Sprint 6 — scoped by causationIdIn, the SAME strictly-correct
     // linkage discipline reviewsResult above already uses. MUST go through
-    // fetchFollowThroughEventsForRecommendations (an explicit, generous
-    // limit), never a bare listByTenant call — that store call's own
+    // fetchFollowThroughEventsForRecommendations (an EXHAUSTIVE paged
+    // read), never a bare listByTenant call — that store call's own
     // causationIdIn default assumes at most one row per recommendation,
     // which holds for reviews but NOT for follow-through's deliberately
-    // multi-row corrections (Codex review finding on PR #25, P1 — see that
-    // function's own doc comment in commercialEvidence.ts).
+    // multi-row corrections (Codex + founder architecture review findings
+    // on PR #25 — see that function's own doc comment in
+    // commercialEvidence.ts for the full history).
     fetchFollowThroughEventsForRecommendations(tenantId, recommendationIds, eventStore),
   ]);
   const { current: followThroughByRecommendation } = resolveCurrentFollowThroughByRecommendation(

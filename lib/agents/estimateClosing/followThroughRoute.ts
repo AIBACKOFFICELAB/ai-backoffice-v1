@@ -23,6 +23,7 @@ function statusForFollowThroughError(error: FollowThroughRecordError): number {
     case "invalid_action_channel":
     case "invalid_customer_response":
     case "invalid_business_disposition":
+    case "invalid_submission_id":
       return 400;
     case "recommendation_not_found":
     case "wrong_event_type":
@@ -76,6 +77,11 @@ export async function handleFollowThroughRequest(request: NextRequest, eventId: 
     actionChannel: isRecord(body) ? (body.actionChannel ?? null) : null,
     customerResponse: isRecord(body) ? body.customerResponse : undefined,
     businessDisposition: isRecord(body) ? body.businessDisposition : undefined,
+    // Request/transport identity only — see followThrough.ts's
+    // buildFollowThroughIdempotencyKey doc comment. Never used for
+    // authorization here or downstream; tenant/recommendation ownership is
+    // independently verified regardless of this value.
+    submissionId: isRecord(body) ? body.submissionId : undefined,
   });
 
   if (!result.ok) {

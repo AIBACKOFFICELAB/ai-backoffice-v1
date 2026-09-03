@@ -17,7 +17,7 @@ const UNAUTHENTICATED = { authenticated: false, response: NextResponse.json({ er
 const OWNER_TENANT: TenantContext = { tenantId: "tenant-1", tenantName: "Test Co", tenantSlug: "test-co", role: "owner", userId: "user-owner" };
 const STAFF_TENANT: TenantContext = { tenantId: "tenant-1", tenantName: "Test Co", tenantSlug: "test-co", role: "staff", userId: "user-staff" };
 
-const VALID_BODY = { actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" };
+const VALID_BODY = { actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won", submissionId: "submission-1" };
 
 describe("handleFollowThroughRequest", () => {
   it("returns 401 when unauthenticated", async () => {
@@ -75,10 +75,11 @@ describe("handleFollowThroughRequest", () => {
       actionChannel: "phone",
       customerResponse: "observed",
       businessDisposition: "won",
+      submissionId: "submission-1",
     });
   });
 
-  it("passes actionChannel as null when omitted (actionTaken 'no'/'later' case)", async () => {
+  it("passes actionChannel as null when omitted (actionTaken 'no'/'later' case), and passes submissionId through unchanged", async () => {
     const recordFollowThrough = vi.fn(async () => ({
       ok: true as const,
       followThrough: { recommendationEventId: "rec-1", actionTaken: "no" as const, actionChannel: null, customerResponse: "unknown" as const, businessDisposition: "pending" as const },
@@ -86,7 +87,7 @@ describe("handleFollowThroughRequest", () => {
       deduped: false,
     }));
 
-    await handleFollowThroughRequest(makeRequest({ actionTaken: "no", customerResponse: "unknown", businessDisposition: "pending" }), "rec-1", {
+    await handleFollowThroughRequest(makeRequest({ actionTaken: "no", customerResponse: "unknown", businessDisposition: "pending", submissionId: "submission-2" }), "rec-1", {
       checkAuth: async () => AUTHENTICATED,
       resolveTenant: async () => OWNER_TENANT,
       recordFollowThrough,
@@ -98,15 +99,17 @@ describe("handleFollowThroughRequest", () => {
       actionChannel: null,
       customerResponse: "unknown",
       businessDisposition: "pending",
+      submissionId: "submission-2",
     });
   });
 
-  it("maps each follow-through error to its correct HTTP status", async () => {
+  it("maps each follow-through error to its correct HTTP status, including invalid_submission_id", async () => {
     const cases: Array<[string, number]> = [
       ["invalid_action_taken", 400],
       ["invalid_action_channel", 400],
       ["invalid_customer_response", 400],
       ["invalid_business_disposition", 400],
+      ["invalid_submission_id", 400],
       ["recommendation_not_found", 404],
       ["wrong_event_type", 404],
     ];

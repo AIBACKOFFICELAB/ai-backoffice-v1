@@ -8,7 +8,7 @@ import {
 } from "./commercialEvidence";
 import { EstimateClosingRecommendationView } from "./recommendationReadModel";
 import { EstimateClosingRecommendationReviewView } from "./evaluationReadModel";
-import { InMemoryBusinessEventStore } from "@/lib/events/store";
+import { InMemoryBusinessEventStore, BusinessEventStore } from "@/lib/events/store";
 
 const TENANT = "tenant-1";
 
@@ -375,5 +375,143 @@ describe("fetchFollowThroughEventsForRecommendations / getEstimateClosingCommerc
     expect(result.recommendationsGenerated).toBe(3);
     expect(result.followthroughRecorded).toBe(2); // A and B, not undercounted to 1
     expect(result.recommendationsWithoutFollowthrough).toBe(1); // only C
+  });
+});
+
+describe("fetchFollowThroughEventsForRecommendations — exhaustive pagination (founder architecture review, PR #25 final hardening)", () => {
+  it("returns EVERY row when a single recommendation has more than 2000 corrections — no fixed-limit truncation", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store, "lead-a");
+    const TOTAL = 2005;
+    for (let i = 0; i < TOTAL; i++) {
+      const iso = new Date(Date.parse("2026-01-01T00:00:00.000Z") + i * 1000).toISOString();
+      await seedFollowThroughEvent(store, rec.id, { occurredAt: iso, businessDisposition: i === TOTAL - 1 ? "won" : "pending" });
+    }
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [rec.id], store);
+    expect(events).toHaveLength(TOTAL);
+    // No duplicate ids across page boundaries.
+    expect(new Set(events.map((e) => e.id)).size).toBe(TOTAL);
+  }, 20000);
+
+  it("one recommendation with >2000 corrections cannot crowd another recommendation out of the batch", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const recA = await seedRecommendationEvent(store, "lead-a");
+    const recB = await seedRecommendationEvent(store, "lead-b");
+    for (let i = 0; i < 2005; i++) {
+      const iso = new Date(Date.parse("2026-01-01T00:00:00.000Z") + i * 1000).toISOString();
+      await seedFollowThroughEvent(store, recA.id, { occurredAt: iso });
+    }
+    // recB's single record is older than ALL of recA's 2005 rows — exactly
+    // the case a fixed single-page limit would drop.
+    await seedFollowThroughEvent(store, recB.id, { occurredAt: "2025-01-01T00:00:00.000Z", businessDisposition: "won" });
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [recA.id, recB.id], store);
+    const { current } = resolveCurrentFollowThroughByRecommendation(events.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload })));
+
+    expect(current.has(recB.id)).toBe(true);
+    expect(current.get(recB.id)?.followThrough.businessDisposition).toBe("won");
+  }, 20000);
+
+  it("newest/current state resolves correctly for every recommendation even across many pages", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const recA = await seedRecommendationEvent(store, "lead-a");
+    for (let i = 0; i < 2005; i++) {
+      const iso = new Date(Date.parse("2026-01-01T00:00:00.000Z") + i * 1000).toISOString();
+      // The LAST inserted row (i = 2004) has the latest occurredAt and is
+      // the only one marked "won" — proves the paged fetch preserves it as
+      // the correctly-resolved "current" state, not lost or reordered.
+      await seedFollowThroughEvent(store, recA.id, { occurredAt: iso, businessDisposition: i === 2004 ? "won" : "pending" });
+    }
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [recA.id], store);
+    const { current } = resolveCurrentFollowThroughByRecommendation(events.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload })));
+    expect(current.get(recA.id)?.followThrough.businessDisposition).toBe("won");
+  }, 20000);
+
+  it("malformed records within a large paged result are safely skipped, never crash the fetch or the resolver", async () => {
+    const store = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(store, "lead-a");
+    for (let i = 0; i < 650; i++) {
+      const iso = new Date(Date.parse("2026-01-01T00:00:00.000Z") + i * 1000).toISOString();
+      if (i % 100 === 0) {
+        // A malformed payload scattered across page boundaries (page size 300).
+        await store.insert({ tenantId: TENANT, eventType: "estimate.closing_recommendation_followthrough_recorded", actorType: "user", causationId: rec.id, occurredAt: iso, payload: { actionTaken: "garbage" } });
+      } else {
+        await seedFollowThroughEvent(store, rec.id, { occurredAt: iso });
+      }
+    }
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [rec.id], store);
+    expect(events).toHaveLength(650);
+    const { current, skippedMalformed } = resolveCurrentFollowThroughByRecommendation(events.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload })));
+    expect(skippedMalformed).toBe(7); // i = 0, 100, ..., 600
+    expect(current.has(rec.id)).toBe(true);
+  }, 20000);
+
+  it("tenant isolation is preserved across pages — a different tenant's rows never appear, even sharing the same causationId string", async () => {
+    const storeA = new InMemoryBusinessEventStore();
+    const rec = await seedRecommendationEvent(storeA, "lead-a"); // tenant-1
+    await seedFollowThroughEvent(storeA, rec.id, { occurredAt: "2026-01-01T00:00:00.000Z" });
+    // Insert a row for a DIFFERENT tenant with the identical causationId
+    // string (a plausible collision if two tenants' recommendation ids
+    // ever matched) directly into the same store instance.
+    await storeA.insert({ tenantId: "tenant-OTHER", eventType: "estimate.closing_recommendation_followthrough_recorded", actorType: "user", causationId: rec.id, occurredAt: "2026-01-02T00:00:00.000Z", payload: { recommendationEventId: rec.id, actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" } });
+
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [rec.id], storeA);
+    expect(events).toHaveLength(1); // only tenant-1's row
+    expect(events[0].tenantId).toBe(TENANT);
+  });
+
+  it("zero recommendation IDs makes zero store calls", async () => {
+    const calls: unknown[] = [];
+    const spyingStore: BusinessEventStore = {
+      async insert(input) {
+        throw new Error("should never be called");
+      },
+      async listByTenant(...args) {
+        calls.push(args);
+        return [];
+      },
+      async getById() {
+        return null;
+      },
+    };
+    const events = await fetchFollowThroughEventsForRecommendations(TENANT, [], spyingStore);
+    expect(events).toEqual([]);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("pagination terminates — a store that never returns a short page fails loudly instead of looping forever", async () => {
+    const alwaysFullPage: BusinessEventStore = {
+      async insert(input) {
+        throw new Error("should never be called");
+      },
+      async listByTenant(_tenantId, opts) {
+        // Always returns exactly a full page, forever — simulates a
+        // broken/misbehaving store implementation.
+        return Array.from({ length: opts?.limit ?? 0 }, (_, i) => ({
+          id: `fake-${i}`,
+          tenantId: TENANT,
+          eventType: "estimate.closing_recommendation_followthrough_recorded",
+          actorType: "user" as const,
+          actorId: null,
+          entityType: null,
+          entityId: null,
+          correlationId: "corr",
+          causationId: "rec-1",
+          idempotencyKey: null,
+          payload: { recommendationEventId: "rec-1", actionTaken: "yes", actionChannel: "phone", customerResponse: "observed", businessDisposition: "won" },
+          metadata: {},
+          occurredAt: "2026-01-01T00:00:00.000Z",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }));
+      },
+      async getById() {
+        return null;
+      },
+    };
+
+    await expect(fetchFollowThroughEventsForRecommendations(TENANT, ["rec-1"], alwaysFullPage)).rejects.toThrow(/exceeded/);
   });
 });

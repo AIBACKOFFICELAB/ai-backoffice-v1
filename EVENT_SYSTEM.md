@@ -192,12 +192,21 @@ story is represented as MULTIPLE events over time, one per submission, with
 the read side (`commercialEvidence.ts::resolveCurrentFollowThroughByRecommendation`)
 resolving "current" as the most recent one by `occurredAt` — the same
 "latest wins" discipline the scan-telemetry read side already uses. The
-idempotency key is content-derived (`estimate.closing_recommendation_
-followthrough_recorded:<recommendationEventId>:<hash of the four answers>`),
-so an exact-duplicate retry (a double-click, a network retry) dedupes to one
-row, while a genuine correction (a different answer) is intentionally
-allowed to create a new, additional row — nothing is ever deleted or
-overwritten.
+idempotency key is REQUEST-IDENTITY-derived, not business-content-derived
+(`estimate.closing_recommendation_followthrough_recorded:
+<recommendationEventId>:<client-generated submissionId>` — see
+`followThrough.ts::buildFollowThroughIdempotencyKey`'s own doc comment for
+the two earlier, both-proved-wrong designs: a pure content hash, then a
+content hash plus a coarse time bucket, each defeated by a real correction
+sequence). A client-generated `submissionId` (one per explicit Save action,
+reused only when retrying that SAME action after a transport failure — see
+`components/ai/FollowThroughControls.tsx`) is the only approach that
+cleanly separates REQUEST identity from BUSINESS CONTENT: an exact-duplicate
+retry (same submissionId) dedupes to one row regardless of timing, while a
+genuine correction — even one that reverts to an earlier answer, submitted
+seconds later — always gets a new submissionId and therefore always creates
+a new, additional row. `submissionId` is transport identity only: never
+persisted in the event payload, never used for authorization.
 
 **Privacy contract**: the payload carries exactly four bounded enum fields
 (`actionTaken`, `actionChannel`, `customerResponse`, `businessDisposition`)
