@@ -41,6 +41,13 @@ const SPRINT_5_FILES = [
   "recommendationEvidence.ts",
 ];
 
+const SPRINT_6_FILES = [
+  "followThroughTypes.ts",
+  "followThrough.ts",
+  "followThroughRoute.ts",
+  "commercialEvidence.ts",
+];
+
 // Usage-specific patterns — an actual import, call, or declaration — NOT a
 // bare word match. Every file in this codebase, this test one included,
 // legitimately uses these words in DOC COMMENTS to describe their own
@@ -66,6 +73,29 @@ describe("P1 Sprint 5 authority freeze — new/touched scan-path and read-model 
       }
     });
   }
+
+  for (const file of SPRINT_6_FILES) {
+    it(`${file} contains no send-tool, approval, or toolPlan surface`, () => {
+      const source = readSourceWithoutComments(file);
+      for (const { pattern, reason } of FORBIDDEN_PATTERNS) {
+        expect(pattern.test(source), `${file} matched forbidden pattern ${pattern} — ${reason}`).toBe(false);
+      }
+    });
+  }
+
+  it("followThrough.ts never imports a lead-mutation function or an OutcomeStore — structurally cannot mutate a lead or write a canonical outcome (P1 Sprint 6 §10/§11)", () => {
+    const source = readSourceWithoutComments("followThrough.ts");
+    expect(source).not.toMatch(/updateLead\s*\(/);
+    expect(source).not.toMatch(/from\s+["'][^"']*leads\/(repository|supabase)["']/i);
+    expect(source).not.toMatch(/OutcomeStore/);
+    expect(source).not.toMatch(/recordOutcome\s*\(/);
+  });
+
+  it("commercialEvidence.ts never writes to outcomes and never imports an OutcomeStore — read-only, observation-only", () => {
+    const source = readSourceWithoutComments("commercialEvidence.ts");
+    expect(source).not.toMatch(/OutcomeStore/);
+    expect(source).not.toMatch(/recordOutcome\s*\(/);
+  });
 
   it("shadowRunner.ts (unchanged by this sprint) still has no toolPlan parameter and never imports the tool/approval runtime", () => {
     const source = readSourceWithoutComments("shadowRunner.ts");

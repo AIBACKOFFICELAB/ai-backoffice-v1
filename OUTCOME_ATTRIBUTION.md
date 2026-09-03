@@ -140,6 +140,91 @@ observation of what AI noticed — never a claim of recovered or won
 revenue; nothing in this sprint changes that boundary or adds a new dollar
 figure anywhere.
 
+## Follow-through is not an outcome (P1 Sprint 6)
+
+P1 Sprint 6 adds owner-recorded recommendation follow-through
+(`estimate.closing_recommendation_followthrough_recorded` — see
+`EVENT_SYSTEM.md`) and a commercial evidence read model
+(`lib/agents/estimateClosing/commercialEvidence.ts`). Neither writes a
+canonical `outcomes` row, and neither is ever conflated with one — this
+sprint adds **zero** new outcome writers. `authorityFreeze.test.ts` pins
+this structurally: `followThrough.ts` and `commercialEvidence.ts` import no
+`OutcomeStore` and call no `recordOutcome`.
+
+**The constitutional attribution rule this sprint enforces throughout:**
+
+```
+AI recommendation != owner review != owner action != customer response
+!= estimate won != AI-caused revenue
+```
+
+No stage automatically implies the next. Concretely:
+
+- **A recommendation review's `wouldAct: "yes"`** is the owner's stated
+  INTENT at review time — it has never meant, and still does not mean, the
+  owner actually acted. Sprint 6 adds the missing evidence for the real
+  question ("did you act on this?") as an entirely separate, later,
+  optional record — it never reinterprets `wouldAct` as `actionTaken`.
+- **`actionTaken: "yes"`** means the owner reports they followed up. It
+  does not imply the customer responded — `customerResponse` is recorded
+  independently and can be "unknown" even when `actionTaken` is "yes".
+- **`customerResponse: "observed"`** means a response was noted. It does
+  not imply the business was won — `businessDisposition` is a separate
+  field, and the read model's diagnostics (`commercialEvidence.ts`) flag
+  (never auto-correct) the internally-unusual case of a response observed
+  without a recorded action.
+- **`businessDisposition: "won"`** is an OWNER-REPORTED, self-attested
+  observation about the current state of the deal — not a canonical,
+  attributed `estimate_won` outcome. It creates no `outcomes` row, and
+  `attributionConfidence` is never assigned to it. A dashboard or workspace
+  surface may say "owner-reported wins" — it must never say "AI wins",
+  "revenue recovered", or state/imply a conversion rate this figure does
+  not support (see `commercialEvidence.ts`'s `followThroughCoverageRate`,
+  deliberately named with its denominator explicit rather than "conversion
+  rate").
+- **Owner-reported "won" is NEVER direct AI attribution.** Even a
+  `businessDisposition: "won"` recorded immediately after `actionTaken:
+  "yes"` and `customerResponse: "observed"` does not establish that THIS
+  recommendation caused the win — a walk-in, a referral, or unrelated
+  timing could equally explain it. Establishing genuine `direct`
+  attribution requires the same rigor every other `direct` outcome in this
+  codebase requires (see "Attribution confidence" above) — self-reported
+  sequence-of-events is not causal proof.
+
+**The pure evidence-ladder resolver**
+(`commercialEvidence.ts::resolveEstimateClosingAttributionState`) makes
+this explicit in code, not just prose: it returns an `evidenceStage` (how
+far the OBSERVED evidence chain reaches — RECOMMENDATION_RECORDED through
+BUSINESS_DISPOSITION_OBSERVED) as a field entirely SEPARATE from
+`attributionStage`, which this sprint hardcodes to
+`"ATTRIBUTION_NOT_ESTABLISHED"` — a type-level constant, not a runtime
+computation — regardless of how far the evidence ladder reaches. It is
+literally impossible for this sprint's code to report an established
+attribution; a future sprint that adds a real canonical-outcome path would
+have to deliberately widen that type, not silently repurpose it. See
+`app/(app)/agentic/estimate-closing/recommendations/[eventId]/page.tsx`'s
+Attribution evidence ladder, which renders `evidenceStage`'s progress
+per-row while always showing "Revenue attribution: NOT ESTABLISHED".
+
+**Lead status is a separate evidence system, never silently synchronized.**
+`leads.status` transitions through the ordinary lead-management flow, with
+zero causal connection to a recommendation or its follow-through. Recording
+`businessDisposition: "won"` never writes `leads.status = "Won"`, and vice
+versa — when the two disagree (e.g. follow-through says "Won" but the lead
+is still "Estimate Sent"), the recommendation detail page surfaces a
+bounded discrepancy note rather than auto-correcting either record; see
+`computeEstimateClosingCommercialEvidence`'s `disposition_lead_status_
+mismatch` diagnostic.
+
+**Trust-promotion evidence boundary.** `ApprovalReadinessEvidence` (P1
+Sprint 3) now also surfaces follow-through coverage, observed customer
+responses, and observed business dispositions as additional FACTS — still
+with no computed threshold, no readiness score, and no automatic promotion
+logic. Human Approval Mode remains NOT AUTHORIZED regardless of how much
+evidence accumulates; that a canonical-outcome-free evidence trail exists
+is itself the honest thing to display ("Evidence available for founder
+decision" — never "Ready for Approval Mode").
+
 ## Deferred
 
 - No revenue dashboard yet (P1 — "Prove measurable business ROI with the

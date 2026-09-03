@@ -169,6 +169,63 @@ most recent telemetry event is a genuine scan failure) — whichever
 telemetry type is more recent wins, so a failure recorded after a prior
 success is never masked by that earlier success.
 
+## Recommendation follow-through — owner-recorded observation, not an outcome (P1 Sprint 6)
+
+`estimate.closing_recommendation_followthrough_recorded`
+(`lib/agents/estimateClosing/followThrough.ts`, the only writer) records
+what the tenant OWNER observed happened after a Shadow recommendation: did
+they act on it, how, did the customer respond, and what the current
+business result is. This is a **different question** from
+`estimate.closing_recommendation_reviewed` (P1 Sprint 3), which asks "was
+the recommendation good?" — follow-through asks "what actually happened
+next?" Neither implies the other: a "would act: yes" review does not mean
+the owner ever actually acted, and an actual action does not retroactively
+make the review agree.
+
+**Correction semantics — append-only, not update-in-place.** Unlike
+`estimate.closing_recommendation_reviewed` (one canonical, idempotency-
+deduped event per recommendation, never superseded), follow-through can
+legitimately evolve — "later" today can genuinely become "yes" + a
+business result next week. `business_events` has no update path
+(`BusinessEventStore` is insert/list/getById only), so a real follow-through
+story is represented as MULTIPLE events over time, one per submission, with
+the read side (`commercialEvidence.ts::resolveCurrentFollowThroughByRecommendation`)
+resolving "current" as the most recent one by `occurredAt` — the same
+"latest wins" discipline the scan-telemetry read side already uses. The
+idempotency key is content-derived (`estimate.closing_recommendation_
+followthrough_recorded:<recommendationEventId>:<hash of the four answers>`),
+so an exact-duplicate retry (a double-click, a network retry) dedupes to one
+row, while a genuine correction (a different answer) is intentionally
+allowed to create a new, additional row — nothing is ever deleted or
+overwritten.
+
+**Privacy contract**: the payload carries exactly four bounded enum fields
+(`actionTaken`, `actionChannel`, `customerResponse`, `businessDisposition`)
+plus the `recommendationEventId` anchor — no free-text field exists
+anywhere in the type, by construction. `lib/events/contracts.ts` enforces
+this shape (including the structural rule that `actionChannel` is required
+exactly when `actionTaken === "yes"` and forbidden otherwise) and reuses
+`forbidRawEstimatePii` as defense in depth, even though this payload has no
+legitimate path to a customer record, message content, or a call
+transcript at all.
+
+**Owner authorization**: recording follow-through follows the identical
+owner-only, session-resolved trust boundary `estimate.closing_
+recommendation_reviewed` already established (`followThroughRoute.ts`) —
+`tenantId`/`actorUserId` are always resolved from the authenticated server
+session, never from request-body input; a cross-tenant recommendation id
+returns the same non-enumerating "not found" whether it belongs to another
+tenant or doesn't exist at all.
+
+**What recording follow-through never does**: it never writes to
+`outcomes` (see the "Follow-through is not an outcome" section below), never
+mutates `leads.status` (a `businessDisposition: "won"` value is an
+OWNER-REPORTED observation, never synchronized into the lead record —
+see `app/(app)/agentic/estimate-closing/recommendations/[eventId]/page.tsx`'s
+discrepancy-surfacing behavior when the two disagree), and has no
+dependency on any tool/approval/lead/outcome store — a structural
+guarantee pinned by `authorityFreeze.test.ts`.
+
 ## Migration strategy
 
 Per the directive: *"Do not migrate every current workflow immediately if
