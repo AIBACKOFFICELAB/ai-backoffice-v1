@@ -6,6 +6,14 @@ import { getLeadById } from "@/lib/leads/repository";
 import { LeadStatus } from "@/data/leadModel";
 import { parsePersistedRecommendationPayload, EstimateClosingRecommendationView } from "./recommendationReadModel";
 import { listEstimateClosingRecommendationReviews, EstimateClosingRecommendationReviewView } from "./evaluationReadModel";
+import { EstimateClosingRecommendationFollowThrough } from "./followThroughTypes";
+import {
+  resolveCurrentFollowThroughByRecommendation,
+  resolveEstimateClosingAttributionState,
+  EstimateClosingAttributionState,
+} from "./commercialEvidence";
+
+const FOLLOWTHROUGH_EVENT_TYPE = "estimate.closing_recommendation_followthrough_recorded";
 
 /**
  * P1 Sprint 5 §12 — the FIRST RECOMMENDATION EVIDENCE PACKET. Resolves only
@@ -56,6 +64,17 @@ export type EstimateClosingRecommendationEvidence =
       sequence: RecommendationEvidenceSequence | null;
       leadStatus: LeadStatus | null;
       review: EstimateClosingRecommendationReviewView | null;
+      /** P1 Sprint 6 — the CURRENT (most recent, see followThrough.ts's
+       * append-only/correction discipline) owner-recorded follow-through
+       * for this recommendation, or null if none has ever been recorded.
+       * An OBSERVATION, never an outcome — see followThroughTypes.ts. */
+      followThrough: EstimateClosingRecommendationFollowThrough | null;
+      followThroughOccurredAt: string | null;
+      /** P1 Sprint 6 §13 — the pure evidence-ladder state for this
+       * recommendation. attributionStage is always
+       * "ATTRIBUTION_NOT_ESTABLISHED" this sprint — see
+       * commercialEvidence.ts's own doc comment. */
+      attributionState: EstimateClosingAttributionState;
       /** Always false — structural facts, not live query results. Shadow
        * Mode has no toolPlan anywhere in its signature and never calls
        * requestApproval() or any SEND-permission tool — see
@@ -119,13 +138,20 @@ export async function getEstimateClosingRecommendationEvidence(
     mode: "shadow",
   };
 
-  const [stalledEvent, agentRun, sequences, leadResult, reviewsResult] = await Promise.all([
+  const [stalledEvent, agentRun, sequences, leadResult, reviewsResult, followThroughEvents] = await Promise.all([
     recommendationEvent.causationId ? eventStore.getById(params.tenantId, recommendationEvent.causationId) : Promise.resolve(null),
     parsed.value.agentRunId ? runStore.getById(params.tenantId, parsed.value.agentRunId) : Promise.resolve(null),
     getSequencesForTenant(params.tenantId),
     recommendationEvent.entityId ? getLead(recommendationEvent.entityId, params.tenantId) : Promise.resolve({ lead: undefined, source: "mock-fallback" as const }),
     listEstimateClosingRecommendationReviews(params.tenantId, [recommendationEvent.id], { eventStore }),
+    eventStore.listByTenant(params.tenantId, { eventType: FOLLOWTHROUGH_EVENT_TYPE, causationIdIn: [recommendationEvent.id] }),
   ]);
+
+  const { current: followThroughByRecommendation } = resolveCurrentFollowThroughByRecommendation(
+    followThroughEvents.map((e) => ({ causationId: e.causationId, occurredAt: e.occurredAt, payload: e.payload }))
+  );
+  const currentFollowThrough = followThroughByRecommendation.get(recommendationEvent.id) ?? null;
+  const review = reviewsResult.reviews[0] ?? null;
 
   const sequence = parsed.value.sequenceId ? (sequences.find((s) => s.id === parsed.value.sequenceId) ?? null) : null;
 
@@ -167,7 +193,15 @@ export async function getEstimateClosingRecommendationEvidence(
     modelInvocation,
     sequence: sequence ? { status: sequence.status, estimateSentAt: sequence.estimateSentAt, day7DueAt: sequence.day7DueAt, lastReplyAt: sequence.lastReplyAt } : null,
     leadStatus: leadResult.lead?.status ?? null,
-    review: reviewsResult.reviews[0] ?? null,
+    review,
+    followThrough: currentFollowThrough?.followThrough ?? null,
+    followThroughOccurredAt: currentFollowThrough?.occurredAt ?? null,
+    attributionState: resolveEstimateClosingAttributionState({
+      hasReview: review !== null,
+      actionTaken: currentFollowThrough?.followThrough.actionTaken ?? null,
+      customerResponse: currentFollowThrough?.followThrough.customerResponse ?? null,
+      businessDisposition: currentFollowThrough?.followThrough.businessDisposition ?? null,
+    }),
     toolCallExists: false,
     approvalExists: false,
     customerActionExists: false,

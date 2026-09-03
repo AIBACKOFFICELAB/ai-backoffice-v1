@@ -2,7 +2,7 @@ export const dynamic = "force-dynamic";
 
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { Bot, ArrowLeft, Sparkles, Target, ShieldAlert, ThumbsUp, Clock, Radar } from "lucide-react";
+import { Bot, ArrowLeft, Sparkles, Target, ShieldAlert, ThumbsUp, Clock, Radar, CheckCircle2 } from "lucide-react";
 import { getTenantContext } from "@/lib/tenant";
 import { getLeads } from "@/lib/leads/repository";
 import { SupabaseAgentStore } from "@/lib/agents/agentStore";
@@ -18,6 +18,7 @@ import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/fea
 import { resolveEstimateClosingAgentStatus } from "@/lib/agents/estimateClosing/status";
 import { getEstimateClosingEvaluation } from "@/lib/agents/estimateClosing/evaluationReadModel";
 import { getEstimateClosingOperations } from "@/lib/agents/estimateClosing/operationsReadModel";
+import { getEstimateClosingCommercialEvidence } from "@/lib/agents/estimateClosing/commercialEvidence";
 import { getEstimateLifecycleReadModel, buildShadowReadinessLines } from "@/lib/leads/estimateLifecycleReadModel";
 
 /**
@@ -32,12 +33,13 @@ export default async function EstimateClosingWorkspacePage() {
   const tenant = await getTenantContext();
   if (!tenant) redirect("/auth/login");
 
-  const [agents, evaluation, { leads }, lifecycle, operations] = await Promise.all([
+  const [agents, evaluation, { leads }, lifecycle, operations, commercialEvidence] = await Promise.all([
     new SupabaseAgentStore().listByTenant(tenant.tenantId),
     getEstimateClosingEvaluation(tenant.tenantId),
     getLeads(tenant.tenantId),
     getEstimateLifecycleReadModel(tenant.tenantId),
     getEstimateClosingOperations(tenant.tenantId),
+    getEstimateClosingCommercialEvidence(tenant.tenantId),
   ]);
   const readinessLines = buildShadowReadinessLines(lifecycle);
 
@@ -258,6 +260,54 @@ export default async function EstimateClosingWorkspacePage() {
             </div>
           </section>
 
+          {/* Commercial evidence — P1 Sprint 6 §17. Restrained: what
+              actually happened after a recommendation, in the owner's own
+              words. Never "AI wins", never "revenue recovered", never a
+              conversion rate — see commercialEvidence.ts's own doc comment
+              on the constitutional attribution rule this section obeys. */}
+          <section>
+            <h2 className="text-xl font-bold text-ink-900">Commercial evidence</h2>
+            <p className="text-sm text-ink-500">What actually happened after each recommendation — recorded by you, not inferred by AI.</p>
+            <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <MetricCard
+                label="Recommendations with follow-through"
+                value={commercialEvidence.followthroughRecorded}
+                icon={<CheckCircle2 className="h-4 w-4" />}
+                helpText={
+                  commercialEvidence.followThroughCoverageRate === null
+                    ? "Not enough evidence yet"
+                    : `${Math.round(commercialEvidence.followThroughCoverageRate * 100)}% of ${commercialEvidence.recommendationsGenerated} recommendations`
+                }
+              />
+              <MetricCard
+                label="Owner actions recorded"
+                value={`${commercialEvidence.actedYes} / ${commercialEvidence.actedNo} / ${commercialEvidence.actedLater}`}
+                helpText="Yes / No / Later"
+              />
+              <MetricCard label="Customer responses observed" value={commercialEvidence.customerResponsesObserved} />
+              <MetricCard
+                label="Owner-reported wins"
+                value={commercialEvidence.ownerReportedWon}
+                helpText="Owner-reported, not AI-attributed revenue"
+              />
+              <MetricCard label="Owner-reported losses" value={commercialEvidence.ownerReportedLost} />
+              <MetricCard label="Owner-reported still pending" value={commercialEvidence.ownerReportedPending} />
+              <MetricCard
+                label="Follow-through still missing"
+                value={commercialEvidence.recommendationsWithoutFollowthrough}
+                tone={commercialEvidence.recommendationsWithoutFollowthrough > 0 ? "warning" : "default"}
+              />
+              <MetricCard label="Malformed records skipped" value={commercialEvidence.malformedFollowThroughCount} />
+            </div>
+            {commercialEvidence.diagnostics.length > 0 && (
+              <Alert tone="info" className="mt-4" title="Data-quality signals">
+                {commercialEvidence.diagnostics.length} recommendation{commercialEvidence.diagnostics.length === 1 ? " has" : "s have"} a follow-through
+                record worth a second look (e.g. a recorded result that doesn&rsquo;t match the lead&rsquo;s current status). Nothing was changed
+                automatically.
+              </Alert>
+            )}
+          </section>
+
           {/* E. Approval Readiness */}
           <section>
             <ApprovalReadinessEvidence
@@ -270,6 +320,9 @@ export default async function EstimateClosingWorkspacePage() {
               toolCallsAttributable={evaluation.toolCallsAttributable}
               approvalsAttributable={evaluation.approvalsAttributable}
               customerActionsAttributable={evaluation.customerActionsAttributable}
+              followthroughRecorded={commercialEvidence.followthroughRecorded}
+              customerResponsesObserved={commercialEvidence.customerResponsesObserved}
+              ownerReportedDispositions={commercialEvidence.ownerReportedWon + commercialEvidence.ownerReportedLost + commercialEvidence.ownerReportedPending}
             />
           </section>
         </>

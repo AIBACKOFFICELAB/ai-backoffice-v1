@@ -9,8 +9,10 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardHeader, CardBody } from "@/components/ui/Card";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { RecommendationReviewCard } from "@/components/ai/RecommendationReviewCard";
+import { FollowThroughControls } from "@/components/ai/FollowThroughControls";
 import { getEstimateClosingRecommendationEvidence } from "@/lib/agents/estimateClosing/recommendationEvidence";
 import { labelChannel, labelTiming } from "@/lib/agents/estimateClosing/labels";
+import { BUSINESS_DISPOSITION_LABELS } from "@/lib/agents/estimateClosing/followThroughTypes";
 
 const RUN_STATUS_LABEL: Record<string, string> = {
   succeeded: "Succeeded",
@@ -65,7 +67,31 @@ export default async function RecommendationEvidencePage({ params }: { params: P
   // self-contradictory (Codex review finding on PR #24, P2). Revenue
   // attribution stays explicitly unestablished regardless — a reply alone
   // never implies the job was won or revenue recovered.
-  const customerResponseObserved = evidence.sequence?.lastReplyAt != null;
+  //
+  // P1 Sprint 6: TWO independent signals can now establish "customer
+  // response" — the deterministic automated-sequence reply (unchanged from
+  // Sprint 5, always wins when present) AND the owner's own follow-through
+  // report. Neither is trusted over reality when the sequence itself proves
+  // a reply happened; the owner-reported value only fills in when the
+  // sequence has nothing to say.
+  const sequenceReplyObserved = evidence.sequence?.lastReplyAt != null;
+  const customerResponseState: "observed" | "not_observed" | "unknown" = sequenceReplyObserved
+    ? "observed"
+    : (evidence.followThrough?.customerResponse ?? "not_observed");
+  const CUSTOMER_RESPONSE_LADDER_LABEL: Record<typeof customerResponseState, string> = {
+    observed: "OBSERVED",
+    not_observed: "NOT OBSERVED",
+    unknown: "UNKNOWN",
+  };
+
+  // P1 Sprint 6 §19 — real lead status corroboration. Owner-recorded
+  // follow-through and current lead status are two SEPARATE evidence
+  // systems; when they disagree, surface the discrepancy honestly rather
+  // than silently preferring either one or auto-correcting.
+  const dispositionMismatch =
+    evidence.followThrough &&
+    ((evidence.followThrough.businessDisposition === "won" && evidence.leadStatus !== "Won") ||
+      (evidence.followThrough.businessDisposition === "lost" && evidence.leadStatus !== "Lost"));
 
   return (
     <div className="space-y-8">
@@ -107,6 +133,9 @@ export default async function RecommendationEvidencePage({ params }: { params: P
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Current lead status</dt>
               <dd className="mt-1 text-sm font-semibold text-ink-900">{evidence.leadStatus ?? "Unavailable"}</dd>
+              {dispositionMismatch && (
+                <dd className="mt-1 text-xs font-medium text-warning-700">Recorded follow-through and current lead status differ.</dd>
+              )}
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Follow-up sequence stage</dt>
@@ -178,8 +207,29 @@ export default async function RecommendationEvidencePage({ params }: { params: P
         </CardBody>
       </Card>
 
-      {/* Attribution evidence ladder — P1 Sprint 5 §19: evidence-state UX
-          only, never an inferred outcome. */}
+      {/* ACTUAL FOLLOW-THROUGH — P1 Sprint 6 §14/§15. A DIFFERENT question
+          from the Recommendation quality review above: "was this
+          recommendation good?" (review) vs. "what actually happened
+          afterward?" (follow-through). Deliberately its own card, its own
+          heading, and never framed as "Approve AI" — this is historical
+          evidence capture about what a HUMAN did outside the agent. */}
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold text-ink-900">Actual follow-through</h2>
+          <p className="mt-0.5 text-sm text-ink-500">What actually happened next — recorded by you, not inferred by AI.</p>
+        </CardHeader>
+        <CardBody>
+          <FollowThroughControls
+            recommendationEventId={evidence.recommendation.recommendationEventId}
+            existingFollowThrough={evidence.followThrough}
+            existingOccurredAt={evidence.followThroughOccurredAt}
+          />
+        </CardBody>
+      </Card>
+
+      {/* Attribution evidence ladder — P1 Sprint 5 §19, upgraded P1 Sprint
+          6 §16 with real follow-through evidence: evidence-state UX only,
+          never an inferred outcome. */}
       <Card>
         <CardHeader>
           <div className="flex items-center gap-2">
@@ -188,19 +238,31 @@ export default async function RecommendationEvidencePage({ params }: { params: P
           </div>
         </CardHeader>
         <CardBody>
-          <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">AI recommendation</dt>
               <dd className="mt-1 text-sm font-bold text-success-700">RECORDED</dd>
             </div>
             <div>
-              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Owner review</dt>
+              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Owner quality review</dt>
               <dd className={`mt-1 text-sm font-bold ${evidence.review ? "text-success-700" : "text-ink-500"}`}>{evidence.review ? "RECORDED" : "NOT YET"}</dd>
             </div>
             <div>
-              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Customer response evidence</dt>
-              <dd className={`mt-1 text-sm font-bold ${customerResponseObserved ? "text-success-700" : "text-ink-500"}`}>
-                {customerResponseObserved ? "OBSERVED" : "NOT OBSERVED"}
+              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Actual owner action</dt>
+              <dd className={`mt-1 text-sm font-bold ${evidence.followThrough?.actionTaken === "yes" ? "text-success-700" : "text-ink-500"}`}>
+                {evidence.followThrough?.actionTaken === "yes" ? "RECORDED" : "NOT YET"}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Customer response</dt>
+              <dd className={`mt-1 text-sm font-bold ${customerResponseState === "observed" ? "text-success-700" : "text-ink-500"}`}>
+                {CUSTOMER_RESPONSE_LADDER_LABEL[customerResponseState]}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Business disposition</dt>
+              <dd className="mt-1 text-sm font-bold text-ink-500">
+                {evidence.followThrough ? BUSINESS_DISPOSITION_LABELS[evidence.followThrough.businessDisposition].toUpperCase() : "NOT YET RECORDED"}
               </dd>
             </div>
             <div>
@@ -208,6 +270,10 @@ export default async function RecommendationEvidencePage({ params }: { params: P
               <dd className="mt-1 text-sm font-bold text-ink-500">NOT ESTABLISHED</dd>
             </div>
           </dl>
+          <p className="mt-4 text-xs text-ink-400">
+            Every row above is an independent observation. None implies the next — a recorded action does not mean the customer responded; a response does
+            not mean the job was won; a win does not mean this recommendation caused it.
+          </p>
         </CardBody>
       </Card>
     </div>

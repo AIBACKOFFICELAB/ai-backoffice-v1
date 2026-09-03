@@ -102,6 +102,14 @@ export const KNOWN_EVENT_TYPES = [
    * (the candidate read itself threw) — a fixed error category only, never
    * raw error text. See lib/agents/estimateClosing/scanTelemetry.ts. */
   "estimate.closing_scan_failed",
+  /** P1 Sprint 6: an OWNER-RECORDED observation of what happened after a
+   * shadow recommendation — did they act, how, did the customer respond,
+   * what is the current business result. Never an approval, never an agent
+   * action, never an outcome, never recovered revenue. actorType is "user"
+   * (a human recorded it). Multiple events of this type can exist per
+   * recommendation (append-only corrections) — the most recent one wins;
+   * see lib/agents/estimateClosing/followThrough.ts, the only writer. */
+  "estimate.closing_recommendation_followthrough_recorded",
   "job.created",
   "job.completed",
   "invoice.created",
