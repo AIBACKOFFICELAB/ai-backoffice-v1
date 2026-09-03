@@ -160,6 +160,7 @@ export default async function EstimateClosingWorkspacePage() {
                   label="Last durable scan"
                   value={formattedLastScanAt?.display ?? "—"}
                   valueTitle={formattedLastScanAt?.title}
+                  truncateValue
                   icon={<Clock className="h-4 w-4" />}
                 />
                 <MetricCard label="Candidates scanned" value={operations.latestScanCounts?.candidatesScanned ?? "—"} />

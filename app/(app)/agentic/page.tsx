@@ -92,6 +92,10 @@ export default async function AgenticActivityPage() {
   // instant available as an accessible tooltip. Presentation only — does
   // not touch operations.lastScanAt itself or any telemetry semantics.
   const formattedLastScanAt = formatOperationalTimestamp(operations.lastScanAt);
+  // Same hotfix, same defect (Codex P2 finding on PR #26) — this raw
+  // Postgres ISO instant was left behind passing straight into MetricCard
+  // with no formatting at all. Presentation only.
+  const formattedLatestRecommendationAt = formatOperationalTimestamp(estimateClosingSummary.latestRecommendationAt);
 
   return (
     <div className="space-y-6">
@@ -169,7 +173,9 @@ export default async function AgenticActivityPage() {
                 />
                 <MetricCard
                   label="Latest recommendation"
-                  value={estimateClosingSummary.latestRecommendationAt ?? "—"}
+                  value={formattedLatestRecommendationAt?.display ?? "—"}
+                  valueTitle={formattedLatestRecommendationAt?.title}
+                  truncateValue
                   icon={<Bot className="h-4 w-4" />}
                 />
               </div>
@@ -183,6 +189,7 @@ export default async function AgenticActivityPage() {
                   label="Last durable scan"
                   value={formattedLastScanAt?.display ?? (operations.scanTelemetryStatus === "no_telemetry" ? "No telemetry yet" : "—")}
                   valueTitle={formattedLastScanAt?.title}
+                  truncateValue
                   tone={operations.scanTelemetryStatus === "failure_recorded" ? "warning" : "default"}
                 />
                 <MetricCard
