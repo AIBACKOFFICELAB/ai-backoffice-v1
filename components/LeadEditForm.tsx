@@ -35,6 +35,7 @@ export default function LeadEditForm({ lead, followupStatus }: { lead: PlumbingL
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    setSavedAt(null);
 
     const amount = parseFloat(estimateAmount);
     if (isNaN(amount) || amount < 0) {
@@ -55,9 +56,12 @@ export default function LeadEditForm({ lead, followupStatus }: { lead: PlumbingL
         }),
       });
 
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || "Failed to save changes.");
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.estimateLifecycleComplete === false) {
+        if (data.leadPersisted) router.refresh();
+        throw new Error(data.error || (data.leadPersisted || data.estimateLifecycleComplete === false
+          ? "Estimate saved, but follow-up setup is incomplete. Save again to retry safely, or refresh to review."
+          : "Failed to save changes."));
       }
 
       setSavedAt(Date.now());

@@ -121,11 +121,22 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
         console.error("[estimate-followup] enrollment failed for lead", id);
       }
     } catch (error) {
-      console.error("[estimate-followup] markEstimateSent threw", error);
+      console.error("[estimate-followup] markEstimateSent threw", { leadId: id, category: error instanceof Error ? error.name : "unknown" });
+      estimateLifecycle = { outcome: "lifecycle_failed", sequenceCreated: false };
     }
   }
 
-  return NextResponse.json({ lead: updatedLead, ...(estimateLifecycle ? { estimateLifecycle } : {}) });
+  if (transitioningToEstimateSent) {
+    const complete = ["newly_sent_enrolled", "already_sent_enrolled", "already_sent_reconciled"].includes(estimateLifecycle?.outcome ?? "");
+    if (!complete) {
+      return NextResponse.json({
+        lead: updatedLead, leadPersisted: true, estimateLifecycleComplete: false, estimateLifecycle,
+        error: "Estimate saved, but follow-up setup is incomplete. Save again to retry safely, or refresh to review.",
+      }, { status: 503 });
+    }
+    return NextResponse.json({ lead: updatedLead, leadPersisted: true, estimateLifecycleComplete: true, estimateLifecycle });
+  }
+  return NextResponse.json({ lead: updatedLead });
 }
 
 export async function DELETE(request: NextRequest, props: { params: Promise<{ id: string }> }) {
