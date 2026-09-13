@@ -243,11 +243,13 @@ export const EVENT_CONTRACTS: Record<string, EventContract> = {
   "lead.created": {
     eventType: "lead.created",
     schemaVersion: 1,
-    // leadId itself (the event's entityId) is already a unique, durable
-    // identity — no separate idempotency key is needed to dedupe this
-    // event type.
-    idempotency: "not_applicable",
-    validatePayload: forbidRawCallerPhone,
+    // Intake retries use lead.created:<canonical-id>; entity_id alone has
+    // no uniqueness constraint. Legacy MCR emissions remain compatible.
+    idempotency: "recommended",
+    validatePayload: payload => {
+      const callerCheck = forbidRawCallerPhone(payload);
+      return callerCheck.ok ? forbidRawEstimatePii(payload) : callerCheck;
+    },
   },
   "recovery.sms_sent": {
     eventType: "recovery.sms_sent",

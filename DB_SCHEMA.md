@@ -191,3 +191,15 @@ suite `describe.skip`s cleanly and explicitly rather than silently passing
 (skipped is never reported as passed). `.github/workflows/ci.yml`'s
 `test-db` job runs this automatically against an ephemeral Postgres
 service container on every push/PR.
+
+
+## Canonical Lead Intake v2 — migration 023 (not applied to production)
+
+`023_canonical_lead_intake_provenance.sql` adds nullable `source_ref text`,
+`intake_schema_version integer` and `received_at timestamptz` to `leads`.
+The existing `source text` column carries adapter provenance. The unique partial
+index `uq_leads_tenant_source_ref` covers `(tenant_id, source, source_ref)` where
+`source_ref IS NOT NULL`, preventing duplicates under concurrent intake retries.
+Old rows are not rewritten; old writers may omit the new fields. Existing
+`tenants.slug UNIQUE NOT NULL` supplies public routing identity. No tenant-table,
+RLS or grant changes. See [intake contract and cutover](docs/modules/canonical-lead-intake-v2.md).

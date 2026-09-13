@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkAuth } from "@/lib/api-auth";
-import { createLead, getLeads } from "@/lib/leads/repository";
+import { getLeads } from "@/lib/leads/repository";
 import { getTenantContext } from "@/lib/tenant";
-import { LeadInsert } from "@/data/leadModel";
+import { getTenantProfile } from "@/lib/tenant";
+import { createCanonicalLeadFromIntake } from "@/lib/leads/intake/service";
+import { createLiveIntakeDeps } from "@/lib/leads/intake/server";
+import { intakeFailure, readIntakeBody } from "@/lib/leads/intake/http";
 
 export const dynamic = "force-dynamic";
 
@@ -32,18 +35,10 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "No tenant membership found for this user." }, { status: 403 });
   }
 
-  let payload: LeadInsert;
   try {
-    payload = (await request.json()) as LeadInsert;
-  } catch {
-    return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
-  }
-
-  try {
-    const lead = await createLead(payload, tenant.tenantId);
-    return NextResponse.json({ lead });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
+    const raw = await readIntakeBody(request);
+    const profile = await getTenantProfile(tenant.tenantId);
+    const result = await createCanonicalLeadFromIntake(raw, { id: tenant.tenantId, name: tenant.tenantName, email: profile?.email ?? null }, "manual", tenant.userId, createLiveIntakeDeps());
+    return NextResponse.json({ lead: result.lead }, { status: result.deduped ? 200 : 201 });
+  } catch (error) { return intakeFailure(error); }
 }

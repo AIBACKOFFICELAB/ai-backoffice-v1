@@ -18,7 +18,7 @@ function sortLeads(leads: PlumbingLead[]) {
   });
 }
 
-export function LeadInboxList({ leads }: { leads: PlumbingLead[] }) {
+export function LeadInboxList({ leads, readOnly = false }: { leads: PlumbingLead[]; readOnly?: boolean }) {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<LeadStatus | "All">("All");
 
@@ -106,12 +106,13 @@ export function LeadInboxList({ leads }: { leads: PlumbingLead[] }) {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
+                      {(lead.source === "website_form" || lead.source === "manual") && <span className="text-xs text-ink-500">{lead.source === "manual" ? "Manual entry" : "Website request"}</span>}
                       {lead.status === "New" && (
                         <span className="rounded-pill bg-brand-100 px-2.5 py-1 text-xs font-semibold text-brand-800">
                           New lead
                         </span>
                       )}
-                      <LeadStatusSelect leadId={lead.id} initialStatus={lead.status} />
+                      {readOnly ? <span className="text-xs text-ink-500">Legacy · read-only</span> : <LeadStatusSelect leadId={lead.id} initialStatus={lead.status} />}
                       <span
                         className={`rounded-pill px-2.5 py-1 text-xs font-semibold ${
                           isEmergency ? "bg-red-100 text-red-700" : "bg-amber-100 text-amber-700"

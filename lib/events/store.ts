@@ -63,8 +63,9 @@ const UNIQUE_VIOLATION = "23505";
  * mechanism (see docs/constitution/06_DATABASE_PRINCIPLES.md and
  * docs/AGENT_SECURITY.md). */
 export class SupabaseBusinessEventStore implements BusinessEventStore {
+  constructor(private readonly clientFactory = createServerSupabaseClient) {}
   async insert(input: EmitEventInput): Promise<{ event: BusinessEvent; deduped: boolean }> {
-    const supabase = await createServerSupabaseClient();
+    const supabase = await this.clientFactory();
     const { data, error } = await supabase
       .from("business_events")
       .insert({
@@ -96,7 +97,7 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
   }
 
   private async findByIdempotencyKey(tenantId: string, idempotencyKey: string): Promise<BusinessEvent | null> {
-    const supabase = await createServerSupabaseClient();
+    const supabase = await this.clientFactory();
     const { data, error } = await supabase
       .from("business_events")
       .select("*")
@@ -108,7 +109,7 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
   }
 
   async listByTenant(tenantId: string, opts: { eventType?: string; limit?: number; offset?: number; causationIdIn?: string[] } = {}): Promise<BusinessEvent[]> {
-    const supabase = await createServerSupabaseClient();
+    const supabase = await this.clientFactory();
     let query = supabase.from("business_events").select("*").eq("tenant_id", tenantId);
     if (opts.eventType) query = query.eq("event_type", opts.eventType);
     if (opts.causationIdIn) {
@@ -131,7 +132,7 @@ export class SupabaseBusinessEventStore implements BusinessEventStore {
   }
 
   async getById(tenantId: string, id: string): Promise<BusinessEvent | null> {
-    const supabase = await createServerSupabaseClient();
+    const supabase = await this.clientFactory();
     const { data, error } = await supabase.from("business_events").select("*").eq("tenant_id", tenantId).eq("id", id).maybeSingle();
     if (error || !data) return null;
     return mapRow(data);

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkAuth } from "@/lib/api-auth";
-import { updateLead, createLead, deleteLead, getLeadById } from "@/lib/leads/repository";
+import { updateLead, deleteLead, getLeadById } from "@/lib/leads/repository";
 import { getTenantContext } from "@/lib/tenant";
 import { LeadUpdate } from "@/data/leadModel";
 import { validateEstimateSentTransition, markEstimateSent, createLiveMarkEstimateSentDeps } from "@/lib/leads/estimateLifecycle";
@@ -86,7 +86,7 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
     expectedCurrentStatus = existing.status;
   }
 
-  let updatedLead = await updateLead(id, payload, tenant.tenantId, transitioningToEstimateSent ? { expectedCurrentStatus } : {});
+  const updatedLead = await updateLead(id, payload, tenant.tenantId, transitioningToEstimateSent ? { expectedCurrentStatus } : {});
 
   if (!updatedLead) {
     const { lead: sourceLead, source: sourceLeadSource } = await getLeadById(id, tenant.tenantId);
@@ -100,8 +100,7 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
       // silently applying a stale transition.
       return NextResponse.json({ error: "This lead's status changed since you loaded it — please refresh and try again." }, { status: 409 });
     }
-    // Lead exists in Google Sheets but not yet in Supabase — shadow-write it into this tenant
-    updatedLead = await createLead({ ...sourceLead, ...payload, id }, tenant.tenantId);
+    return NextResponse.json({ error: "Legacy records are read-only. Create a canonical lead using New lead." }, { status: 409 });
   }
 
   // Canonical estimate-lifecycle transition: enrolls the lead in the Day
@@ -142,6 +141,10 @@ export async function DELETE(request: NextRequest, props: { params: Promise<{ id
   }
 
   const { id } = params;
+  const existing = await getLeadById(id, tenant.tenantId);
+  if (existing.lead && existing.source !== "supabase") {
+    return NextResponse.json({ error: "Legacy Sheet records are read-only. Create a canonical lead using New lead." }, { status: 409 });
+  }
   try {
     await deleteLead(id, tenant.tenantId);
     return NextResponse.json({ success: true });

@@ -6,9 +6,10 @@ export type LeadDataSource = "supabase" | "google-sheets" | "mock-fallback";
 
 /**
  * Google Sheets / mock fallback data has no tenant boundary. It only remains
- * as a bootstrap path for a tenant with zero rows in Supabase yet (e.g. during
- * initial onboarding before real leads exist) and must never be used to answer
- * a query for one tenant with another tenant's spreadsheet data.
+ * as the existing bootstrap path only after a successful empty Supabase read.
+ * It is read-only compatibility, never an intake source or a DB-error fallback.
+ * The legacy Sheet configuration is global: restrict bootstrap use to the
+ * existing pilot until retired; it is not a multi-tenant integration.
  */
 export async function getLeads(tenantId: string): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
   try {
@@ -18,6 +19,7 @@ export async function getLeads(tenantId: string): Promise<{ leads: PlumbingLead[
     }
   } catch (error) {
     console.error("[leads] Supabase fetch failed.", error);
+    return { leads: [], source: "supabase", error: true, message: "Lead Inbox is temporarily unavailable." };
   }
 
   try {

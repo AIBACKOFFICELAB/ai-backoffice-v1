@@ -19,7 +19,8 @@
     "lucide-react": "0.462.0",
     "next": "^15.5.24",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "server-only": "0.0.1"
   },
   "devDependencies": {
     "@types/node": "20.16.5",
@@ -40,5 +41,8 @@
     "next": {
       "postcss": "8.5.23"
     }
+  },
+  "engines": {
+    "node": ">=22"
   }
 }
