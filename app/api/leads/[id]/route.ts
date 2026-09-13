@@ -48,7 +48,6 @@ export async function PUT(request: NextRequest, props: { params: Promise<{ id: s
   }
 
   const { id } = params;
-  if (id.startsWith("GS-")) return NextResponse.json({ error: "Legacy Sheet records are read-only. Create a canonical lead using New lead." }, { status: 409 });
   const transitioningToEstimateSent = payload.status === "Estimate Sent";
 
   // P1 Sprint 4 — validate BEFORE any write when the request would set
@@ -142,7 +141,10 @@ export async function DELETE(request: NextRequest, props: { params: Promise<{ id
   }
 
   const { id } = params;
-  if (id.startsWith("GS-")) return NextResponse.json({ error: "Legacy Sheet records are read-only. Create a canonical lead using New lead." }, { status: 409 });
+  const existing = await getLeadById(id, tenant.tenantId);
+  if (existing.lead && existing.source !== "supabase") {
+    return NextResponse.json({ error: "Legacy Sheet records are read-only. Create a canonical lead using New lead." }, { status: 409 });
+  }
   try {
     await deleteLead(id, tenant.tenantId);
     return NextResponse.json({ success: true });

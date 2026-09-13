@@ -75,8 +75,20 @@ DESCRIBE("canonical intake production service/store/route against real PostgreSQ
   });
   it("legacy GS operational writes are refused before database mutation", async () => {
     const req = new NextRequest("https://example.test/api/leads/GS-1", { method: "PUT", body: JSON.stringify({ status: "Estimate Sent", estimateAmount: 250 }) });
-    expect((await PUT(req, { params: Promise.resolve({ id: "GS-1" }) })).status).toBe(409);
+    expect((await PUT(req, { params: Promise.resolve({ id: "GS-1" }) })).status).toBe(404);
     expect((await getPgTestPool().query("SELECT count(*) FROM leads WHERE tenant_id=$1", [tenantId])).rows[0].count).toBe("0");
+  });
+  it("preserves operations for already-materialized Supabase leads with GS-prefixed IDs", async () => {
+    const c = await getPgTestPool().connect(); let oldId: string;
+    try { oldId = await insertLead(c, tenantId); } finally { c.release(); }
+    const id = `GS-existing-${randomUUID()}`;
+    await getPgTestPool().query("UPDATE leads SET id=$1 WHERE id=$2 AND tenant_id=$3", [id, oldId, tenantId]);
+    expect((await getLeadById(id, tenantId)).source).toBe("supabase");
+    const req = new NextRequest(`https://example.test/api/leads/${id}`, { method: "PUT", body: JSON.stringify({ status: "Estimate Sent", estimateAmount: 250 }) });
+    const response = await PUT(req, { params: Promise.resolve({ id }) });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ lead: { id, status: "Estimate Sent" }, estimateLifecycle: { outcome: "newly_sent_enrolled" } });
+    expect((await getPgTestPool().query("SELECT count(*) FROM estimate_followup_sequences WHERE tenant_id=$1 AND lead_id=$2", [tenantId, id])).rows[0].count).toBe("1");
   });
   it("migration is repeatable and does not rewrite existing lead rows", async () => {
     const c = await getPgTestPool().connect(); let id: string;

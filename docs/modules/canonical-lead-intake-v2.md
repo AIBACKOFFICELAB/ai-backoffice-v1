@@ -131,7 +131,9 @@ returns unavailable rather than switching to potentially stale Sheet truth.
 The legacy Sheet configuration remains global and has no per-tenant binding; do
 not expand that bootstrap path to additional tenants. Retire it after pilot cutover.
 
-`GS-*` leads are marked read-only in Inbox/detail and refused operational PUT/DELETE.
+Sheet-only leads are marked read-only in Inbox/detail and refused operational writes.
+Existing Supabase leads remain operational even if their historical ID starts with
+`GS-`; storage source, not ID spelling, determines whether a record is canonical.
 The old Sheet shadow-write is removed. Use New lead to record a legacy job as a
 canonical lead before working it. Existing canonical records are not deleted,
 backfilled, renamed or rewritten. New official service requests bypass Sheets.
@@ -194,8 +196,8 @@ production migration, website-link change or automatic merge is part of this PR.
 - `npm run typecheck`: pass.
 - `npm run lint`: pass (existing Next lint deprecation/workspace-root notices).
 - `npm run build`: pass.
-- Ordinary `npm test`: 839 passed, 95 DB tests skipped, 934 total.
-- Full fresh-PostgreSQL `npm test`: 934 passed, zero skipped (baseline 871; +63).
+- Ordinary `npm test`: 844 passed, 96 DB tests skipped, 940 total (also verified under Node 22).
+- Full fresh-PostgreSQL `npm test`: 940 passed, zero skipped (baseline 871; +69).
 - `git diff --check`: pass. Frozen lifecycle/Estimate Closing files unchanged.
 - Browser: public request submitted successfully at 390px width through the built
   Next app, real Supabase SDK, local PostgREST and disposable PostgreSQL. Confirmed
@@ -209,3 +211,18 @@ production migration, website-link change or automatic merge is part of this PR.
 - No production customer data, email delivery, Supabase mutation or hosted preview
   submission was used. Local test email credentials were absent; notification
   failures were tested with fakes. Production migration remains unapplied.
+
+
+## Review corrections
+
+Codex review identified that prefix-only read-only checks would block previously
+materialized Supabase leads. Corrected to use storage source; no old ID or record
+is rewritten. A real PostgreSQL regression covers an existing GS-prefixed canonical
+lead successfully entering the unchanged Estimate Sent enrollment path.
+
+CI exposed a runtime prerequisite that local Node 24 already satisfied: the locked
+Supabase SDK initializes its WebSocket implementation during client construction,
+and Node 20 has none. CI now uses Node 22 and package engines records >=22. No
+SDK upgrade or production environment setting was performed. Verify a supported
+Node runtime in the Founder deployment checklist. This fixes the genuine runtime
+requirement instead of stubbing away the SDK test failure.
