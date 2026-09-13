@@ -134,6 +134,7 @@ export async function enrollLeadInFollowup(tenantId: string, lead: PlumbingLead)
     if (error.code === UNIQUE_VIOLATION) {
       return { enrolled: false, reason: "already-enrolled" as const };
     }
+    console.error("[estimate-followup] sequence insert failed", { leadId: lead.id, code: error.code });
     return { enrolled: false, reason: "insert-failed" as const, error: error.message };
   }
   return { enrolled: true as const };
@@ -170,10 +171,11 @@ export async function recordReplyForPhone(tenantId: string, phone: string) {
     return { matched: true as const, stopped: false };
   }
 
-  await supabase
+  const replyWrite = await supabase
     .from("estimate_followup_sequences")
     .update({ status: "replied", last_reply_at: new Date().toISOString(), updated_at: new Date().toISOString() })
-    .eq("id", sequence.id);
+    .eq("tenant_id", tenantId).eq("id", sequence.id).select("id").maybeSingle();
+  if (replyWrite.error || !replyWrite.data) throw new Error("Follow-up reply update failed");
 
   await writeHistory(tenantId, sequence.id, lead.id, "reply_detected", { channel: "sms" });
 
@@ -222,10 +224,11 @@ async function processSequence(seq: Record<string, any>) {
   }
 
   if (settings.stopOnStatusChange && lead.status !== "Estimate Sent") {
-    await supabase
+    const stopWrite = await supabase
       .from("estimate_followup_sequences")
       .update({ status: "stopped", stopped_reason: "status-changed", updated_at: new Date().toISOString() })
-      .eq("id", seq.id);
+      .eq("tenant_id", seq.tenant_id).eq("id", seq.id).select("id").maybeSingle();
+    if (stopWrite.error || !stopWrite.data) throw new Error("Follow-up stop update failed");
     await writeHistory(seq.tenant_id, seq.id, seq.lead_id, "stopped", { channel: "sms" });
     return { leadId: seq.lead_id, action: "stopped", reason: "status-changed" };
   }
@@ -254,7 +257,8 @@ async function processSequence(seq: Record<string, any>) {
   if (due.key === "day7") {
     update.status = "completed";
   }
-  await supabase.from("estimate_followup_sequences").update(update).eq("id", seq.id);
+  const stepWrite = await supabase.from("estimate_followup_sequences").update(update).eq("tenant_id", seq.tenant_id).eq("id", seq.id).select("id").maybeSingle();
+  if (stepWrite.error || !stepWrite.data) throw new Error("Follow-up step update failed");
 
   await writeHistory(seq.tenant_id, seq.id, seq.lead_id, `${due.key}_sent` as const, {
     channel: "sms",
@@ -274,7 +278,7 @@ async function writeHistory(
   extra: { channel: "sms" | "email"; messageBody?: string; providerSid?: string; failureReason?: string }
 ) {
   const supabase = await createServerSupabaseClient();
-  await supabase.from("estimate_followup_history").insert({
+  const { error } = await supabase.from("estimate_followup_history").insert({
     tenant_id: tenantId,
     sequence_id: sequenceId,
     lead_id: leadId,
@@ -284,6 +288,7 @@ async function writeHistory(
     provider_sid: extra.providerSid ?? null,
     failure_reason: extra.failureReason ?? null,
   });
+  if (error) throw new Error("Follow-up history insert failed");
 }
 
 export async function getEstimateFollowupHistory(tenantId: string, limit = 50) {

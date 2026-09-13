@@ -1,6 +1,4 @@
 import { PlumbingLead, LeadStatus } from "@/data/leadModel";
-import { emitEvent } from "@/lib/events/service";
-import { SupabaseBusinessEventStore } from "@/lib/events/store";
 import { enrollLeadInFollowup } from "@/lib/modules/estimateFollowup/service";
 
 /**
@@ -19,8 +17,7 @@ import { enrollLeadInFollowup } from "@/lib/modules/estimateFollowup/service";
  *
  * Deliberately does NOT own the lead's own status/amount database write —
  * app/api/leads/[id]/route.ts already has exactly one write path
- * (lib/leads/repository.ts::updateLead, including its Google-Sheets
- * shadow-write fallback) and this module must not duplicate it (P1 Sprint 4
+ * (lib/leads/repository.ts::updateLead) and this module must not duplicate it (P1 Sprint 4
  * directive Gate 4: "Do NOT duplicate business logic across UI/API
  * routes"). validateEstimateSentTransition runs BEFORE that write (so an
  * invalid transition writes nothing at all); markEstimateSent runs AFTER
@@ -76,7 +73,10 @@ export type MarkEstimateSentOutcome =
    * function) is NOT rolled back; see estimateLifecycleReadModel.ts's
    * "Estimate Sent without sequence" diagnostic, which is exactly what
    * exists to catch this case in production rather than hiding it. */
-  | "enrollment_failed";
+  | "enrollment_failed"
+  /** Sequence exists, but recording the event failed. Retry repairs only the
+   * missing fact through the existing event idempotency key. */
+  | "event_failed";
 
 export type MarkEstimateSentResult = {
   outcome: MarkEstimateSentOutcome;
@@ -106,20 +106,9 @@ export function buildEstimateSentIdempotencyKey(leadId: string): string {
 export function createLiveMarkEstimateSentDeps(): MarkEstimateSentDeps {
   return {
     enrollLeadInFollowup,
-    async emitLifecycleEvent({ tenantId, leadId, estimateAmount, sequenceCreated, actorUserId }) {
-      await emitEvent(
-        {
-          tenantId,
-          eventType: "estimate.sent",
-          actorType: "user",
-          actorId: actorUserId,
-          entityType: "lead",
-          entityId: leadId,
-          idempotencyKey: buildEstimateSentIdempotencyKey(leadId),
-          payload: { estimateAmount, sequenceCreated },
-        },
-        new SupabaseBusinessEventStore()
-      );
+    async emitLifecycleEvent(input) {
+      const { emitEstimateSentEvent } = await import("./estimateLifecycleEvent.server");
+      await emitEstimateSentEvent(input);
     },
   };
 }
@@ -155,13 +144,16 @@ export async function markEstimateSent(
   }
 
   if (outcome !== "enrollment_failed") {
-    await deps.emitLifecycleEvent({
-      tenantId,
-      leadId: lead.id,
-      estimateAmount: lead.estimateAmount,
-      sequenceCreated,
-      actorUserId,
-    });
+    try {
+      await deps.emitLifecycleEvent({
+        tenantId, leadId: lead.id, estimateAmount: lead.estimateAmount,
+        sequenceCreated, actorUserId,
+      });
+    } catch {
+      // A retry reuses the sequence and the existing event idempotency key.
+      console.error("[estimate-followup] estimate.sent persistence failed", { leadId: lead.id });
+      return { outcome: "event_failed", leadId: lead.id, sequenceCreated };
+    }
   }
 
   return { outcome, leadId: lead.id, sequenceCreated };
