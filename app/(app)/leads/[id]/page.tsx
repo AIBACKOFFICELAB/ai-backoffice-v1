@@ -62,7 +62,7 @@ export default async function LeadDetailPage({ params }: { params: Promise<{ id:
         </p>
       </div>
 
-      <LeadEditForm lead={lead} followupStatus={followupStatus} />
+      {id.startsWith("GS-") ? <Card className="p-5"><p>Legacy Sheet record · read-only.</p><Link href="/leads/new" className="text-brand-700 underline">Create a canonical lead</Link></Card> : <LeadEditForm lead={lead} followupStatus={followupStatus} />}
 
       {mcrHistory && (
         <Card className="p-5">

@@ -1,3 +1,4 @@
+// Legacy/bootstrap read-only compatibility. New intake must never write here.
 import { createSign } from "node:crypto";
 import { PlumbingLead } from "@/data/leadModel";
 
