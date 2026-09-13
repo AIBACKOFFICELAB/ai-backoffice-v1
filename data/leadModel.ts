@@ -48,6 +48,9 @@ export type PlumbingLead = {
   reviewRequestStatus: ReviewRequestStatus;
   internalNotes: string;
   source?: string;
+  sourceRef?: string;
+  intakeSchemaVersion?: number;
+  receivedAt?: string;
   createdAt?: string;
   updatedAt?: string;
   smsSentAt?: string | null;
@@ -60,6 +63,6 @@ export type LeadInsert = Omit<PlumbingLead, "id" | "createdAt" | "updatedAt"> & 
   source?: string;
 };
 
-export type LeadUpdate = Partial<Omit<PlumbingLead, "id" | "createdAt" | "updatedAt" | "source" | "smsSentAt">>;
+export type LeadUpdate = Partial<Omit<PlumbingLead, "id" | "createdAt" | "updatedAt" | "source" | "sourceRef" | "intakeSchemaVersion" | "receivedAt" | "smsSentAt">>;
 
 export const reviewVisibleStatuses: ReviewRequestStatus[] = ["Not Ready", "Ready to Send", "Sent", "Review Received"];

@@ -4,7 +4,7 @@ import { LeadInsert, LeadUpdate, PlumbingLead } from "@/data/leadModel";
 
 const tableName = "leads";
 
-type LeadRow = {
+export type LeadRow = {
   id: string;
   date: string;
   customer_name: string;
@@ -27,12 +27,15 @@ type LeadRow = {
   review_request_status: string;
   internal_notes: string | null;
   source: string | null;
+  source_ref?: string | null;
+  intake_schema_version?: number | null;
+  received_at?: string | null;
   created_at: string;
   updated_at: string;
   sms_sent_at: string | null;
 };
 
-function mapRowToLead(row: LeadRow): PlumbingLead {
+export function mapRowToLead(row: LeadRow): PlumbingLead {
   return {
     id: row.id,
     date: row.date,
@@ -56,13 +59,16 @@ function mapRowToLead(row: LeadRow): PlumbingLead {
     reviewRequestStatus: row.review_request_status as PlumbingLead["reviewRequestStatus"],
     internalNotes: row.internal_notes || "",
     source: row.source || undefined,
+    sourceRef: row.source_ref ?? undefined,
+    intakeSchemaVersion: row.intake_schema_version ?? undefined,
+    receivedAt: row.received_at ?? undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     smsSentAt: row.sms_sent_at,
   };
 }
 
-function mapLeadToRow(lead: LeadInsert): Partial<LeadRow> {
+export function mapLeadToRow(lead: LeadInsert): Partial<LeadRow> {
   return {
     id: lead.id || randomUUID(),
     date: lead.date,
@@ -86,6 +92,7 @@ function mapLeadToRow(lead: LeadInsert): Partial<LeadRow> {
     review_request_status: lead.reviewRequestStatus,
     internal_notes: lead.internalNotes || null,
     source: lead.source || null,
+    ...(lead.sourceRef ? { source_ref: lead.sourceRef, intake_schema_version: lead.intakeSchemaVersion, received_at: lead.receivedAt } : {}),
     created_at: lead.createdAt || new Date().toISOString(),
     updated_at: lead.updatedAt || new Date().toISOString(),
     sms_sent_at: lead.smsSentAt ?? null,
