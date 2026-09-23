@@ -1,4 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
+// reviewRoute.ts -> review.ts now imports evidenceEvent.server.ts (Owner
+// Evidence Persistence Hotfix), tagged "server-only" — see
+// review.test.ts's identical comment.
+vi.mock("server-only", () => ({}));
 import { NextRequest, NextResponse } from "next/server";
 import { handleReviewRequest } from "./reviewRoute";
 import type { TenantContext } from "@/lib/tenant";

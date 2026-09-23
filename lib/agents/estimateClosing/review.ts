@@ -1,5 +1,6 @@
-import { BusinessEventStore, SupabaseBusinessEventStore } from "@/lib/events/store";
+import { BusinessEventStore } from "@/lib/events/store";
 import { emitEvent } from "@/lib/events/service";
+import { createEstimateClosingEvidenceEventStore } from "./evidenceEvent.server";
 import { parsePersistedRecommendationPayload } from "./recommendationReadModel";
 import { REVIEW_VERDICTS, REVIEW_WOULD_ACT, REVIEW_REASON_CODES, ReviewVerdict, ReviewWouldAct, ReviewReasonCode, EstimateClosingRecommendationReview, parsePersistedReviewPayload } from "./reviewTypes";
 
@@ -117,7 +118,15 @@ export async function recordEstimateClosingRecommendationReview(
   input: RecordReviewInput,
   deps: { eventStore?: BusinessEventStore } = {}
 ): Promise<RecordReviewResult> {
-  const eventStore = deps.eventStore ?? new SupabaseBusinessEventStore();
+  // Owner Evidence Persistence Hotfix: production business_events has
+  // never had an authenticated INSERT policy (SELECT-only —
+  // business_events_select_tenant, migration 009). The default store must
+  // route the final insert through the narrowly-scoped, independently
+  // re-verified evidence writer (see evidenceEvent.server.ts's own doc
+  // comment for the exact RLS mechanism), never the plain authenticated
+  // client — getById/listByTenant on that store still use the ordinary
+  // authenticated client (reads were never broken).
+  const eventStore = deps.eventStore ?? createEstimateClosingEvidenceEventStore();
 
   const validated = validateReviewInput(input);
   if (!validated.ok) return validated;

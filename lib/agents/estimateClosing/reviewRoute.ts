@@ -78,12 +78,26 @@ export async function handleReviewRequest(request: NextRequest, eventId: string,
     return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
   }
 
-  const result = await recordReview(tenant.tenantId, tenant.userId, {
-    recommendationEventId: eventId,
-    verdict: isRecord(body) ? body.verdict : undefined,
-    wouldAct: isRecord(body) ? body.wouldAct : undefined,
-    reasonCodes: isRecord(body) ? body.reasonCodes : undefined,
-  });
+  // Owner Evidence Persistence Hotfix (Section 7 — failure truthfulness):
+  // recordReview can THROW (an event-store insert failure — RLS denial,
+  // a transient DB error, or the evidence writer's own authorization
+  // re-check failing) as well as return a typed { ok: false } result.
+  // Both paths must produce a genuine failure response, never a false
+  // "saved" claim — and a thrown exception's message must never reach the
+  // client verbatim (it can carry Postgres/internal detail), only a fixed,
+  // sanitized message; the real error is logged server-side for diagnosis.
+  let result;
+  try {
+    result = await recordReview(tenant.tenantId, tenant.userId, {
+      recommendationEventId: eventId,
+      verdict: isRecord(body) ? body.verdict : undefined,
+      wouldAct: isRecord(body) ? body.wouldAct : undefined,
+      reasonCodes: isRecord(body) ? body.reasonCodes : undefined,
+    });
+  } catch (err) {
+    console.error("[estimate-closing/review] failed to persist owner review", err);
+    return NextResponse.json({ error: "Failed to record your review. Please try again." }, { status: 500 });
+  }
 
   if (!result.ok) {
     return NextResponse.json({ error: describeReviewError(result.error) }, { status: statusForReviewError(result.error) });

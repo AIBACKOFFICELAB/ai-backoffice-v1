@@ -71,18 +71,32 @@ export async function handleFollowThroughRequest(request: NextRequest, eventId: 
     return NextResponse.json({ error: "Invalid JSON payload." }, { status: 400 });
   }
 
-  const result = await recordFollowThrough(tenant.tenantId, tenant.userId, {
-    recommendationEventId: eventId,
-    actionTaken: isRecord(body) ? body.actionTaken : undefined,
-    actionChannel: isRecord(body) ? (body.actionChannel ?? null) : null,
-    customerResponse: isRecord(body) ? body.customerResponse : undefined,
-    businessDisposition: isRecord(body) ? body.businessDisposition : undefined,
-    // Request/transport identity only — see followThrough.ts's
-    // buildFollowThroughIdempotencyKey doc comment. Never used for
-    // authorization here or downstream; tenant/recommendation ownership is
-    // independently verified regardless of this value.
-    submissionId: isRecord(body) ? body.submissionId : undefined,
-  });
+  // Owner Evidence Persistence Hotfix (Section 7 — failure truthfulness):
+  // recordFollowThrough can THROW (an event-store insert failure — RLS
+  // denial, a transient DB error, or the evidence writer's own
+  // authorization re-check failing) as well as return a typed
+  // { ok: false } result. Both paths must produce a genuine failure
+  // response, never a false "saved" claim — and a thrown exception's
+  // message must never reach the client verbatim, only a fixed, sanitized
+  // message; the real error is logged server-side for diagnosis.
+  let result;
+  try {
+    result = await recordFollowThrough(tenant.tenantId, tenant.userId, {
+      recommendationEventId: eventId,
+      actionTaken: isRecord(body) ? body.actionTaken : undefined,
+      actionChannel: isRecord(body) ? (body.actionChannel ?? null) : null,
+      customerResponse: isRecord(body) ? body.customerResponse : undefined,
+      businessDisposition: isRecord(body) ? body.businessDisposition : undefined,
+      // Request/transport identity only — see followThrough.ts's
+      // buildFollowThroughIdempotencyKey doc comment. Never used for
+      // authorization here or downstream; tenant/recommendation ownership is
+      // independently verified regardless of this value.
+      submissionId: isRecord(body) ? body.submissionId : undefined,
+    });
+  } catch (err) {
+    console.error("[estimate-closing/followthrough] failed to persist owner follow-through", err);
+    return NextResponse.json({ error: "Failed to record your follow-through. Please try again." }, { status: 500 });
+  }
 
   if (!result.ok) {
     return NextResponse.json({ error: describeFollowThroughError(result.error) }, { status: statusForFollowThroughError(result.error) });

@@ -48,6 +48,10 @@ const SPRINT_6_FILES = [
   "commercialEvidence.ts",
 ];
 
+// Owner Evidence Persistence Hotfix — the new narrow evidence writer, plus
+// the two files that now construct it by default.
+const HOTFIX_FILES = ["evidenceEvent.server.ts", "review.ts", "followThrough.ts"];
+
 // Usage-specific patterns — an actual import, call, or declaration — NOT a
 // bare word match. Every file in this codebase, this test one included,
 // legitimately uses these words in DOC COMMENTS to describe their own
@@ -83,11 +87,60 @@ describe("P1 Sprint 5 authority freeze — new/touched scan-path and read-model 
     });
   }
 
+  for (const file of HOTFIX_FILES) {
+    it(`${file} contains no send-tool, approval, or toolPlan surface`, () => {
+      const source = readSourceWithoutComments(file);
+      for (const { pattern, reason } of FORBIDDEN_PATTERNS) {
+        expect(pattern.test(source), `${file} matched forbidden pattern ${pattern} — ${reason}`).toBe(false);
+      }
+    });
+  }
+
+  it("evidenceEvent.server.ts grants write authority for ONLY the two fixed owner-evidence event types — never a general business_events INSERT surface", () => {
+    const source = readSourceWithoutComments("evidenceEvent.server.ts");
+    expect(source).toMatch(/estimate\.closing_recommendation_reviewed/);
+    expect(source).toMatch(/estimate\.closing_recommendation_followthrough_recorded/);
+    // No third event type string is ever registered in the allow-list.
+    const allowListMatch = source.match(/ALLOWED_EVENT_TYPES\s*=\s*new Set<string>\(\[([\s\S]*?)\]\)/);
+    expect(allowListMatch, "could not locate ALLOWED_EVENT_TYPES literal").not.toBeNull();
+    const entries = (allowListMatch![1].match(/"[^"]+"/g) ?? []).length;
+    expect(entries).toBe(2);
+  });
+
+  it("evidenceEvent.server.ts never exports the elevated/service-role client itself, and never imports a lead-mutation, outcome, approval, or tool-call store", () => {
+    const source = readSourceWithoutComments("evidenceEvent.server.ts");
+    expect(source).not.toMatch(/export\s+(async\s+)?function\s+eventClient/);
+    expect(source).not.toMatch(/export\s*\{\s*eventClient/);
+    expect(source).not.toMatch(/updateLead\s*\(/);
+    expect(source).not.toMatch(/from\s+["'][^"']*leads\/(repository|supabase)["']/i);
+    expect(source).not.toMatch(/OutcomeStore/);
+    expect(source).not.toMatch(/ApprovalStore/);
+    expect(source).not.toMatch(/ToolCallStore/);
+    expect(source).not.toMatch(/AgentRunStore/);
+  });
+
+  it("evidenceEvent.server.ts is marked server-only and never imported into client-bundled code (followThroughTypes.ts/reviewTypes.ts stay dependency-free)", () => {
+    const source = readSourceWithoutComments("evidenceEvent.server.ts");
+    expect(source).toMatch(/^import ["']server-only["'];/m);
+    expect(readSourceWithoutComments("followThroughTypes.ts")).not.toMatch(/evidenceEvent\.server/);
+    expect(readSourceWithoutComments("reviewTypes.ts")).not.toMatch(/evidenceEvent\.server/);
+  });
+
   it("followThrough.ts never imports a lead-mutation function or an OutcomeStore — structurally cannot mutate a lead or write a canonical outcome (P1 Sprint 6 §10/§11)", () => {
     const source = readSourceWithoutComments("followThrough.ts");
     expect(source).not.toMatch(/updateLead\s*\(/);
     expect(source).not.toMatch(/from\s+["'][^"']*leads\/(repository|supabase)["']/i);
     expect(source).not.toMatch(/OutcomeStore/);
+    expect(source).not.toMatch(/recordOutcome\s*\(/);
+  });
+
+  it("review.ts never imports a lead-mutation function, an OutcomeStore, an ApprovalStore, or a ToolCallStore — structurally cannot mutate a lead, write an outcome, create an approval, or invoke a tool", () => {
+    const source = readSourceWithoutComments("review.ts");
+    expect(source).not.toMatch(/updateLead\s*\(/);
+    expect(source).not.toMatch(/from\s+["'][^"']*leads\/(repository|supabase)["']/i);
+    expect(source).not.toMatch(/OutcomeStore/);
+    expect(source).not.toMatch(/ApprovalStore/);
+    expect(source).not.toMatch(/ToolCallStore/);
     expect(source).not.toMatch(/recordOutcome\s*\(/);
   });
 
