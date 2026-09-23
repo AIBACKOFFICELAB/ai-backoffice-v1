@@ -1,5 +1,6 @@
-import { BusinessEventStore, SupabaseBusinessEventStore } from "@/lib/events/store";
+import { BusinessEventStore } from "@/lib/events/store";
 import { emitEvent } from "@/lib/events/service";
+import { createEstimateClosingEvidenceEventStore } from "./evidenceEvent.server";
 import {
   FOLLOWTHROUGH_ACTION_TAKEN,
   FOLLOWTHROUGH_ACTION_CHANNEL,
@@ -226,7 +227,10 @@ export async function recordEstimateClosingRecommendationFollowThrough(
   input: RecordFollowThroughInput,
   deps: { eventStore?: BusinessEventStore; now?: () => number } = {}
 ): Promise<RecordFollowThroughResult> {
-  const eventStore = deps.eventStore ?? new SupabaseBusinessEventStore();
+  // Owner Evidence Persistence Hotfix — same defect and same fix as
+  // review.ts's identical change; see evidenceEvent.server.ts's own doc
+  // comment for the exact RLS mechanism this routes around.
+  const eventStore = deps.eventStore ?? createEstimateClosingEvidenceEventStore();
   const now = deps.now ?? (() => Date.now());
 
   const validated = validateFollowThroughInput(input);

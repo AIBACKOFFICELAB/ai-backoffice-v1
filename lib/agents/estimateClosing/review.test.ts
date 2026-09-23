@@ -1,4 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+// review.ts now imports evidenceEvent.server.ts (Owner Evidence Persistence
+// Hotfix), which is tagged "server-only" — that package's real
+// implementation throws outside a genuine server-component resolve
+// condition. This suite injects an InMemoryBusinessEventStore for every
+// test (never the real default), so the mock only needs to satisfy the
+// import-time guard, matching lib/leads/estimateLifecycle.rls.pg.test.ts's
+// identical precedent.
+vi.mock("server-only", () => ({}));
 import {
   recordEstimateClosingRecommendationReview,
   validateReviewInput,

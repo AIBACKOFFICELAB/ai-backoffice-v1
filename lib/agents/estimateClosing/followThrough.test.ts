@@ -1,4 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+// followThrough.ts now imports evidenceEvent.server.ts (Owner Evidence
+// Persistence Hotfix), tagged "server-only" — see review.test.ts's
+// identical comment for why this mock is required here too.
+vi.mock("server-only", () => ({}));
 import {
   recordEstimateClosingRecommendationFollowThrough,
   validateFollowThroughInput,
