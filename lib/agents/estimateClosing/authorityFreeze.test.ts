@@ -52,6 +52,12 @@ const SPRINT_6_FILES = [
 // the two files that now construct it by default.
 const HOTFIX_FILES = ["evidenceEvent.server.ts", "review.ts", "followThrough.ts"];
 
+// P1 Sprint 7 — Evidence & Operations Closure. Read models, a
+// presentation-only incident classifier, and UI; no new write path of any
+// kind, by design (§25: "read models, classification, navigation,
+// presentation").
+const SPRINT_7_FILES = ["evidenceTimeline.ts", "recommendationEvidence.ts", "evaluationReadModel.ts", "operationsReadModel.ts"];
+
 // Usage-specific patterns — an actual import, call, or declaration — NOT a
 // bare word match. Every file in this codebase, this test one included,
 // legitimately uses these words in DOC COMMENTS to describe their own
@@ -95,6 +101,41 @@ describe("P1 Sprint 5 authority freeze — new/touched scan-path and read-model 
       }
     });
   }
+
+  for (const file of SPRINT_7_FILES) {
+    it(`${file} contains no send-tool, approval, or toolPlan surface (P1 Sprint 7)`, () => {
+      const source = readSourceWithoutComments(file);
+      for (const { pattern, reason } of FORBIDDEN_PATTERNS) {
+        expect(pattern.test(source), `${file} matched forbidden pattern ${pattern} — ${reason}`).toBe(false);
+      }
+    });
+  }
+
+  it("evidenceTimeline.ts is a pure presentation function — imports no store, no Supabase client, and performs no I/O of its own (P1 Sprint 7 §25)", () => {
+    const source = readSourceWithoutComments("evidenceTimeline.ts");
+    expect(source).not.toMatch(/from\s+["']@\/lib\/supabase\/server["']/);
+    expect(source).not.toMatch(/from\s+["']@supabase\/supabase-js["']/);
+    expect(source).not.toMatch(/Store\b/);
+    expect(source).not.toMatch(/\basync function\b/);
+    expect(source).not.toMatch(/await\s/);
+  });
+
+  it("operationalIncidents.ts (lib/agents/) is a pure classifier — imports only the AgentRun TYPE (never a store class/instance), and never mutates or deletes a run", () => {
+    const source = stripComments(readFileSync(join(ROOT, "..", "operationalIncidents.ts"), "utf8"));
+    expect(source).not.toMatch(/from\s+["']@\/lib\/supabase\/server["']/);
+    expect(source).toMatch(/^import \{ AgentRun \} from "\.\/runStore";$/m);
+    expect(source).not.toMatch(/AgentRunStore/);
+    expect(source).not.toMatch(/\.(update|delete)\s*\(/);
+    expect(source).not.toMatch(/\basync function\b/);
+  });
+
+  it("revenueCommandCenter.ts's P1 Sprint 7 attention-item builders are pure — no new write call introduced alongside them", () => {
+    const source = stripComments(readFileSync(join(ROOT, "..", "..", "dashboard", "revenueCommandCenter.ts"), "utf8"));
+    expect(source).not.toMatch(/requestApproval\s*\(/);
+    expect(source).not.toMatch(/recordOutcome\s*\(/);
+    expect(source).not.toMatch(/updateLead\s*\(/);
+    expect(source).not.toMatch(/\.insert\s*\(/);
+  });
 
   it("evidenceEvent.server.ts grants write authority for ONLY the two fixed owner-evidence event types — never a general business_events INSERT surface", () => {
     const source = readSourceWithoutComments("evidenceEvent.server.ts");

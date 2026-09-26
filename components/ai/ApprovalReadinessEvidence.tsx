@@ -50,7 +50,7 @@ export function ApprovalReadinessEvidence({
       value: agreementRate === null ? "Not enough evidence yet" : `${agreeCount} of ${recommendationsReviewed} (${Math.round(agreementRate * 100)}%)`,
     },
     { label: "Owner would-act rate", value: recommendationsReviewed === 0 ? "Not enough evidence yet" : `${wouldActYes} of ${recommendationsReviewed}` },
-    { label: "Model/run failures", value: String(modelFailureCount) },
+    { label: "Historical model/run failures", value: String(modelFailureCount) },
     { label: "Safety incidents", value: "0" },
     { label: "Customer actions taken", value: String(customerActionsAttributable) },
     { label: "Tool calls", value: String(toolCallsAttributable) },

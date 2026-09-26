@@ -18,6 +18,7 @@ import {
   FollowThroughBusinessDisposition,
   EstimateClosingRecommendationFollowThrough,
 } from "@/lib/agents/estimateClosing/followThroughTypes";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 
 /**
  * P1 Sprint 6 §14 — "ACTUAL FOLLOW-THROUGH" / "WHAT HAPPENED NEXT" capture
@@ -161,15 +162,17 @@ export function FollowThroughControls({
   }
 
   const currentlyRecorded = savedRecord ?? existingFollowThrough;
+  const formattedExistingOccurredAt = formatOperationalTimestamp(existingOccurredAt);
 
   return (
     <div className="space-y-4">
       {currentlyRecorded && (
-        <p className="text-sm font-medium text-success-700">
+        <p className="text-sm font-medium text-success-700" role="status" aria-live="polite">
           Currently recorded: {ACTION_TAKEN_LABELS[currentlyRecorded.actionTaken]}
           {currentlyRecorded.actionChannel ? ` (${ACTION_CHANNEL_LABELS[currentlyRecorded.actionChannel]})` : ""} &bull; Customer response:{" "}
-          {CUSTOMER_RESPONSE_LABELS[currentlyRecorded.customerResponse]} &bull; Result: {BUSINESS_DISPOSITION_LABELS[currentlyRecorded.businessDisposition]}
-          {existingOccurredAt && !savedAt ? ` — recorded ${existingOccurredAt}` : ""}
+          {CUSTOMER_RESPONSE_LABELS[currentlyRecorded.customerResponse]} &bull; Owner-reported result:{" "}
+          {BUSINESS_DISPOSITION_LABELS[currentlyRecorded.businessDisposition]}
+          {existingOccurredAt && !savedAt ? ` — recorded ${formattedExistingOccurredAt?.display ?? existingOccurredAt}` : ""}
         </p>
       )}
 
@@ -182,7 +185,7 @@ export function FollowThroughControls({
               type="button"
               onClick={() => chooseActionTaken(v)}
               aria-pressed={actionTaken === v}
-              className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+              className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                 actionTaken === v ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
               }`}
             >
@@ -202,7 +205,7 @@ export function FollowThroughControls({
                 type="button"
                 onClick={() => chooseActionChannel(c)}
                 aria-pressed={actionChannel === c}
-                className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+                className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                   actionChannel === c ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
                 }`}
               >
@@ -222,7 +225,7 @@ export function FollowThroughControls({
               type="button"
               onClick={() => chooseCustomerResponse(r)}
               aria-pressed={customerResponse === r}
-              className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+              className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                 customerResponse === r ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
               }`}
             >
@@ -241,7 +244,7 @@ export function FollowThroughControls({
               type="button"
               onClick={() => chooseBusinessDisposition(d)}
               aria-pressed={businessDisposition === d}
-              className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+              className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                 businessDisposition === d ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
               }`}
             >
