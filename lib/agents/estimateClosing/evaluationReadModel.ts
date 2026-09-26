@@ -5,6 +5,7 @@ import { listEstimateClosingRecommendations, EstimateClosingRecommendationView }
 import { REVIEW_REASON_CODES, ReviewReasonCode, EstimateClosingRecommendationReview, parsePersistedReviewPayload } from "./reviewTypes";
 import { ESTIMATE_CLOSING_REASON_CODES, EstimateClosingReasonCode } from "./types";
 import { ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "./mode";
+import { classifyAgentRunIncidents, isActiveFailedRun } from "@/lib/agents/operationalIncidents";
 
 export { parsePersistedReviewPayload };
 
@@ -149,8 +150,16 @@ export type EstimateClosingEvaluation = {
   reviewReasonCodeBreakdown: Record<ReviewReasonCode, number>;
   /** Bounded count of agent_runs with workflowId ===
    * ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID and status 'failed', within the
-   * same window. */
+   * same window. A historical/lifetime-style tally — never shrinks just
+   * because a later run for the same estimate succeeded (P1 Sprint 7 §9:
+   * "they continue to count in historical failure telemetry"). */
   modelFailureCount: number;
+  /** P1 Sprint 7 §9/§10/§11 — of modelFailureCount, how many are still
+   * ACTIVE (no later run for the same estimate has since succeeded). This
+   * is the figure that should ever drive a "needs attention" warning; the
+   * difference between this and modelFailureCount above is purely
+   * historical/resolved and must never be presented as an open problem. */
+  activeModelFailureCount: number;
   opportunityValueAnalyzed: number;
   /** Most recent recommendation's occurredAt within the window, or null
    * when none exist. Mirrors
@@ -255,7 +264,10 @@ export async function getEstimateClosingEvaluation(
   }
   const averageConfidence = recommendationsResult.recommendations.length > 0 ? confidenceSum / recommendationsResult.recommendations.length : null;
 
-  const modelFailureCount = runs.filter((run) => run.workflowId === ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID && run.status === "failed").length;
+  const estimateClosingRuns = runs.filter((run) => run.workflowId === ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID);
+  const modelFailureCount = estimateClosingRuns.filter((run) => run.status === "failed").length;
+  const failureIncidents = classifyAgentRunIncidents(estimateClosingRuns);
+  const activeModelFailureCount = estimateClosingRuns.filter((run) => run.status === "failed" && isActiveFailedRun(run.id, failureIncidents)).length;
 
   return {
     recommendationsGenerated: recommendationsResult.recommendations.length,
@@ -273,6 +285,7 @@ export async function getEstimateClosingEvaluation(
     reasonCodeBreakdown,
     reviewReasonCodeBreakdown,
     modelFailureCount,
+    activeModelFailureCount,
     opportunityValueAnalyzed,
     latestRecommendationAt,
     skippedMalformedRecommendations: recommendationsResult.skippedMalformed,
