@@ -16,6 +16,7 @@ import { SupabaseToolCallStore } from "@/lib/agents/toolCallStore";
 import { SupabaseApprovalStore } from "@/lib/approvals/store";
 import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
 import { modeForRunWorkflow, ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID } from "@/lib/agents/estimateClosing/mode";
+import { classifyAgentRunIncidents, isActiveFailedRun } from "@/lib/agents/operationalIncidents";
 import { isEstimateClosingShadowEnabled } from "@/lib/agents/estimateClosing/featureFlag";
 import {
   listEstimateClosingRecommendations,
@@ -85,7 +86,15 @@ export default async function AgenticActivityPage() {
   const estimateClosingAgentStatus = resolveEstimateClosingAgentStatus(agents);
   const estimateClosingShadowEnabled = isEstimateClosingShadowEnabled();
   const estimateClosingSummary = summarizeEstimateClosingRecommendations(recommendationsResult.recommendations);
+  // P1 Sprint 7 §9/§18 — a failed Shadow run stays in this list forever
+  // (agent_runs is immutable audit history), but only an ACTIVE failure
+  // (no later run for the same estimate has since succeeded) is presented
+  // as something needing attention today. A failure resolved by a later
+  // success is shown separately, calmly, as historical.
+  const allAgentRunIncidents = classifyAgentRunIncidents(agentRuns);
   const estimateClosingFailures = agentRuns.filter((run) => run.workflowId === ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID && run.status === "failed");
+  const estimateClosingActiveFailures = estimateClosingFailures.filter((run) => isActiveFailedRun(run.id, allAgentRunIncidents));
+  const estimateClosingHistoricalFailures = estimateClosingFailures.filter((run) => !isActiveFailedRun(run.id, allAgentRunIncidents));
   // P1 Sprint 6 visual acceptance hotfix — the raw Postgres ISO instant
   // (e.g. "2026-09-03T11:11:54.002556+00:00") broke the compact "Last
   // durable scan" metric card layout; format for display, keep the exact
@@ -201,9 +210,21 @@ export default async function AgenticActivityPage() {
                 <MetricCard label="Customer actions taken" value={operations.customerActionsAttributable} helpText="Always 0 in Shadow Mode" />
               </div>
 
-              {estimateClosingFailures.length > 0 && (
-                <Alert tone="warning" className="mt-4" title={`${estimateClosingFailures.length} recent shadow run${estimateClosingFailures.length === 1 ? "" : "s"} failed`}>
-                  {estimateClosingFailures[0].failureReason ?? "A shadow reasoning run did not complete."} No customer action was attempted or affected.
+              {estimateClosingActiveFailures.length > 0 && (
+                <Alert tone="warning" className="mt-4" title={`${estimateClosingActiveFailures.length} recent shadow run${estimateClosingActiveFailures.length === 1 ? "" : "s"} failed`}>
+                  {estimateClosingActiveFailures[0].failureReason ?? "A shadow reasoning run did not complete."} No customer action was attempted or affected.
+                </Alert>
+              )}
+
+              {/* §18 — a failure resolved by a later successful run is
+                  never hidden, just no longer presented as an open
+                  problem: shown calmly, with a reference to what resolved
+                  it, distinct from the warning-tone alert above. */}
+              {estimateClosingActiveFailures.length === 0 && estimateClosingHistoricalFailures.length > 0 && (
+                <Alert tone="info" className="mt-4" title="Historical failure — resolved by a later successful run">
+                  {estimateClosingHistoricalFailures.length} earlier shadow run{estimateClosingHistoricalFailures.length === 1 ? "" : "s"} failed and{" "}
+                  {estimateClosingHistoricalFailures.length === 1 ? "was" : "were"} superseded by a subsequent successful run for the same estimate. No
+                  action is needed. See Recent agent runs below for the full history.
                 </Alert>
               )}
 
@@ -274,21 +295,30 @@ export default async function AgenticActivityPage() {
             <div className="space-y-4">
               {runsWithToolCalls.map(({ run, toolCalls }) => {
                 const mode = modeForRunWorkflow(run.workflowId);
+                const failureIncident = run.status === "failed" ? allAgentRunIncidents.get(run.id) : undefined;
+                const isHistoricalFailure = failureIncident?.state === "resolved_by_later_success";
                 return (
                   <div key={run.id} className="rounded-card border border-surface-border p-4 text-sm">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <p className="font-medium text-ink-900">{agentNameById.get(run.agentId) ?? run.agentId}</p>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <AIStatusBadge mode={mode} />
                         <span className={`rounded-pill px-2.5 py-1 text-xs font-semibold ${RUN_STATUS_TONE[run.status] ?? "bg-surface-sunken text-ink-700"}`}>
                           {run.status}
                         </span>
+                        {isHistoricalFailure && (
+                          <span className="rounded-pill bg-surface-sunken px-2.5 py-1 text-xs font-semibold text-ink-500">Historical</span>
+                        )}
                       </div>
                     </div>
                     <p className="mt-1 text-ink-500">
-                      trigger: {run.workflowId ?? "manual"} &bull; started {run.startedAt ?? "—"} &bull; completed {run.completedAt ?? "—"}
+                      trigger: {run.workflowId ?? "manual"} &bull; started {formatOperationalTimestamp(run.startedAt)?.display ?? "—"} &bull; completed{" "}
+                      {formatOperationalTimestamp(run.completedAt)?.display ?? "—"}
                     </p>
                     {run.failureReason && <p className="mt-2 text-danger-600">Failure: {run.failureReason}</p>}
+                    {isHistoricalFailure && failureIncident?.resolvedByOccurredAt && (
+                      <p className="mt-1 text-ink-500">Resolved by a later successful run &bull; {failureIncident.resolvedByOccurredAt}</p>
+                    )}
                     {mode === "shadow" && run.status === "succeeded" && (
                       <p className="mt-2 text-ink-500">No action taken — Shadow Mode. Nothing was sent to the customer.</p>
                     )}
@@ -322,14 +352,16 @@ export default async function AgenticActivityPage() {
           ) : (
             <ul className="divide-y divide-surface-border">
               {approvals.map((approval) => (
-                <li key={approval.id} className="flex items-center justify-between gap-3 py-3 text-sm">
-                  <div>
+                <li key={approval.id} className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm">
+                  <div className="min-w-0 flex-1">
                     <p className="font-medium text-ink-900">{approval.requestedAction}</p>
                     <p className="text-ink-500">
-                      risk: {approval.riskLevel} &bull; requested {approval.createdAt}
+                      risk: {approval.riskLevel} &bull; requested {formatOperationalTimestamp(approval.createdAt)?.display ?? approval.createdAt}
                     </p>
                   </div>
-                  <span className={`rounded-pill px-2.5 py-1 text-xs font-semibold ${approval.status === "pending" ? "bg-warning-50 text-warning-700" : "bg-surface-sunken text-ink-700"}`}>
+                  <span
+                    className={`shrink-0 rounded-pill px-2.5 py-1 text-xs font-semibold ${approval.status === "pending" ? "bg-warning-50 text-warning-700" : "bg-surface-sunken text-ink-700"}`}
+                  >
                     {approval.status}
                   </span>
                 </li>
@@ -349,15 +381,15 @@ export default async function AgenticActivityPage() {
           ) : (
             <ul className="divide-y divide-surface-border">
               {outcomes.map((outcome) => (
-                <li key={outcome.id} className="flex items-center justify-between gap-3 py-3 text-sm">
-                  <div>
+                <li key={outcome.id} className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm">
+                  <div className="min-w-0 flex-1">
                     <p className="font-medium text-ink-900">{outcome.outcomeType}</p>
                     <p className="text-ink-500">
-                      {outcome.attributionConfidence} &bull; {outcome.occurredAt}
+                      {outcome.attributionConfidence} &bull; {formatOperationalTimestamp(outcome.occurredAt)?.display ?? outcome.occurredAt}
                     </p>
                   </div>
                   {outcome.outcomeValue != null && (
-                    <span className="font-semibold text-ink-900">
+                    <span className="shrink-0 font-semibold text-ink-900">
                       {outcome.currency} {outcome.outcomeValue.toFixed(2)}
                     </span>
                   )}
@@ -379,9 +411,9 @@ export default async function AgenticActivityPage() {
             <ul className="divide-y divide-surface-border">
               {events.map((event) => (
                 <li key={event.id} className="py-3 text-sm">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-medium text-ink-900">{event.eventType}</span>
-                    <span className="text-xs text-ink-500">{event.occurredAt}</span>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="min-w-0 flex-1 break-words font-medium text-ink-900">{event.eventType}</span>
+                    <span className="shrink-0 text-xs text-ink-500">{formatOperationalTimestamp(event.occurredAt)?.display ?? event.occurredAt}</span>
                   </div>
                   <p className="text-ink-500">
                     {event.actorType}
