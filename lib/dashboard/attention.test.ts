@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { isOverdueFollowUp, isUnresolvedEmergency, countUnreviewedRecommendations } from "./revenueCommandCenter";
+import {
+  isOverdueFollowUp,
+  isUnresolvedEmergency,
+  countUnreviewedRecommendations,
+  buildUnreviewedRecommendationAttentionItem,
+  buildMissingFollowThroughAttentionItem,
+  buildActiveAgentFailureAttentionItems,
+} from "./revenueCommandCenter";
 import { PlumbingLead } from "@/data/leadModel";
+import { AgentRun } from "@/lib/agents/runStore";
 
 function makeLead(overrides: Partial<PlumbingLead> = {}): PlumbingLead {
   return {
@@ -90,5 +98,103 @@ describe("countUnreviewedRecommendations", () => {
     const recs = [{ recommendationEventId: "r1" }];
     const reviews = [{ recommendationEventId: "some-other-recommendation" }];
     expect(countUnreviewedRecommendations(recs, reviews)).toBe(1);
+  });
+});
+
+/** P1 Sprint 7 §19/§30 — the exact-link attention-card builders. */
+describe("buildUnreviewedRecommendationAttentionItem", () => {
+  it("A: is null at zero recommendations (never a fake notification)", () => {
+    expect(buildUnreviewedRecommendationAttentionItem([], null)).toBeNull();
+  });
+
+  it("E/G: links directly to the exact recommendation when it is the only one — never a generic link", () => {
+    const item = buildUnreviewedRecommendationAttentionItem([{ recommendationEventId: "rec-abc" }], "2026-09-23T11:11:57.000Z");
+    expect(item?.href).toBe("/agentic/estimate-closing/recommendations/rec-abc");
+    expect(item?.href).not.toBe("/agentic/estimate-closing");
+  });
+
+  it("falls back to the workspace link once more than one recommendation shares the gap", () => {
+    const item = buildUnreviewedRecommendationAttentionItem(
+      [{ recommendationEventId: "rec-a" }, { recommendationEventId: "rec-b" }],
+      "2026-09-23T11:11:57.000Z"
+    );
+    expect(item?.href).toBe("/agentic/estimate-closing");
+  });
+
+  it("B: is null once the recommendation has been reviewed (caller passes an already-filtered list)", () => {
+    expect(buildUnreviewedRecommendationAttentionItem([], "2026-09-23T11:11:57.000Z")).toBeNull();
+  });
+});
+
+describe("buildMissingFollowThroughAttentionItem", () => {
+  it("C: is visible (non-null) when a recommendation has no follow-through", () => {
+    const item = buildMissingFollowThroughAttentionItem([{ recommendationEventId: "rec-abc" }], null);
+    expect(item).not.toBeNull();
+  });
+
+  it("D: is null once follow-through exists (caller passes an already-filtered list)", () => {
+    expect(buildMissingFollowThroughAttentionItem([], null)).toBeNull();
+  });
+
+  it("F: the single-recommendation link includes the #actual-follow-through anchor", () => {
+    const item = buildMissingFollowThroughAttentionItem([{ recommendationEventId: "rec-abc" }], null);
+    expect(item?.href).toBe("/agentic/estimate-closing/recommendations/rec-abc#actual-follow-through");
+  });
+
+  it("falls back to the workspace link (no anchor) once more than one recommendation shares the gap", () => {
+    const item = buildMissingFollowThroughAttentionItem([{ recommendationEventId: "rec-a" }, { recommendationEventId: "rec-b" }], null);
+    expect(item?.href).toBe("/agentic/estimate-closing");
+  });
+});
+
+function makeRun(overrides: Partial<AgentRun> & Pick<AgentRun, "id">): AgentRun {
+  return {
+    tenantId: "tenant-1",
+    agentId: "agent-1",
+    triggerEventId: "trigger-1",
+    workflowId: "estimate_closing_shadow",
+    status: "failed",
+    startedAt: null,
+    completedAt: null,
+    modelStrategy: {},
+    inputContextRef: null,
+    outputSummary: null,
+    failureReason: "model gateway failed: configuration",
+    correlationId: "corr-1",
+    createdAt: "2026-09-21T00:00:00.000Z",
+    updatedAt: "2026-09-21T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+describe("buildActiveAgentFailureAttentionItems", () => {
+  const agentNameById = new Map([["agent-1", "Estimate Closing Agent"]]);
+
+  it("I: an active failure (no later success) appears in Needs Your Attention", () => {
+    const runs = [makeRun({ id: "r1", status: "failed", completedAt: "2026-09-21T00:00:00.000Z" })];
+    const items = buildActiveAgentFailureAttentionItems(runs, agentNameById);
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("agent_failure");
+  });
+
+  it("H: a historical failure (resolved by a later success for the same subject) disappears from Needs Your Attention", () => {
+    const runs = [
+      makeRun({ id: "r1", status: "failed", completedAt: "2026-09-21T00:00:00.000Z" }),
+      makeRun({ id: "r2", status: "failed", completedAt: "2026-09-22T00:00:00.000Z" }),
+      makeRun({ id: "r3", status: "succeeded", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const items = buildActiveAgentFailureAttentionItems(runs, agentNameById);
+    expect(items).toHaveLength(0);
+  });
+
+  it("a newer failure after the resolving success is active again, while the older resolved ones stay hidden", () => {
+    const runs = [
+      makeRun({ id: "r1", status: "failed", completedAt: "2026-09-21T00:00:00.000Z" }),
+      makeRun({ id: "r2", status: "succeeded", completedAt: "2026-09-22T00:00:00.000Z" }),
+      makeRun({ id: "r3", status: "failed", completedAt: "2026-09-25T00:00:00.000Z" }),
+    ];
+    const items = buildActiveAgentFailureAttentionItems(runs, agentNameById);
+    expect(items).toHaveLength(1);
+    expect(items[0].occurredAt).toBe("2026-09-25T00:00:00.000Z");
   });
 });
