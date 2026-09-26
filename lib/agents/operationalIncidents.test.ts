@@ -100,13 +100,33 @@ describe("classifyAgentRunIncidents", () => {
     expect(classified.get("r1")?.state).toBe("active");
   });
 
-  it("Codex review, PR #30: a success from a DIFFERENT agent (both lacking workflowId) never resolves another agent's failure for the same trigger event", () => {
+  it("Codex review, PR #30 / Founder repair directive, finding 2.A: a success from a DIFFERENT agent (both lacking workflowId) never resolves another agent's failure for the same trigger event", () => {
     const runs = [
       run({ id: "r1", status: "failed", agentId: "agent-A", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-21T00:00:00.000Z" }),
       run({ id: "r2", status: "succeeded", agentId: "agent-B", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-23T00:00:00.000Z" }),
     ];
     const classified = classifyAgentRunIncidents(runs);
     expect(classified.get("r1")?.state).toBe("active");
+  });
+
+  it("Founder repair directive, finding 2.B: same trigger + same workflow-less agent → a genuinely later success from that SAME agent still resolves the earlier failure", () => {
+    const runs = [
+      run({ id: "r1", status: "failed", agentId: "agent-A", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-21T00:00:00.000Z" }),
+      run({ id: "r2", status: "succeeded", agentId: "agent-A", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    expect(classified.get("r1")?.state).toBe("resolved_by_later_success");
+    expect(classified.get("r1")?.resolvedByRunId).toBe("r2");
+  });
+
+  it("Founder repair directive, finding 2.D: normal Estimate Closing (has workflowId) grouping is unaffected by including agentId in the subject key", () => {
+    const runs = [
+      run({ id: "r1", status: "failed", agentId: "agent-1", workflowId: "estimate_closing_shadow", triggerEventId: "trigger-1", completedAt: "2026-09-21T00:00:00.000Z" }),
+      run({ id: "r2", status: "succeeded", agentId: "agent-1", workflowId: "estimate_closing_shadow", triggerEventId: "trigger-1", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    expect(classified.get("r1")?.state).toBe("resolved_by_later_success");
+    expect(classified.get("r1")?.resolvedByRunId).toBe("r2");
   });
 
   it("Codex review, PR #30: a newer retry (later createdAt) that finishes quickly correctly resolves an older attempt that fails slowly — completion order alone would miss this", () => {
@@ -142,6 +162,22 @@ describe("classifyAgentRunIncidents", () => {
     ];
     const classified = classifyAgentRunIncidents(runs);
     expect(classified.get("r1")?.state).toBe("active");
+  });
+
+  it("Founder repair directive, finding 1.C: EQUAL createdAt (the actual tie-break field) is stable/inactive regardless of how far apart completedAt is", () => {
+    const runs = [
+      // Same attempt-creation instant (a tie by the field that actually
+      // decides order) — one finishes fast, the other finishes much
+      // later. completedAt divergence must never break the tie.
+      run({ id: "r1", status: "failed", createdAt: "2026-09-21T00:00:00.000Z", completedAt: "2026-09-30T00:00:00.000Z" }),
+      run({ id: "r2", status: "succeeded", createdAt: "2026-09-21T00:00:00.000Z", completedAt: "2026-09-21T00:05:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    expect(classified.get("r1")?.state).toBe("active");
+    // Deterministic regardless of array order — reversing the input must
+    // give the identical result.
+    const reversed = classifyAgentRunIncidents([...runs].reverse());
+    expect(reversed.get("r1")?.state).toBe("active");
   });
 
   it("non-failed, non-succeeded runs (pending/running/etc.) are never classified as incidents", () => {

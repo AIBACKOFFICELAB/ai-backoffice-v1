@@ -43,4 +43,10 @@ describe("AI Activity page — P1 Sprint 7 active/historical incident regression
     // Never a delete/mutation call anywhere near the run list.
     expect(source).not.toMatch(/\.(delete|remove)\s*\(\s*run\.id/);
   });
+
+  it("Codex review / Founder repair directive, finding 3: the historical-resolution timestamp is formatted through formatOperationalTimestamp, never rendered raw", () => {
+    const source = readSource();
+    expect(source).not.toMatch(/\{failureIncident\.resolvedByOccurredAt\}/);
+    expect(source).toMatch(/formatOperationalTimestamp\s*\(\s*failureIncident\.resolvedByOccurredAt\s*\)\?\.\s*display/);
+  });
 });
