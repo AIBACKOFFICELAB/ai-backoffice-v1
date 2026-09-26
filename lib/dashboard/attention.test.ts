@@ -147,7 +147,12 @@ describe("buildMissingFollowThroughAttentionItem", () => {
   });
 });
 
+/** createdAt defaults to whatever completedAt/startedAt is passed — see
+ * operationalIncidents.test.ts's identical helper doc comment for why
+ * (Codex review, PR #30: retry order is decided by createdAt, not
+ * completedAt). */
 function makeRun(overrides: Partial<AgentRun> & Pick<AgentRun, "id">): AgentRun {
+  const defaultTimestamp = overrides.completedAt ?? overrides.startedAt ?? "2026-09-21T00:00:00.000Z";
   return {
     tenantId: "tenant-1",
     agentId: "agent-1",
@@ -161,8 +166,8 @@ function makeRun(overrides: Partial<AgentRun> & Pick<AgentRun, "id">): AgentRun 
     outputSummary: null,
     failureReason: "model gateway failed: configuration",
     correlationId: "corr-1",
-    createdAt: "2026-09-21T00:00:00.000Z",
-    updatedAt: "2026-09-21T00:00:00.000Z",
+    createdAt: defaultTimestamp,
+    updatedAt: defaultTimestamp,
     ...overrides,
   };
 }

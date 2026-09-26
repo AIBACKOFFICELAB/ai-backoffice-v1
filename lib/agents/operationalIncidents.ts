@@ -20,25 +20,41 @@ import { AgentRun } from "./runStore";
  * "Historical failure" / "Resolved by later successful run".
  *
  * SUBJECT IDENTITY: two runs are "the same logical workflow/subject" only
- * when they share both `workflowId` AND `triggerEventId`. For Estimate
- * Closing, `triggerEventId` is the id of the one-time, non-re-emittable
- * `estimate.stalled` event for a specific estimate (see
+ * when they share `agentId`, `workflowId`, AND `triggerEventId`. For
+ * Estimate Closing, `triggerEventId` is the id of the one-time,
+ * non-re-emittable `estimate.stalled` event for a specific estimate (see
  * stalledScan.ts::buildStalledIdempotencyKey) — every scan attempt against
  * the same estimate reuses that same id, so grouping on it correctly
  * correlates repeated attempts against ONE estimate without ever needing a
  * hardcoded date or id (§10: "Generalize the rule safely... A newer failure
  * after a success must become active again" — handled naturally below,
- * since only a success STRICTLY LATER than a given failure can resolve it).
- * A run with no `triggerEventId` has no safe entity context to correlate on
- * and is treated as its own singleton subject — it is NEVER merged with
- * another triggerEventId-less run just because both happen to be missing
- * one (§29 tests E/F: unrelated subjects must never resolve each other).
+ * since only a success from a STRICTLY LATER attempt can resolve a given
+ * failure). `agentId` is always included (not just a fallback) so that two
+ * different agents which both happen to omit `workflowId` and share a
+ * `triggerEventId` — the generic agent-runtime API permits exactly this —
+ * are never merged into one subject; a success from one agent must never
+ * mark another agent's failure for the same event as historical (Codex
+ * review, PR #30). A run with no `triggerEventId` has no safe entity
+ * context to correlate on and is treated as its own singleton subject — it
+ * is NEVER merged with another triggerEventId-less run just because both
+ * happen to be missing one (§29 tests E/F: unrelated subjects must never
+ * resolve each other).
+ *
+ * RETRY ORDER: "later" is determined by `createdAt` (when the attempt was
+ * launched), never by `completedAt`. Run creation and the terminal-status
+ * check are not atomic, so an older, slower attempt can finish (and fail)
+ * AFTER a newer retry has already succeeded, or an older attempt can
+ * succeed late, after a newer attempt has already failed — completion-time
+ * ordering would misclassify either case (Codex review, PR #30).
+ * `completedAt` is used only for DISPLAY of when the resolving run actually
+ * finished, never to decide which attempt is logically later.
  *
  * Only two states are ever produced at runtime. "Historical" (§18's exact
  * wording) is the DISPLAY category for `resolved_by_later_success` — there
  * is no independently meaningful third runtime state: a failure is either
- * still unresolved (active) or proven resolved by a later success for the
- * same subject (resolved_by_later_success, shown as "Historical failure").
+ * still unresolved (active) or proven resolved by a later attempt's success
+ * for the same subject (resolved_by_later_success, shown as "Historical
+ * failure").
  */
 export type OperationalIncidentState = "active" | "resolved_by_later_success";
 
@@ -52,12 +68,14 @@ export type ClassifiedFailedRun = {
   resolvedByOccurredAt: string | null;
 };
 
+/** Display-only: when this run actually reached its terminal state. Never
+ * used to decide retry order — see the module doc comment's "RETRY ORDER". */
 function runTimestamp(run: AgentRun): string {
   return run.completedAt ?? run.startedAt ?? run.createdAt;
 }
 
 function subjectKey(run: AgentRun): string {
-  if (run.triggerEventId) return `${run.workflowId ?? "__no_workflow__"}::${run.triggerEventId}`;
+  if (run.triggerEventId) return `${run.agentId}::${run.workflowId ?? "__no_workflow__"}::${run.triggerEventId}`;
   return `__no_trigger__::${run.id}`;
 }
 
@@ -83,14 +101,12 @@ export function classifyAgentRunIncidents(runs: AgentRun[]): Map<string, Classif
   for (const run of runs) {
     if (run.status !== "failed") continue;
     const subject = bySubject.get(subjectKey(run)) ?? [];
-    const failedAt = runTimestamp(run);
 
     let resolver: AgentRun | null = null;
     for (const candidate of subject) {
       if (candidate.status !== "succeeded") continue;
-      const candidateAt = runTimestamp(candidate);
-      if (candidateAt <= failedAt) continue; // only a STRICTLY LATER success resolves a failure
-      if (!resolver || candidateAt < runTimestamp(resolver)) resolver = candidate;
+      if (candidate.createdAt <= run.createdAt) continue; // only a run from a STRICTLY LATER attempt resolves a failure
+      if (!resolver || candidate.createdAt < resolver.createdAt) resolver = candidate;
     }
 
     result.set(run.id, {

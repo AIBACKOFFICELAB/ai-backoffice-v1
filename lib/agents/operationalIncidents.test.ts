@@ -2,7 +2,14 @@ import { describe, it, expect } from "vitest";
 import { classifyAgentRunIncidents, isActiveFailedRun } from "./operationalIncidents";
 import { AgentRun } from "./runStore";
 
+/** `createdAt` defaults to whatever `completedAt` (or `startedAt`) is
+ * passed, so every existing test below — which expresses ordering via
+ * completedAt — keeps meaning what it says now that retry order is
+ * decided by createdAt (Codex review, PR #30); tests that need
+ * createdAt/completedAt to diverge (to prove the two are no longer
+ * conflated) override createdAt explicitly. */
 function run(overrides: Partial<AgentRun> & Pick<AgentRun, "id">): AgentRun {
+  const defaultTimestamp = overrides.completedAt ?? overrides.startedAt ?? "2026-09-21T00:00:00.000Z";
   return {
     tenantId: "tenant-1",
     agentId: "agent-1",
@@ -16,8 +23,8 @@ function run(overrides: Partial<AgentRun> & Pick<AgentRun, "id">): AgentRun {
     outputSummary: null,
     failureReason: null,
     correlationId: "corr-1",
-    createdAt: "2026-09-21T00:00:00.000Z",
-    updatedAt: "2026-09-21T00:00:00.000Z",
+    createdAt: defaultTimestamp,
+    updatedAt: defaultTimestamp,
     ...overrides,
   };
 }
@@ -91,6 +98,41 @@ describe("classifyAgentRunIncidents", () => {
     ];
     const classified = classifyAgentRunIncidents(runs);
     expect(classified.get("r1")?.state).toBe("active");
+  });
+
+  it("Codex review, PR #30: a success from a DIFFERENT agent (both lacking workflowId) never resolves another agent's failure for the same trigger event", () => {
+    const runs = [
+      run({ id: "r1", status: "failed", agentId: "agent-A", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-21T00:00:00.000Z" }),
+      run({ id: "r2", status: "succeeded", agentId: "agent-B", workflowId: null, triggerEventId: "trigger-1", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    expect(classified.get("r1")?.state).toBe("active");
+  });
+
+  it("Codex review, PR #30: a newer retry (later createdAt) that finishes quickly correctly resolves an older attempt that fails slowly — completion order alone would miss this", () => {
+    const runs = [
+      // older attempt: created first, takes a long time, fails late
+      run({ id: "r1", status: "failed", createdAt: "2026-09-21T00:00:00.000Z", completedAt: "2026-09-25T00:00:00.000Z" }),
+      // newer retry: created after r1, but succeeds (and completes) before r1 even finishes
+      run({ id: "r2", status: "succeeded", createdAt: "2026-09-22T00:00:00.000Z", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    expect(classified.get("r1")?.state).toBe("resolved_by_later_success");
+    expect(classified.get("r1")?.resolvedByRunId).toBe("r2");
+  });
+
+  it("Codex review, PR #30: an older attempt that succeeds late does NOT incorrectly resolve a newer attempt that already failed", () => {
+    const runs = [
+      // older attempt: created first, slow, eventually succeeds late
+      run({ id: "r1", status: "succeeded", createdAt: "2026-09-20T00:00:00.000Z", completedAt: "2026-09-26T00:00:00.000Z" }),
+      // newer attempt: created after r1 started, fails and completes before r1 finishes
+      run({ id: "r2", status: "failed", createdAt: "2026-09-22T00:00:00.000Z", completedAt: "2026-09-23T00:00:00.000Z" }),
+    ];
+    const classified = classifyAgentRunIncidents(runs);
+    // r1's createdAt (Sep 20) is not LATER than r2's createdAt (Sep 22) — r1 is an earlier
+    // attempt that merely finished slowly, not a genuine retry — so it must never resolve
+    // r2, even though r1's completedAt (Sep 26) is later than r2's completedAt (Sep 23).
+    expect(classified.get("r2")?.state).toBe("active");
   });
 
   it("a success exactly equal to (not strictly after) the failure's own timestamp does not resolve it", () => {

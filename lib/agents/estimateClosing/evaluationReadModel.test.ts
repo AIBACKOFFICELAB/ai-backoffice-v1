@@ -331,13 +331,20 @@ describe("getEstimateClosingEvaluation", () => {
     const eventStore = new InMemoryBusinessEventStore();
     const runStore = new InMemoryAgentRunStore();
 
+    // Retry order is decided by createdAt (Codex review, PR #30), so this
+    // fixture sets it explicitly rather than relying on real-clock ordering
+    // between two synchronous create() calls, which can land in the same
+    // millisecond in a fast test run.
     const failedRun = await runStore.create({ tenantId: "tenant-1", agentId: "agent-1", workflowId: ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID, triggerEventId: "trigger-1" });
+    failedRun.createdAt = "2026-09-21T00:00:00.000Z";
     await runStore.update("tenant-1", failedRun.id, { status: "failed", completedAt: "2026-09-21T00:00:00.000Z" });
 
     const succeededRun = await runStore.create({ tenantId: "tenant-1", agentId: "agent-1", workflowId: ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID, triggerEventId: "trigger-1" });
+    succeededRun.createdAt = "2026-09-23T00:00:00.000Z";
     await runStore.update("tenant-1", succeededRun.id, { status: "succeeded", completedAt: "2026-09-23T00:00:00.000Z" });
 
     const stillActiveFailedRun = await runStore.create({ tenantId: "tenant-1", agentId: "agent-1", workflowId: ESTIMATE_CLOSING_SHADOW_WORKFLOW_ID, triggerEventId: "trigger-2" });
+    stillActiveFailedRun.createdAt = "2026-09-21T00:00:00.000Z";
     await runStore.update("tenant-1", stillActiveFailedRun.id, { status: "failed", completedAt: "2026-09-21T00:00:00.000Z" });
 
     const evaluation = await getEstimateClosingEvaluation("tenant-1", { eventStore, runStore });

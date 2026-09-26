@@ -317,7 +317,9 @@ export default async function AgenticActivityPage() {
                     </p>
                     {run.failureReason && <p className="mt-2 text-danger-600">Failure: {run.failureReason}</p>}
                     {isHistoricalFailure && failureIncident?.resolvedByOccurredAt && (
-                      <p className="mt-1 text-ink-500">Resolved by a later successful run &bull; {failureIncident.resolvedByOccurredAt}</p>
+                      <p className="mt-1 text-ink-500">
+                        Resolved by a later successful run &bull; {formatOperationalTimestamp(failureIncident.resolvedByOccurredAt)?.display ?? failureIncident.resolvedByOccurredAt}
+                      </p>
                     )}
                     {mode === "shadow" && run.status === "succeeded" && (
                       <p className="mt-2 text-ink-500">No action taken — Shadow Mode. Nothing was sent to the customer.</p>
