@@ -25,6 +25,7 @@ import { ActivityItem } from "@/components/dashboard/ActivityItem";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { AIStatusBadge } from "@/components/ui/AIStatusBadge";
 import { Alert } from "@/components/ui/Alert";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 
 const ATTENTION_TONE: Record<AttentionItemKind, ActionCardTone> = {
   emergency_lead: "danger",
@@ -241,7 +242,7 @@ export default async function DashboardPage() {
                     icon={<Bot className="h-4 w-4" />}
                     title={item.title}
                     description={item.description}
-                    timestamp={item.occurredAt}
+                    timestamp={formatOperationalTimestamp(item.occurredAt)?.display ?? item.occurredAt}
                     badge={
                       item.status === "failed" ? (
                         <span className="inline-flex items-center gap-1 rounded-pill bg-danger-50 px-2 py-0.5 text-xs font-semibold text-danger-700">
@@ -268,7 +269,7 @@ export default async function DashboardPage() {
               <PhoneMissed className="h-4 w-4 text-ink-400" aria-hidden="true" />
               <p className="text-sm font-semibold text-ink-500">Missed Call Recovery</p>
             </div>
-            <div className="mt-3 grid grid-cols-4 gap-3 text-center">
+            <div className="mt-3 grid grid-cols-2 gap-3 text-center sm:grid-cols-4">
               <div>
                 <p className="text-2xl font-bold text-ink-900">{data.missedCallAnalytics.totalMissedCalls}</p>
                 <p className="text-xs text-ink-400">Missed calls</p>
