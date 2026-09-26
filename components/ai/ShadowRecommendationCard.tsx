@@ -1,6 +1,7 @@
 import { Card } from "@/components/ui/Card";
 import { AIStatusBadge } from "@/components/ui/AIStatusBadge";
 import { labelReasonCode, labelRecommendation, labelChannel, labelTiming } from "@/lib/agents/estimateClosing/labels";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 import type { EstimateClosingRecommendation } from "@/lib/agents/estimateClosing/types";
 
 /**
@@ -19,6 +20,7 @@ export function ShadowRecommendationCard({
   occurredAt: string;
 }) {
   const timingLabel = labelTiming(recommendation.suggestedTiming);
+  const formattedOccurredAt = formatOperationalTimestamp(occurredAt);
 
   return (
     <Card className="p-5">
@@ -71,7 +73,7 @@ export function ShadowRecommendationCard({
       )}
 
       <div className="mt-5 flex flex-wrap items-center justify-between gap-2 border-t border-surface-border pt-4 text-xs text-ink-400">
-        <span>Detected {occurredAt}</span>
+        <span title={formattedOccurredAt?.title}>Detected {formattedOccurredAt?.display ?? occurredAt}</span>
         <span className="font-semibold text-ink-500">Customer contacted: No</span>
       </div>
     </Card>
