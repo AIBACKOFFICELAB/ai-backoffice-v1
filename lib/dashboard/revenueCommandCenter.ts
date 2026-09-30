@@ -3,7 +3,7 @@ import { getLeads, buildLeadMetrics } from "@/lib/leads/repository";
 import { getMissedCallAnalytics } from "@/lib/modules/missedCallRecovery/service";
 import { getEstimateFollowupAnalytics } from "@/lib/modules/estimateFollowup/service";
 import { SupabaseAgentStore } from "@/lib/agents/agentStore";
-import { SupabaseAgentRunStore } from "@/lib/agents/runStore";
+import { SupabaseAgentRunStore, AgentRun } from "@/lib/agents/runStore";
 import { SupabaseApprovalStore } from "@/lib/approvals/store";
 import { SupabaseOutcomeStore } from "@/lib/outcomes/store";
 import { SupabaseBusinessEventStore } from "@/lib/events/store";
@@ -21,6 +21,7 @@ import { listEstimateClosingRecommendationReviews } from "@/lib/agents/estimateC
 import { resolveCurrentFollowThroughByRecommendation, fetchFollowThroughEventsForRecommendations } from "@/lib/agents/estimateClosing/commercialEvidence";
 import { getEstimateFollowupSequencesForTenant } from "@/lib/modules/estimateFollowup/service";
 import { computeEstimateLifecycleReadModel } from "@/lib/leads/estimateLifecycleReadModel";
+import { classifyAgentRunIncidents, isActiveFailedRun } from "@/lib/agents/operationalIncidents";
 
 /**
  * P1B Revenue Command Center — assembles the dashboard's data in one
@@ -158,12 +159,19 @@ export function isUnresolvedEmergency(lead: PlumbingLead): boolean {
  * pairRecommendationsWithReviews matching logic (by recommendationEventId),
  * kept separate here since the dashboard only needs the COUNT, not the
  * full pairing. */
+export function findUnreviewedRecommendations<T extends { recommendationEventId: string }>(
+  recommendations: T[],
+  reviews: Array<{ recommendationEventId: string }>
+): T[] {
+  const reviewedIds = new Set(reviews.map((r) => r.recommendationEventId));
+  return recommendations.filter((r) => !reviewedIds.has(r.recommendationEventId));
+}
+
 export function countUnreviewedRecommendations(
   recommendations: Array<{ recommendationEventId: string }>,
   reviews: Array<{ recommendationEventId: string }>
 ): number {
-  const reviewedIds = new Set(reviews.map((r) => r.recommendationEventId));
-  return recommendations.filter((r) => !reviewedIds.has(r.recommendationEventId)).length;
+  return findUnreviewedRecommendations(recommendations, reviews).length;
 }
 
 /** P1 Sprint 6 §18 — exported for unit testing. Pure: counts recommendations
@@ -174,11 +182,86 @@ export function countUnreviewedRecommendations(
  * recommendation ids that DO have a current follow-through record (already
  * resolved by resolveCurrentFollowThroughByRecommendation), never
  * re-derived here. */
+export function findRecommendationsMissingFollowThrough<T extends { recommendationEventId: string }>(
+  recommendations: T[],
+  followThroughRecommendationIds: Set<string>
+): T[] {
+  return recommendations.filter((r) => !followThroughRecommendationIds.has(r.recommendationEventId));
+}
+
 export function countRecommendationsMissingFollowThrough(
   recommendations: Array<{ recommendationEventId: string }>,
   followThroughRecommendationIds: Set<string>
 ): number {
-  return recommendations.filter((r) => !followThroughRecommendationIds.has(r.recommendationEventId)).length;
+  return findRecommendationsMissingFollowThrough(recommendations, followThroughRecommendationIds).length;
+}
+
+/** P1 Sprint 7 §19/§30 — pure, independently-testable builder for the
+ * "awaiting review" attention item. Returns null at zero (never shown).
+ * Links directly to the one exact recommendation when it is the only gap
+ * (§30 test E/G: "no generic link when exact resource is known"); falls
+ * back to the workspace once there is more than one, since a single card
+ * cannot uniquely resolve to more than one URL. */
+export function buildUnreviewedRecommendationAttentionItem(
+  unreviewed: Array<{ recommendationEventId: string }>,
+  latestRecommendationAt: string | null
+): AttentionItem | null {
+  const count = unreviewed.length;
+  if (count === 0) return null;
+  return {
+    kind: "recommendation_review",
+    title: "AI recommendations awaiting review",
+    description: `${count} Shadow recommendation${count === 1 ? "" : "s"} ${count === 1 ? "hasn't" : "haven't"} been reviewed yet`,
+    href: count === 1 ? `/agentic/estimate-closing/recommendations/${encodeURIComponent(unreviewed[0].recommendationEventId)}` : "/agentic/estimate-closing",
+    occurredAt: latestRecommendationAt ?? new Date().toISOString(),
+  };
+}
+
+/** P1 Sprint 7 §19/§30 — pure, independently-testable builder for the
+ * "missing actual-result follow-up" attention item. Same single-vs-many
+ * exact-link rule as buildUnreviewedRecommendationAttentionItem; the
+ * `#actual-follow-through` anchor lands the owner directly on that card
+ * (§19) instead of the top of the recommendation page. */
+export function buildMissingFollowThroughAttentionItem(
+  missing: Array<{ recommendationEventId: string }>,
+  latestRecommendationAt: string | null
+): AttentionItem | null {
+  const count = missing.length;
+  if (count === 0) return null;
+  return {
+    kind: "followthrough_needed",
+    title: "AI recommendations still need actual-result follow-up",
+    description: `${count} recommendation${count === 1 ? " has" : "s have"} no recorded outcome yet`,
+    href:
+      count === 1
+        ? `/agentic/estimate-closing/recommendations/${encodeURIComponent(missing[0].recommendationEventId)}#actual-follow-through`
+        : "/agentic/estimate-closing",
+    occurredAt: latestRecommendationAt ?? new Date().toISOString(),
+  };
+}
+
+/** P1 Sprint 7 §9/§11/§30 — pure, independently-testable builder for the
+ * agent-failure attention items. A failed run surfaces here only while
+ * ACTIVE (classifyAgentRunIncidents found no later same-subject success) —
+ * a resolved/historical failure is never shown as needing action today,
+ * though it remains fully visible wherever run history itself is rendered
+ * (§9: "remain visible in audit/history"; this function only decides
+ * ATTENTION visibility, never touches the run record itself). */
+export function buildActiveAgentFailureAttentionItems(recentRuns: AgentRun[], agentNameById: Map<string, string>): AttentionItem[] {
+  const failureIncidents = classifyAgentRunIncidents(recentRuns);
+  const items: AttentionItem[] = [];
+  for (const run of recentRuns) {
+    if (run.status !== "failed") continue;
+    if (!isActiveFailedRun(run.id, failureIncidents)) continue;
+    items.push({
+      kind: "agent_failure",
+      title: agentNameById.get(run.agentId) ?? "Agent",
+      description: run.failureReason ?? "The agent run failed.",
+      href: "/agentic",
+      occurredAt: run.completedAt ?? run.createdAt,
+    });
+  }
+  return items;
 }
 
 export async function buildRevenueCommandCenterData(tenantId: string, tenantName: string): Promise<RevenueCommandCenterData> {
@@ -305,35 +388,24 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
   // item, never one per recommendation (would flood this list once real
   // volume exists) — internal product-attention only, never an email/SMS/
   // push/approval (directive: "Do NOT send email/SMS/push notify
-  // externally/create an approval"). Never shown when the count is 0.
-  const unreviewedRecommendationsCount = countUnreviewedRecommendations(recommendationsResult.recommendations, reviewsResult.reviews);
-  if (unreviewedRecommendationsCount > 0) {
-    attentionItems.push({
-      kind: "recommendation_review",
-      title: "AI recommendations awaiting review",
-      description: `${unreviewedRecommendationsCount} Shadow recommendation${unreviewedRecommendationsCount === 1 ? "" : "s"} ${unreviewedRecommendationsCount === 1 ? "hasn't" : "haven't"} been reviewed yet`,
-      href: "/agentic/estimate-closing",
-      occurredAt: estimateClosingSummary.latestRecommendationAt ?? new Date().toISOString(),
-    });
-  }
+  // externally/create an approval"). Never shown when the count is 0. See
+  // buildUnreviewedRecommendationAttentionItem for the §19/§30 exact-link
+  // rule.
+  const unreviewedRecommendations = findUnreviewedRecommendations(recommendationsResult.recommendations, reviewsResult.reviews);
+  const unreviewedItem = buildUnreviewedRecommendationAttentionItem(unreviewedRecommendations, estimateClosingSummary.latestRecommendationAt);
+  if (unreviewedItem) attentionItems.push(unreviewedItem);
 
   // P1 Sprint 6 §18 — a DIFFERENT gap from unreviewed recommendations
   // above: recommendations with no OWNER-RECORDED actual-result follow-up
   // yet, regardless of review status. One aggregate item, never one per
-  // recommendation; never shown at zero; never an email/SMS/push/approval.
-  const missingFollowThroughCount = countRecommendationsMissingFollowThrough(
+  // recommendation; never shown at zero. See
+  // buildMissingFollowThroughAttentionItem for the exact-link rule.
+  const missingFollowThroughRecommendations = findRecommendationsMissingFollowThrough(
     recommendationsResult.recommendations,
     new Set(followThroughByRecommendation.keys())
   );
-  if (missingFollowThroughCount > 0) {
-    attentionItems.push({
-      kind: "followthrough_needed",
-      title: "AI recommendations still need actual-result follow-up",
-      description: `${missingFollowThroughCount} recommendation${missingFollowThroughCount === 1 ? " has" : "s have"} no recorded outcome yet`,
-      href: "/agentic/estimate-closing",
-      occurredAt: estimateClosingSummary.latestRecommendationAt ?? new Date().toISOString(),
-    });
-  }
+  const missingFollowThroughItem = buildMissingFollowThroughAttentionItem(missingFollowThroughRecommendations, estimateClosingSummary.latestRecommendationAt);
+  if (missingFollowThroughItem) attentionItems.push(missingFollowThroughItem);
 
   for (const approval of pendingApprovals) {
     attentionItems.push({
@@ -345,17 +417,12 @@ export async function buildRevenueCommandCenterData(tenantId: string, tenantName
     });
   }
 
-  for (const run of recentRuns) {
-    if (run.status === "failed") {
-      attentionItems.push({
-        kind: "agent_failure",
-        title: agentNameById.get(run.agentId) ?? "Agent",
-        description: run.failureReason ?? "The agent run failed.",
-        href: "/agentic",
-        occurredAt: run.completedAt ?? run.createdAt,
-      });
-    }
-  }
+  // P1 Sprint 7 §9/§11 — a failed run must appear here only while it is
+  // still ACTIVE (see buildActiveAgentFailureAttentionItems). A resolved/
+  // historical failure remains fully visible in agent_runs and in AI
+  // Activity (§9: "remain visible in audit/history") — it simply stops
+  // being presented as something needing action TODAY.
+  attentionItems.push(...buildActiveAgentFailureAttentionItems(recentRuns, agentNameById));
 
   attentionItems.sort((a, b) => b.occurredAt.localeCompare(a.occurredAt));
 

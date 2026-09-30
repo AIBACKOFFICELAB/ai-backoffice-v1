@@ -11,8 +11,12 @@ import { EmptyState } from "@/components/ui/EmptyState";
 import { RecommendationReviewCard } from "@/components/ai/RecommendationReviewCard";
 import { FollowThroughControls } from "@/components/ai/FollowThroughControls";
 import { getEstimateClosingRecommendationEvidence } from "@/lib/agents/estimateClosing/recommendationEvidence";
+import { buildEstimateClosingEvidenceTimeline } from "@/lib/agents/estimateClosing/evidenceTimeline";
+import { LifecycleTimeline } from "@/components/ai/LifecycleTimeline";
 import { labelChannel, labelTiming } from "@/lib/agents/estimateClosing/labels";
-import { BUSINESS_DISPOSITION_LABELS } from "@/lib/agents/estimateClosing/followThroughTypes";
+import { BUSINESS_DISPOSITION_LABELS, ACTION_TAKEN_LABELS } from "@/lib/agents/estimateClosing/followThroughTypes";
+import { WOULD_ACT_LABELS } from "@/lib/agents/estimateClosing/reviewTypes";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 
 const RUN_STATUS_LABEL: Record<string, string> = {
   succeeded: "Succeeded",
@@ -93,6 +97,12 @@ export default async function RecommendationEvidencePage({ params }: { params: P
     ((evidence.followThrough.businessDisposition === "won" && evidence.leadStatus !== "Won") ||
       (evidence.followThrough.businessDisposition === "lost" && evidence.leadStatus !== "Lost"));
 
+  const timelineStages = buildEstimateClosingEvidenceTimeline(evidence);
+  const formattedEstimateSentAt = formatOperationalTimestamp(evidence.sequence?.estimateSentAt ?? null);
+  const formattedDay7DueAt = formatOperationalTimestamp(evidence.sequence?.day7DueAt ?? null);
+  const formattedReplyAt = formatOperationalTimestamp(evidence.sequence?.lastReplyAt ?? null);
+  const formattedStalledAt = formatOperationalTimestamp(evidence.stalledEventOccurredAt);
+
   return (
     <div className="space-y-8">
       <div>
@@ -104,6 +114,20 @@ export default async function RecommendationEvidencePage({ params }: { params: P
           <PageHeader title="Recommendation detail" description="Full privacy-safe evidence for one Shadow Mode recommendation. No customer action was taken." />
         </div>
       </div>
+
+      {/* P1 Sprint 7 §7/§8 — the canonical lifecycle timeline: the whole
+          story in one place, without reconstructing it from the sections
+          below. Every stage below is the same underlying evidence, shown
+          again in full detail for anyone who wants it. */}
+      <Card>
+        <CardHeader>
+          <h2 className="font-semibold text-ink-900">Lifecycle</h2>
+          <p className="mt-0.5 text-sm text-ink-500">The complete story for this estimate, in order.</p>
+        </CardHeader>
+        <CardBody>
+          <LifecycleTimeline stages={timelineStages} />
+        </CardBody>
+      </Card>
 
       {/* A. Recommendation + D. Owner evaluation — reuses the existing
           review system entirely; never a second one. */}
@@ -143,15 +167,21 @@ export default async function RecommendationEvidencePage({ params }: { params: P
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Estimate sent</dt>
-              <dd className="mt-1 text-sm font-semibold text-ink-900">{evidence.sequence?.estimateSentAt ?? "Unavailable"}</dd>
+              <dd className="mt-1 text-sm font-semibold text-ink-900" title={formattedEstimateSentAt?.title}>
+                {formattedEstimateSentAt?.display ?? "Unavailable"}
+              </dd>
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Day 7 due</dt>
-              <dd className="mt-1 text-sm font-semibold text-ink-900">{evidence.sequence?.day7DueAt ?? "Unavailable"}</dd>
+              <dd className="mt-1 text-sm font-semibold text-ink-900" title={formattedDay7DueAt?.title}>
+                {formattedDay7DueAt?.display ?? "Unavailable"}
+              </dd>
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Reply received</dt>
-              <dd className="mt-1 text-sm font-semibold text-ink-900">{evidence.sequence ? (evidence.sequence.lastReplyAt ? evidence.sequence.lastReplyAt : "No") : "Unavailable"}</dd>
+              <dd className="mt-1 text-sm font-semibold text-ink-900" title={formattedReplyAt?.title}>
+                {evidence.sequence ? (formattedReplyAt?.display ?? "No") : "Unavailable"}
+              </dd>
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Suggested next step</dt>
@@ -174,7 +204,9 @@ export default async function RecommendationEvidencePage({ params }: { params: P
           <dl className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Stalled event</dt>
-              <dd className="mt-1 text-sm font-semibold text-ink-900">{evidence.stalledEventFound ? `Found (${evidence.stalledEventOccurredAt})` : "Unavailable"}</dd>
+              <dd className="mt-1 text-sm font-semibold text-ink-900" title={formattedStalledAt?.title}>
+                {evidence.stalledEventFound ? `Found (${formattedStalledAt?.display ?? evidence.stalledEventOccurredAt})` : "Unavailable"}
+              </dd>
             </div>
             <div>
               <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Agent run</dt>
@@ -213,7 +245,7 @@ export default async function RecommendationEvidencePage({ params }: { params: P
           afterward?" (follow-through). Deliberately its own card, its own
           heading, and never framed as "Approve AI" — this is historical
           evidence capture about what a HUMAN did outside the agent. */}
-      <Card>
+      <Card id="actual-follow-through" className="scroll-mt-20">
         <CardHeader>
           <h2 className="font-semibold text-ink-900">Actual follow-through</h2>
           <p className="mt-0.5 text-sm text-ink-500">What actually happened next — recorded by you, not inferred by AI.</p>
@@ -260,7 +292,7 @@ export default async function RecommendationEvidencePage({ params }: { params: P
               </dd>
             </div>
             <div>
-              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Business disposition</dt>
+              <dt className="text-xs font-semibold uppercase tracking-wide text-ink-400">Owner-reported business disposition</dt>
               <dd className="mt-1 text-sm font-bold text-ink-500">
                 {evidence.followThrough ? BUSINESS_DISPOSITION_LABELS[evidence.followThrough.businessDisposition].toUpperCase() : "NOT YET RECORDED"}
               </dd>
@@ -270,6 +302,25 @@ export default async function RecommendationEvidencePage({ params }: { params: P
               <dd className="mt-1 text-sm font-bold text-ink-500">NOT ESTABLISHED</dd>
             </div>
           </dl>
+
+          {/* P1 Sprint 7 §14 — intent vs. actual is a first-class,
+              neutrally-framed comparison, not a "contradiction." Only
+              shown once both facts exist to compare. */}
+          {evidence.review && evidence.followThrough && (
+            <div className="mt-4 rounded-card bg-surface-sunken p-3">
+              <p className="text-xs font-semibold uppercase tracking-wide text-ink-400">Intent vs. actual</p>
+              <p className="mt-1 text-sm text-ink-700">
+                <span className="font-semibold text-ink-900">Would-act intent:</span> {WOULD_ACT_LABELS[evidence.review.wouldAct]}
+                <span className="mx-2 text-ink-300">&bull;</span>
+                <span className="font-semibold text-ink-900">Actual action:</span> {ACTION_TAKEN_LABELS[evidence.followThrough.actionTaken]}
+              </p>
+              <p className="mt-1 text-xs text-ink-500">
+                Both are real, independent observations — a later action does not mean the earlier intent was wrong, and stated intent does not predict
+                what actually happened.
+              </p>
+            </div>
+          )}
+
           <p className="mt-4 text-xs text-ink-400">
             Every row above is an independent observation. None implies the next — a recorded action does not mean the customer responded; a response does
             not mean the job was won; a win does not mean this recommendation caused it.

@@ -2,6 +2,7 @@ import { Card } from "@/components/ui/Card";
 import { ShadowRecommendationCard } from "@/components/ai/ShadowRecommendationCard";
 import { ReviewControls } from "@/components/ai/ReviewControls";
 import { VERDICT_LABELS, WOULD_ACT_LABELS, REVIEW_REASON_CODE_LABELS } from "@/lib/agents/estimateClosing/reviewTypes";
+import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 import type { EstimateClosingRecommendationReviewView } from "@/lib/agents/estimateClosing/evaluationReadModel";
 import type { EstimateClosingRecommendation } from "@/lib/agents/estimateClosing/types";
 
@@ -27,6 +28,7 @@ export function RecommendationReviewCard({
   occurredAt: string;
   existingReview: EstimateClosingRecommendationReviewView | null;
 }) {
+  const formattedReviewedAt = existingReview ? formatOperationalTimestamp(existingReview.occurredAt) : null;
   return (
     <div className="space-y-2">
       <ShadowRecommendationCard recommendation={recommendation} serviceType={serviceType} occurredAt={occurredAt} />
@@ -35,7 +37,7 @@ export function RecommendationReviewCard({
           <div>
             <p className="text-xs font-semibold uppercase tracking-wide text-ink-400">Your review</p>
             <p className="mt-1 text-sm font-semibold text-ink-900">
-              {VERDICT_LABELS[existingReview.verdict]} · {WOULD_ACT_LABELS[existingReview.wouldAct]}
+              {VERDICT_LABELS[existingReview.verdict]} · Intent: {WOULD_ACT_LABELS[existingReview.wouldAct]}
             </p>
             {existingReview.reasonCodes.length > 0 && (
               <ul className="mt-2 flex flex-wrap gap-1.5">
@@ -46,7 +48,9 @@ export function RecommendationReviewCard({
                 ))}
               </ul>
             )}
-            <p className="mt-2 text-xs text-ink-400">Reviewed {existingReview.occurredAt}</p>
+            <p className="mt-2 text-xs text-ink-400" title={formattedReviewedAt?.title}>
+              Reviewed {formattedReviewedAt?.display ?? existingReview.occurredAt}
+            </p>
           </div>
         ) : (
           <ReviewControls recommendationEventId={recommendationEventId} />

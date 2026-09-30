@@ -64,8 +64,8 @@ export function ReviewControls({ recommendationEventId }: { recommendationEventI
 
   if (submitted) {
     return (
-      <p className="text-sm font-medium text-success-700">
-        Recorded: {VERDICT_LABELS[submitted.verdict]} · {WOULD_ACT_LABELS[submitted.wouldAct]}
+      <p className="text-sm font-medium text-success-700" role="status" aria-live="polite">
+        Recorded: {VERDICT_LABELS[submitted.verdict]} · Intent: {WOULD_ACT_LABELS[submitted.wouldAct]}
       </p>
     );
   }
@@ -81,7 +81,7 @@ export function ReviewControls({ recommendationEventId }: { recommendationEventI
               type="button"
               onClick={() => setVerdict(v)}
               aria-pressed={verdict === v}
-              className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+              className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                 verdict === v ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
               }`}
             >
@@ -100,7 +100,7 @@ export function ReviewControls({ recommendationEventId }: { recommendationEventI
               type="button"
               onClick={() => setWouldAct(w)}
               aria-pressed={wouldAct === w}
-              className={`min-h-[36px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
+              className={`min-h-[44px] rounded-pill px-3 text-xs font-semibold ring-1 transition focus-ring ${
                 wouldAct === w ? "bg-brand-700 text-white ring-brand-700" : "bg-white text-ink-700 ring-surface-border hover:bg-surface-sunken"
               }`}
             >
@@ -119,7 +119,7 @@ export function ReviewControls({ recommendationEventId }: { recommendationEventI
               type="button"
               onClick={() => toggleReasonCode(code)}
               aria-pressed={reasonCodes.includes(code)}
-              className={`min-h-[32px] rounded-pill px-2.5 text-xs font-medium ring-1 transition focus-ring ${
+              className={`min-h-[40px] rounded-pill px-2.5 text-xs font-medium ring-1 transition focus-ring ${
                 reasonCodes.includes(code) ? "bg-ink-900 text-white ring-ink-900" : "bg-white text-ink-600 ring-surface-border hover:bg-surface-sunken"
               }`}
             >

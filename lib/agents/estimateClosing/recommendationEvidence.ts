@@ -51,7 +51,10 @@ export type RecommendationEvidenceAgentRun = {
   outputFingerprint: string | null;
 };
 
-export type RecommendationEvidenceSequence = Pick<FollowupSequenceRow, "status" | "estimateSentAt" | "day7DueAt" | "lastReplyAt">;
+export type RecommendationEvidenceSequence = Pick<
+  FollowupSequenceRow,
+  "status" | "estimateSentAt" | "day1SentAt" | "day3SentAt" | "day7SentAt" | "day7DueAt" | "lastReplyAt"
+>;
 
 export type EstimateClosingRecommendationEvidence =
   | {
@@ -63,6 +66,12 @@ export type EstimateClosingRecommendationEvidence =
       modelInvocation: RecommendationEvidenceModelInvocation | null;
       sequence: RecommendationEvidenceSequence | null;
       leadStatus: LeadStatus | null;
+      /** P1 Sprint 7 — when this lead first entered the system, for the
+       * evidence timeline's "Lead received" stage. Prefers the lead's own
+       * `receivedAt`/`createdAt` audit fields over `date` (a customer-facing
+       * display field, not guaranteed to be a true intake timestamp); null
+       * when none of those are available — never fabricated. */
+      leadReceivedAt: string | null;
       review: EstimateClosingRecommendationReviewView | null;
       /** P1 Sprint 6 — the CURRENT (most recent, see followThrough.ts's
        * append-only/correction discipline) owner-recorded follow-through
@@ -191,8 +200,19 @@ export async function getEstimateClosingRecommendationEvidence(
         }
       : null,
     modelInvocation,
-    sequence: sequence ? { status: sequence.status, estimateSentAt: sequence.estimateSentAt, day7DueAt: sequence.day7DueAt, lastReplyAt: sequence.lastReplyAt } : null,
+    sequence: sequence
+      ? {
+          status: sequence.status,
+          estimateSentAt: sequence.estimateSentAt,
+          day1SentAt: sequence.day1SentAt,
+          day3SentAt: sequence.day3SentAt,
+          day7SentAt: sequence.day7SentAt,
+          day7DueAt: sequence.day7DueAt,
+          lastReplyAt: sequence.lastReplyAt,
+        }
+      : null,
     leadStatus: leadResult.lead?.status ?? null,
+    leadReceivedAt: leadResult.lead?.receivedAt ?? leadResult.lead?.createdAt ?? leadResult.lead?.date ?? null,
     review,
     followThrough: currentFollowThrough?.followThrough ?? null,
     followThroughOccurredAt: currentFollowThrough?.occurredAt ?? null,

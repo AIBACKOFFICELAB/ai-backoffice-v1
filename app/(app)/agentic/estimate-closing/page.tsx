@@ -51,6 +51,7 @@ export default async function EstimateClosingWorkspacePage() {
   // defect as /agentic's identical "Last durable scan" card, sourced from
   // the same operations.lastScanAt value. Presentation only.
   const formattedLastScanAt = formatOperationalTimestamp(operations.lastScanAt);
+  const formattedLatestRecommendationAt = formatOperationalTimestamp(evaluation.latestRecommendationAt);
 
   return (
     <div className="space-y-8">
@@ -92,7 +93,9 @@ export default async function EstimateClosingWorkspacePage() {
               </div>
               <div>
                 <p className="text-xs font-semibold uppercase tracking-wide text-ink-400">Latest recommendation</p>
-                <p className="mt-1 text-sm font-semibold text-ink-900">{evaluation.latestRecommendationAt ?? "—"}</p>
+                <p className="mt-1 text-sm font-semibold text-ink-900" title={formattedLatestRecommendationAt?.title}>
+                  {formattedLatestRecommendationAt?.display ?? "—"}
+                </p>
               </div>
             </div>
           )}
@@ -103,9 +106,22 @@ export default async function EstimateClosingWorkspacePage() {
             </Alert>
           )}
 
-          {evaluation.modelFailureCount > 0 && (
-            <Alert tone="warning" className="mt-4" title={`${evaluation.modelFailureCount} recent shadow run${evaluation.modelFailureCount === 1 ? "" : "s"} failed`}>
+          {evaluation.activeModelFailureCount > 0 && (
+            <Alert
+              tone="warning"
+              className="mt-4"
+              title={`${evaluation.activeModelFailureCount} recent shadow run${evaluation.activeModelFailureCount === 1 ? "" : "s"} failed`}
+            >
               A model reasoning run did not complete. No customer action was attempted or affected.
+            </Alert>
+          )}
+
+          {/* P1 Sprint 7 §18 — a failure resolved by a later successful run
+              is never hidden, just no longer an open problem. */}
+          {evaluation.activeModelFailureCount === 0 && evaluation.modelFailureCount > 0 && (
+            <Alert tone="info" className="mt-4" title="Historical failure — resolved by a later successful run">
+              {evaluation.modelFailureCount} earlier shadow run{evaluation.modelFailureCount === 1 ? "" : "s"} failed and{" "}
+              {evaluation.modelFailureCount === 1 ? "was" : "were"} superseded by a subsequent successful run for the same estimate. No action is needed.
             </Alert>
           )}
         </CardBody>
@@ -164,9 +180,18 @@ export default async function EstimateClosingWorkspacePage() {
                   icon={<Clock className="h-4 w-4" />}
                 />
                 <MetricCard label="Candidates scanned" value={operations.latestScanCounts?.candidatesScanned ?? "—"} />
-                <MetricCard label="Stalled found" value={operations.latestScanCounts?.stalledFound ?? "—"} />
+                <MetricCard label="Stalled estimates found" value={operations.latestScanCounts?.stalledFound ?? "—"} />
                 <MetricCard label="Shadow attempts" value={operations.latestScanCounts?.shadowAttempts ?? "—"} />
-                <MetricCard label="Recommendation successes" value={operations.latestScanCounts?.succeeded ?? "—"} />
+                <MetricCard
+                  label="New recommendations generated"
+                  value={operations.latestScanCounts?.succeeded ?? "—"}
+                  helpText="Zero here is healthy when everything scanned was already analyzed"
+                />
+                <MetricCard
+                  label="Already analyzed"
+                  value={operations.latestScanCounts?.alreadyProcessed ?? "—"}
+                  helpText="Idempotent retry-safety working as designed — not a problem"
+                />
                 <MetricCard
                   label="Failures (latest scan)"
                   value={operations.latestScanCounts?.failed ?? "—"}
@@ -181,8 +206,14 @@ export default async function EstimateClosingWorkspacePage() {
                 <MetricCard
                   label="Model/run failures"
                   value={operations.modelFailureCount}
-                  helpText={operations.latestModelFailureCategory ? `Latest: ${operations.latestModelFailureCategory}` : undefined}
-                  tone={operations.modelFailureCount > 0 ? "warning" : "default"}
+                  helpText={
+                    operations.activeModelFailureCount === 0 && operations.modelFailureCount > 0
+                      ? "All resolved by a later successful run"
+                      : operations.latestModelFailureCategory
+                        ? `Latest: ${operations.latestModelFailureCategory}`
+                        : undefined
+                  }
+                  tone={operations.activeModelFailureCount > 0 ? "warning" : "default"}
                 />
               </div>
               {operations.malformedScanTelemetryCount > 0 && (
@@ -224,7 +255,13 @@ export default async function EstimateClosingWorkspacePage() {
                 value={`${evaluation.recommendationBreakdown.followUp} / ${evaluation.recommendationBreakdown.wait} / ${evaluation.recommendationBreakdown.ownerReview}`}
                 helpText="Follow up / Wait / Owner review"
               />
-              <MetricCard label="Model/run failures" value={evaluation.modelFailureCount} icon={<ShieldAlert className="h-4 w-4" />} tone={evaluation.modelFailureCount > 0 ? "warning" : "default"} />
+              <MetricCard
+                label="Model/run failures"
+                value={evaluation.modelFailureCount}
+                helpText={evaluation.activeModelFailureCount === 0 && evaluation.modelFailureCount > 0 ? "All resolved by a later successful run" : undefined}
+                icon={<ShieldAlert className="h-4 w-4" />}
+                tone={evaluation.activeModelFailureCount > 0 ? "warning" : "default"}
+              />
               <MetricCard label="Malformed records skipped" value={evaluation.skippedMalformedRecommendations + evaluation.skippedMalformedReviews} />
             </div>
           </section>

@@ -9,6 +9,7 @@ function baseInput(overrides: Partial<EstimateClosingOperationsInput> = {}): Est
     recommendationsReviewed: 0,
     latestSuccessfulRecommendationAt: null,
     modelFailureCount: 0,
+    activeModelFailureCount: 0,
     latestModelFailureCategory: null,
     malformedRecommendationOrReviewCount: 0,
     lifecycleReadiness: { estimatesSent: 0, activeFollowupSequences: 0, stalledEligible: 0 },
@@ -101,6 +102,12 @@ describe("computeEstimateClosingOperations", () => {
     const ops = computeEstimateClosingOperations(baseInput({ modelFailureCount: 3, latestModelFailureCategory: "rate_limited" }));
     expect(ops.modelFailureCount).toBe(3);
     expect(ops.latestModelFailureCategory).toBe("rate_limited");
+  });
+
+  it("active model failure count passes through independently of the total — may legitimately be lower (P1 Sprint 7)", () => {
+    const ops = computeEstimateClosingOperations(baseInput({ modelFailureCount: 2, activeModelFailureCount: 0 }));
+    expect(ops.modelFailureCount).toBe(2);
+    expect(ops.activeModelFailureCount).toBe(0);
   });
 
   it("lifecycle readiness values pass through untouched — this function never re-derives them", () => {

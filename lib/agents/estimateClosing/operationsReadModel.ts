@@ -70,6 +70,10 @@ export type EstimateClosingOperations = {
   recommendationsAwaitingReview: number;
   latestSuccessfulRecommendationAt: string | null;
   modelFailureCount: number;
+  /** P1 Sprint 7 §9/§11 — of modelFailureCount, how many are still ACTIVE
+   * (no later run for the same estimate has since succeeded). See
+   * evaluationReadModel.ts's identical field for the full explanation. */
+  activeModelFailureCount: number;
   /** The most recent Estimate Closing model_invocations row's error
    * category, when a failed run and its invocation can both be found —
    * null when there is no failure, or when the failure's own invocation
@@ -98,6 +102,7 @@ export type EstimateClosingOperationsInput = {
   recommendationsReviewed: number;
   latestSuccessfulRecommendationAt: string | null;
   modelFailureCount: number;
+  activeModelFailureCount: number;
   /** Already resolved by the I/O wrapper (a two-step lookup: find the most
    * recent failed run, then read ITS invocation) — this function stays
    * pure by taking the resolved value rather than the run/invocation lists
@@ -166,6 +171,7 @@ export function computeEstimateClosingOperations(input: EstimateClosingOperation
     recommendationsAwaitingReview: Math.max(0, input.recommendationsGenerated - input.recommendationsReviewed),
     latestSuccessfulRecommendationAt: input.latestSuccessfulRecommendationAt,
     modelFailureCount: input.modelFailureCount,
+    activeModelFailureCount: input.activeModelFailureCount,
     latestModelFailureCategory: input.latestModelFailureCategory,
     malformedRecommendationOrReviewCount: input.malformedRecommendationOrReviewCount,
     lifecycleReadiness: input.lifecycleReadiness,
@@ -221,6 +227,7 @@ export async function getEstimateClosingOperations(tenantId: string, deps: Opera
     recommendationsReviewed: evaluation.recommendationsReviewed,
     latestSuccessfulRecommendationAt: evaluation.latestRecommendationAt,
     modelFailureCount: evaluation.modelFailureCount,
+    activeModelFailureCount: evaluation.activeModelFailureCount,
     latestModelFailureCategory,
     malformedRecommendationOrReviewCount: evaluation.skippedMalformedRecommendations + evaluation.skippedMalformedReviews,
     lifecycleReadiness: {
