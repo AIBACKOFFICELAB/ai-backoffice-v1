@@ -150,7 +150,17 @@ DESCRIBE("Estimate Sent real authenticated/RLS lifecycle", () => {
     await expect(historyInsert(actor.tenantId,seq.id,otherLead)).rejects.toMatchObject({ code:"42501" });
     await expect(historyInsert(actor.tenantId,seq.id,leadId)).resolves.toMatchObject({rowCount:1});
   });
-  it("Day 1 authenticated processing persists update and history; fake SMS only", async () => {
+  it("Founder Beta boundary: tenant enabled=true is NOT authorization — due step is denied, nothing sent, nothing marked sent", async () => {
+    await retry();
+    await getPgTestPool().query("UPDATE estimate_followup_sequences SET day1_due_at=now()-interval '1 minute' WHERE tenant_id=$1", [actor.tenantId]);
+    const result = await processDueFollowups();
+    expect(result).toEqual([{ leadId, action: "skipped", reason: "outbound-denied" }]);
+    expect((await rows("estimate_followup_sequences")).rows[0].day1_sent_at).toBeNull();
+    expect((await rows("estimate_followup_history")).rowCount).toBe(0);
+    expect(sendSms).not.toHaveBeenCalled();
+  });
+  it("Day 1 authenticated processing persists update and history; fake SMS only (explicitly allowlisted tenant)", async () => {
+    vi.stubEnv("AIBO_OUTBOUND_ALLOWED_TENANT_IDS", actor.tenantId);
     await retry();
     await getPgTestPool().query("UPDATE estimate_followup_sequences SET day1_due_at=now()-interval '1 minute' WHERE tenant_id=$1", [actor.tenantId]);
     const result = await processDueFollowups();

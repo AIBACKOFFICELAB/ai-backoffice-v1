@@ -38,7 +38,7 @@ export function createLiveIntakeDeps(): IntakeDeps {
     emit: input => emitEvent(input, new SupabaseBusinessEventStore(async () => intakeClient())),
     async notify(tenant, lead) {
       if (!tenant.email) { console.warn("[intake] owner notification skipped: tenant email not configured", { leadId: lead.id }); return; }
-      const outcome = await withTelemetryDeadline(sendEmail(tenant.email, "New service request in AI BackOffice", `A new ${lead.serviceType} request has arrived. Emergency: ${lead.emergency}. Open AI BackOffice Lead Inbox to review it. Lead reference: ${lead.id}.`));
+      const outcome = await withTelemetryDeadline(sendEmail(tenant.email, "New service request in AI BackOffice", `A new ${lead.serviceType} request has arrived. Emergency: ${lead.emergency}. Open AI BackOffice Lead Inbox to review it. Lead reference: ${lead.id}.`, { tenantId: tenant.id, ownerNotice: true }));
       if (outcome.outcome !== "resolved" || !outcome.value.ok) throw new Error("Notification unavailable");
     },
   };

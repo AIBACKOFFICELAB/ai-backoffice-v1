@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { useState } from "react";
 import { Button } from "@/components/ui/Button";
-import { AUDIT_URL } from "@/lib/constants";
 
 const navItems = [
   { href: "/pricing", label: "Pricing" },
@@ -47,8 +46,8 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
             >
               Log in
             </Link>
-            <Button href={AUDIT_URL} target="_blank" rel="noopener noreferrer" size="sm">
-              Get My Free Audit
+            <Button href="/pricing" size="sm">
+              Join Founder Beta
             </Button>
           </div>
 
@@ -94,13 +93,11 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               </Link>
             </div>
             <Button
-              href={AUDIT_URL}
-              target="_blank"
-              rel="noopener noreferrer"
+              href="/pricing"
               className="mt-2 w-full"
               onClick={() => setOpen(false)}
             >
-              Get My Free Audit
+              Join Founder Beta
             </Button>
           </nav>
         )}
@@ -131,9 +128,9 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
                 <ul className="mt-3 space-y-2 text-ink-500">
                   <li><Link href="/auth/login" className="hover:text-ink-900">Log in</Link></li>
                   <li>
-                    <a href={AUDIT_URL} target="_blank" rel="noopener noreferrer" className="hover:text-ink-900">
-                      Book a free audit
-                    </a>
+                    <Link href="/pricing" className="hover:text-ink-900">
+                      Join Founder Beta
+                    </Link>
                   </li>
                 </ul>
               </div>

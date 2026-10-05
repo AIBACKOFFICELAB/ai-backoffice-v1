@@ -1,8 +1,10 @@
+import { checkOutboundAllowed, OutboundContext } from "@/lib/execution/outboundGuard";
+
 const RESEND_API_BASE = "https://api.resend.com";
 
 export type SendEmailResult =
   | { ok: true; skipped: false }
-  | { ok: false; skipped: true; reason: "missing-env" }
+  | { ok: false; skipped: true; reason: "missing-env" | "outbound-denied" }
   | { ok: false; skipped: false; reason: "resend-error" | "unexpected-error"; status?: number; detail?: string };
 
 function getResendEnv() {
@@ -22,7 +24,23 @@ function getResendEnv() {
  * result the caller must record in History, per
  * docs/constitution/03_MODULE_ARCHITECTURE.md (no channel fails silently).
  */
-export async function sendEmail(toEmail: string, subject: string, textBody: string): Promise<SendEmailResult> {
+export async function sendEmail(
+  toEmail: string,
+  subject: string,
+  textBody: string,
+  ctx?: OutboundContext & {
+    /** Fixed-content notice to the tenant's own operator-configured contact
+     * (e.g. canonical intake "new request" alert). Not customer-facing, so it
+     * is not subject to the Founder Beta outbound allowlist. */
+    ownerNotice?: boolean;
+  }
+): Promise<SendEmailResult> {
+  // Server-authoritative Founder Beta no-send boundary (see outboundGuard.ts).
+  if (!ctx?.ownerNotice && !checkOutboundAllowed(ctx).allowed) {
+    console.warn("[email] outbound send denied by server boundary", { tenantId: ctx?.tenantId ?? null });
+    return { ok: false, skipped: true, reason: "outbound-denied" };
+  }
+
   const env = getResendEnv();
 
   if (!env.configured) {

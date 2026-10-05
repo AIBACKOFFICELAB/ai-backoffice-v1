@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { EmergencyLeadPayload, isEmergencyLead, sendOwnerEmergencySms } from "@/lib/sms/twilio";
 import { checkAuth } from "@/lib/api-auth";
+import { getTenantContext } from "@/lib/tenant";
 
 export async function POST(request: NextRequest) {
   // Check authentication
@@ -21,7 +22,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ ok: true, sent: false, reason: "not-emergency" });
   }
 
-  const smsResult = await sendOwnerEmergencySms(payload);
+  const tenant = await getTenantContext();
+  const smsResult = await sendOwnerEmergencySms(payload, { tenantId: tenant?.tenantId });
 
   if (smsResult.ok) {
     return NextResponse.json({ ok: true, sent: true, sid: smsResult.sid });
