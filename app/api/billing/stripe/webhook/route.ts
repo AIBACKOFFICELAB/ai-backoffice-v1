@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifyStripeSignature } from "@/lib/billing/stripe";
+import { fetchStripeSubscription, verifyStripeSignature } from "@/lib/billing/stripe";
 import { processStripeEvent, type StripeEvent } from "@/lib/billing/webhook";
 import { createSupabaseBillingStore } from "@/lib/billing/provision.server";
 
@@ -25,7 +25,7 @@ export async function POST(request: NextRequest) {
   }
 
   try {
-    const result = await processStripeEvent(event, createSupabaseBillingStore());
+    const result = await processStripeEvent(event, createSupabaseBillingStore(), fetchStripeSubscription);
     return NextResponse.json({ ok: true, ...result });
   } catch (error) {
     console.error("[billing] webhook processing failed", { eventId: event.id, type: event.type, error: error instanceof Error ? error.message : error });

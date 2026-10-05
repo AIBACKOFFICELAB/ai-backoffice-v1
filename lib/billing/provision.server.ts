@@ -98,7 +98,7 @@ export function createSupabaseBillingStore(): BillingStore {
           stripe_subscription_id: input.subscriptionId,
           purchaser_email: input.email,
           subscription_status: input.subscriptionStatus,
-          entitlement: "active",
+          entitlement: input.entitlement,
           onboarding_status: "onboarding_required",
           current_period_end: input.currentPeriodEnd,
           updated_at: new Date().toISOString(),

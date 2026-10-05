@@ -4,12 +4,25 @@ export const FOUNDER_BETA_PLAN = "founder_beta_299";
 
 export type StripeEvent = { id: string; type: string; created?: number; data: { object: Record<string, any> } };
 
+/** Authoritative current subscription state, read from Stripe at processing time. */
+export type StripeSubscriptionSnapshot = {
+  id: string;
+  status: string;
+  current_period_end?: number | null;
+  cancel_at_period_end?: boolean;
+  canceled_at?: number | null;
+  metadata?: Record<string, string>;
+  items?: { data?: Array<{ current_period_end?: number }> };
+};
+export type SubscriptionFetcher = (subscriptionId: string) => Promise<StripeSubscriptionSnapshot>;
+
 export type ProvisionInput = {
   email: string;
   businessName: string;
   customerId: string;
   subscriptionId: string;
   subscriptionStatus: string;
+  entitlement: Entitlement;
   currentPeriodEnd: string | null;
 };
 
@@ -40,12 +53,12 @@ function isFounderBeta(obj: Record<string, any>): boolean {
   return (obj.metadata?.plan ?? obj.subscription_details?.metadata?.plan ?? obj.lines?.data?.[0]?.metadata?.plan) === FOUNDER_BETA_PLAN;
 }
 
-export async function processStripeEvent(event: StripeEvent, store: BillingStore): Promise<WebhookResult> {
+export async function processStripeEvent(event: StripeEvent, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<WebhookResult> {
   const claim = await store.claimEvent(event.id, event.type);
   if (claim === "duplicate") return { outcome: "duplicate" };
 
   try {
-    const result = await dispatch(event, store);
+    const result = await dispatch(event, store, fetchSubscription);
     await store.finishEvent(event.id, "processed");
     return result;
   } catch (err) {
@@ -54,7 +67,27 @@ export async function processStripeEvent(event: StripeEvent, store: BillingStore
   }
 }
 
-async function dispatch(event: StripeEvent, store: BillingStore): Promise<WebhookResult> {
+/**
+ * Order-independence: webhook delivery order is not guaranteed, so a stale
+ * event must never decide entitlement. Every subscription/invoice event is
+ * treated only as a *signal*; the state we persist is the subscription's
+ * CURRENT state read from Stripe at processing time. Replaying an older
+ * "active" event after a failure/cancellation therefore re-reads the
+ * newer authoritative state and cannot restore access.
+ */
+async function syncFromStripe(subscriptionId: string, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<{ found: boolean; status: string }> {
+  const sub = await fetchSubscription(subscriptionId);
+  const found = await store.updateSubscription(subscriptionId, {
+    subscription_status: sub.status,
+    entitlement: entitlementForStatus(sub.status),
+    current_period_end: iso(sub.current_period_end ?? sub.items?.data?.[0]?.current_period_end),
+    cancel_at_period_end: Boolean(sub.cancel_at_period_end),
+    canceled_at: iso(sub.canceled_at),
+  });
+  return { found, status: sub.status };
+}
+
+async function dispatch(event: StripeEvent, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<WebhookResult> {
   const obj = event.data.object;
 
   switch (event.type) {
@@ -68,13 +101,15 @@ async function dispatch(event: StripeEvent, store: BillingStore): Promise<Webhoo
       }
       const field = (obj.custom_fields as any[] | undefined)?.find((f) => f?.key === "business_name");
       const businessName = String(field?.text?.value ?? "").trim() || email;
+      const current = await fetchSubscription(obj.subscription); // authoritative, not the checkout snapshot
       await store.provision({
         email,
         businessName: businessName.slice(0, 120),
         customerId: obj.customer,
         subscriptionId: obj.subscription,
-        subscriptionStatus: "active",
-        currentPeriodEnd: null,
+        subscriptionStatus: current.status,
+        entitlement: entitlementForStatus(current.status),
+        currentPeriodEnd: iso(current.current_period_end ?? current.items?.data?.[0]?.current_period_end),
       });
       return { outcome: "processed", detail: "provisioned" };
     }
@@ -82,36 +117,20 @@ async function dispatch(event: StripeEvent, store: BillingStore): Promise<Webhoo
     case "customer.subscription.updated":
     case "customer.subscription.deleted": {
       if (!isFounderBeta(obj)) return { outcome: "ignored", detail: "not-founder-beta" };
-      const status = event.type === "customer.subscription.deleted" ? "canceled" : String(obj.status);
-      const found = await store.updateSubscription(obj.id, {
-        subscription_status: status,
-        entitlement: entitlementForStatus(status),
-        current_period_end: iso(obj.current_period_end ?? obj.items?.data?.[0]?.current_period_end),
-        cancel_at_period_end: Boolean(obj.cancel_at_period_end),
-        canceled_at: iso(obj.canceled_at),
-      });
+      const { found, status } = await syncFromStripe(obj.id, store, fetchSubscription);
       // Out-of-order delivery: subscription event can precede checkout.completed. Retry later.
       if (!found) throw new Error(`subscription ${obj.id} not provisioned yet`);
       return { outcome: "processed", detail: status };
     }
 
-    case "invoice.payment_failed": {
-      const subId = obj.subscription ?? obj.parent?.subscription_details?.subscription;
-      if (typeof subId !== "string") return { outcome: "ignored", detail: "no-subscription" };
-      if ((await store.getEntitlement(subId)) === null) return { outcome: "ignored", detail: "unknown-subscription" };
-      await store.updateSubscription(subId, { subscription_status: "past_due", entitlement: "restricted" });
-      return { outcome: "processed", detail: "restricted" };
-    }
-
+    case "invoice.payment_failed":
     case "invoice.paid":
     case "invoice.payment_succeeded": {
       const subId = obj.subscription ?? obj.parent?.subscription_details?.subscription;
       if (typeof subId !== "string") return { outcome: "ignored", detail: "no-subscription" };
-      const current = await store.getEntitlement(subId);
-      if (current === null) return { outcome: "ignored", detail: "unknown-subscription" };
-      if (current === "revoked") return { outcome: "ignored", detail: "revoked-stays-revoked" };
-      await store.updateSubscription(subId, { subscription_status: "active", entitlement: "active" });
-      return { outcome: "processed", detail: "renewed" };
+      if ((await store.getEntitlement(subId)) === null) return { outcome: "ignored", detail: "unknown-subscription" };
+      const { status } = await syncFromStripe(subId, store, fetchSubscription);
+      return { outcome: "processed", detail: status };
     }
 
     default:

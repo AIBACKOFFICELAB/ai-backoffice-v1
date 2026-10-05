@@ -70,3 +70,15 @@ export async function createFounderBetaCheckoutSession(cfg: CheckoutConfig): Pro
   if (!json.url || !json.id) throw new Error("Stripe checkout session response missing url");
   return { url: json.url, id: json.id };
 }
+
+/** Reads the CURRENT subscription from Stripe (authoritative state). */
+export async function fetchStripeSubscription(subscriptionId: string): Promise<import("./webhook").StripeSubscriptionSnapshot> {
+  const key = process.env.STRIPE_SECRET_KEY;
+  if (!key) throw new Error("STRIPE_SECRET_KEY not configured");
+  const res = await fetch(`${STRIPE_API}/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+    headers: { Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`Stripe subscription fetch failed (${res.status})`);
+  return (await res.json()) as import("./webhook").StripeSubscriptionSnapshot;
+}
