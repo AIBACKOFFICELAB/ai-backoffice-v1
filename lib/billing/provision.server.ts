@@ -2,7 +2,7 @@ import "server-only";
 import { billingAdminClient } from "./admin";
 import type { BillingStore, ProvisionInput, SubscriptionPatch } from "./webhook";
 import type { Entitlement } from "./entitlement";
-import { decideTenantForPurchaser, type MembershipFact } from "./tenantResolution";
+import { provisionFounderBeta, tenantSlugForSubscription, type ProvisioningOps } from "./provisioning";
 
 type Admin = ReturnType<typeof billingAdminClient>;
 
@@ -18,9 +18,93 @@ async function findUserIdByEmail(db: Admin, email: string): Promise<string | nul
   return null;
 }
 
-/** Deterministic per subscription -> retries find-or-create the same tenant. */
-export function tenantSlugForSubscription(subscriptionId: string): string {
-  return `beta-${subscriptionId.replace(/[^a-z0-9]/gi, "").slice(-12).toLowerCase()}`;
+
+export { tenantSlugForSubscription };
+
+function supabaseProvisioningOps(db: Admin): ProvisioningOps {
+  return {
+    async findBillingTenantBySubscription(subscriptionId) {
+      const { data, error } = await db.from("billing_subscriptions").select("tenant_id").eq("stripe_subscription_id", subscriptionId).maybeSingle();
+      if (error) throw new Error("billing lookup failed");
+      return data?.tenant_id ?? null;
+    },
+    async findOrCreateUser(email) {
+      // No password: the buyer sets one via the existing password-recovery flow.
+      const found = await findUserIdByEmail(db, email);
+      if (found) return found;
+      const created = await db.auth.admin.createUser({ email, email_confirm: true });
+      if (!created.error && created.data.user) return created.data.user.id;
+      const raced = await findUserIdByEmail(db, email);
+      if (!raced) throw new Error("user creation failed");
+      return raced;
+    },
+    async findTenantIdBySlug(slug) {
+      const { data, error } = await db.from("tenants").select("id").eq("slug", slug).maybeSingle();
+      if (error) throw new Error("tenant lookup failed");
+      return data?.id ?? null;
+    },
+    async createTenant(t) {
+      const { data, error } = await db.from("tenants").insert({ name: t.name, slug: t.slug, email: t.email, status: "active" }).select("id").single();
+      if (error || !data) throw new Error("tenant creation failed");
+      return data.id;
+    },
+    async listMemberships(userId) {
+      const { data, error } = await db.from("tenant_memberships").select("tenant_id, role").eq("user_id", userId);
+      if (error) throw new Error("membership lookup failed");
+      return (data ?? []).map((m) => ({ tenantId: m.tenant_id, role: m.role }));
+    },
+    async listBilling(tenantId) {
+      const { data, error } = await db.from("billing_subscriptions").select("plan, entitlement").eq("tenant_id", tenantId);
+      if (error) throw new Error("billing lookup failed");
+      return (data ?? []) as Array<{ plan: string; entitlement: Entitlement }>;
+    },
+    async replaceRevokedBilling(tenantId, input) {
+      // Onboarding state is preserved as recorded (never invented as complete).
+      const { data, error } = await db
+        .from("billing_subscriptions")
+        .update({
+          stripe_customer_id: input.customerId,
+          stripe_subscription_id: input.subscriptionId,
+          purchaser_email: input.email,
+          subscription_status: input.subscriptionStatus,
+          entitlement: input.entitlement,
+          current_period_end: input.currentPeriodEnd,
+          cancel_at_period_end: false,
+          canceled_at: null,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("tenant_id", tenantId)
+        .eq("plan", "founder_beta_299")
+        .eq("entitlement", "revoked") // guard: never overwrite a live/restricted relationship
+        .select("id");
+      if (error) throw new Error("billing record replacement failed");
+      return (data ?? []).length;
+    },
+    async insertBilling(tenantId, input) {
+      const { error } = await db.from("billing_subscriptions").upsert(
+        {
+          tenant_id: tenantId,
+          plan: "founder_beta_299",
+          stripe_customer_id: input.customerId,
+          stripe_subscription_id: input.subscriptionId,
+          purchaser_email: input.email,
+          subscription_status: input.subscriptionStatus,
+          entitlement: input.entitlement,
+          onboarding_status: "onboarding_required",
+          current_period_end: input.currentPeriodEnd,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "stripe_subscription_id", ignoreDuplicates: true }
+      );
+      if (error) throw new Error("billing record creation failed");
+    },
+    async ensureOwnerMembership(tenantId, userId) {
+      const { error } = await db
+        .from("tenant_memberships")
+        .upsert({ tenant_id: tenantId, user_id: userId, role: "owner" }, { onConflict: "tenant_id,user_id", ignoreDuplicates: true });
+      if (error) throw new Error("membership creation failed");
+    },
+  };
 }
 
 export function createSupabaseBillingStore(): BillingStore {
@@ -47,90 +131,7 @@ export function createSupabaseBillingStore(): BillingStore {
     },
 
     async provision(input: ProvisionInput) {
-      const existing = await db.from("billing_subscriptions").select("id").eq("stripe_subscription_id", input.subscriptionId).maybeSingle();
-      if (existing.error) throw new Error("billing lookup failed");
-      if (existing.data) return; // already provisioned (duplicate/retry)
-
-      // 1. user (no password; buyer sets one via the existing password-recovery flow)
-      let userId = await findUserIdByEmail(db, input.email);
-      if (!userId) {
-        const created = await db.auth.admin.createUser({ email: input.email, email_confirm: true });
-        if (created.error || !created.data.user) {
-          userId = await findUserIdByEmail(db, input.email); // race with a retry
-          if (!userId) throw new Error("user creation failed");
-        } else {
-          userId = created.data.user.id;
-        }
-      }
-
-      // 2. which tenant? (pure policy: lib/billing/tenantResolution.ts)
-      const slug = tenantSlugForSubscription(input.subscriptionId);
-      const t = await db.from("tenants").select("id").eq("slug", slug).maybeSingle();
-      if (t.error) throw new Error("tenant lookup failed");
-      const slugTenantId: string | null = t.data?.id ?? null;
-
-      const mems = await db.from("tenant_memberships").select("tenant_id, role").eq("user_id", userId);
-      if (mems.error) throw new Error("membership lookup failed");
-      const facts: MembershipFact[] = [];
-      for (const m of mems.data ?? []) {
-        const bills = await db.from("billing_subscriptions").select("plan, entitlement").eq("tenant_id", m.tenant_id);
-        if (bills.error) throw new Error("billing lookup failed");
-        facts.push({ tenantId: m.tenant_id, role: m.role, isThisSubscriptionTenant: m.tenant_id === slugTenantId, billing: (bills.data ?? []) as MembershipFact["billing"] });
-      }
-      const decision = decideTenantForPurchaser(facts); // throws ReconciliationRequiredError when ambiguous
-
-      const now = new Date().toISOString();
-      if (decision.kind === "reuse") {
-        // 3a. Ended Founder Beta customer re-subscribing: SAME tenant, replace its single billing row.
-        // Onboarding state is preserved as recorded (never invented as complete).
-        const upd = await db
-          .from("billing_subscriptions")
-          .update({
-            stripe_customer_id: input.customerId,
-            stripe_subscription_id: input.subscriptionId,
-            purchaser_email: input.email,
-            subscription_status: input.subscriptionStatus,
-            entitlement: input.entitlement,
-            current_period_end: input.currentPeriodEnd,
-            cancel_at_period_end: false,
-            canceled_at: null,
-            updated_at: now,
-          })
-          .eq("tenant_id", decision.tenantId)
-          .eq("plan", "founder_beta_299")
-          .eq("entitlement", "revoked") // guard: never overwrite a live/restricted relationship
-          .select("id");
-        if (upd.error || (upd.data ?? []).length !== 1) throw new Error("billing record replacement failed");
-        return;
-      }
-
-      // 3b. new customer (or retry of this subscription's own partial provisioning)
-      let tenantId = decision.kind === "continue" ? decision.tenantId : slugTenantId;
-      if (!tenantId) {
-        const ct = await db.from("tenants").insert({ name: input.businessName, slug, email: input.email, status: "active" }).select("id").single();
-        if (ct.error || !ct.data) throw new Error("tenant creation failed");
-        tenantId = ct.data.id;
-      }
-      const mem = await db.from("tenant_memberships").upsert({ tenant_id: tenantId, user_id: userId, role: "owner" }, { onConflict: "tenant_id,user_id" });
-      if (mem.error) throw new Error("membership creation failed");
-
-      // 4. billing record: PAID — ONBOARDING REQUIRED
-      const bill = await db.from("billing_subscriptions").upsert(
-        {
-          tenant_id: tenantId,
-          plan: "founder_beta_299",
-          stripe_customer_id: input.customerId,
-          stripe_subscription_id: input.subscriptionId,
-          purchaser_email: input.email,
-          subscription_status: input.subscriptionStatus,
-          entitlement: input.entitlement,
-          onboarding_status: "onboarding_required",
-          current_period_end: input.currentPeriodEnd,
-          updated_at: now,
-        },
-        { onConflict: "stripe_subscription_id" }
-      );
-      if (bill.error) throw new Error("billing record creation failed");
+      await provisionFounderBeta(supabaseProvisioningOps(db), input);
     },
 
     async updateSubscription(subscriptionId: string, patch: SubscriptionPatch) {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { Entitlement } from "./entitlement";
 import { processStripeEvent as run, sanitizeLedgerError, type BillingStore, type ProvisionInput, type StripeEvent, type SubscriptionFetcher } from "./webhook";
-import { decideTenantForPurchaser, ReconciliationRequiredError, type MembershipFact } from "./tenantResolution";
+import { decideTenantForPurchaser, ReconciliationRequiredError } from "./tenantResolution";
+import { provisionFounderBeta, type ProvisioningOps } from "./provisioning";
 
 /**
  * PR #31 Codex P1 remediation:
@@ -22,7 +23,31 @@ function world() {
   const billing: BillingRow[] = [];
   const ledger = new Map<string, Ledger>();
   let n = 0;
-  const slugFor = (sub: string) => `beta-${sub.replace(/[^a-z0-9]/gi, "").slice(-12).toLowerCase()}`;
+
+  const faults = { billing: 0, membership: 0 }; // number of upcoming writes to fail
+  const ops: ProvisioningOps = {
+    async findBillingTenantBySubscription(sub) { return billing.find((b) => b.subscriptionId === sub)?.tenantId ?? null; },
+    async findOrCreateUser(email) { let u = users.get(email); if (!u) { u = `u${++n}`; users.set(email, u); } return u; },
+    async findTenantIdBySlug(slug) { return Array.from(tenants).find(([, s]) => s === slug)?.[0] ?? null; },
+    async createTenant(t) { const id = `t${++n}`; tenants.set(id, t.slug); return id; },
+    async listMemberships(userId) { return memberships.filter((m) => m.userId === userId).map((m) => ({ tenantId: m.tenantId, role: m.role })); },
+    async listBilling(tenantId) { return billing.filter((b) => b.tenantId === tenantId).map((b) => ({ plan: b.plan, entitlement: b.entitlement })); },
+    async replaceRevokedBilling(tenantId, i) {
+      const rows = billing.filter((b) => b.tenantId === tenantId && b.plan === "founder_beta_299" && b.entitlement === "revoked");
+      rows.forEach((r) => Object.assign(r, { subscriptionId: i.subscriptionId, customerId: i.customerId, entitlement: i.entitlement, status: i.subscriptionStatus }));
+      return rows.length;
+    },
+    async insertBilling(tenantId, i) {
+      if (faults.billing > 0) { faults.billing--; throw new Error("billing record creation failed"); }
+      if (billing.some((b) => b.subscriptionId === i.subscriptionId)) return; // ON CONFLICT DO NOTHING
+      if (billing.some((b) => b.tenantId === tenantId)) throw new Error("billing record creation failed"); // UNIQUE(tenant_id)
+      billing.push({ tenantId, plan: "founder_beta_299", subscriptionId: i.subscriptionId, customerId: i.customerId, entitlement: i.entitlement, status: i.subscriptionStatus, onboarding: "onboarding_required" });
+    },
+    async ensureOwnerMembership(tenantId, userId) {
+      if (faults.membership > 0) { faults.membership--; throw new Error("membership creation failed"); }
+      if (!memberships.some((m) => m.userId === userId && m.tenantId === tenantId)) memberships.push({ userId, tenantId, role: "owner" });
+    },
+  };
 
   const store: BillingStore = {
     async claimEvent(id) {
@@ -38,27 +63,7 @@ function world() {
       if (status === "failed") l.error = error ?? "PROCESSING_FAILED";
     },
     async provision(i: ProvisionInput) {
-      if (billing.some((b) => b.subscriptionId === i.subscriptionId)) return;
-      let userId = users.get(i.email);
-      if (!userId) { userId = `u${++n}`; users.set(i.email, userId); }
-      const slug = slugFor(i.subscriptionId);
-      const slugTenantId = Array.from(tenants).find(([, s]) => s === slug)?.[0] ?? null;
-      const facts: MembershipFact[] = memberships.filter((m) => m.userId === userId).map((m) => ({
-        tenantId: m.tenantId, role: m.role, isThisSubscriptionTenant: m.tenantId === slugTenantId,
-        billing: billing.filter((b) => b.tenantId === m.tenantId).map((b) => ({ plan: b.plan, entitlement: b.entitlement })),
-      }));
-      const d = decideTenantForPurchaser(facts);
-      if (d.kind === "reuse") {
-        const rows = billing.filter((b) => b.tenantId === d.tenantId && b.plan === "founder_beta_299" && b.entitlement === "revoked");
-        if (rows.length !== 1) throw new Error("billing record replacement failed");
-        Object.assign(rows[0], { subscriptionId: i.subscriptionId, customerId: i.customerId, entitlement: i.entitlement, status: i.subscriptionStatus });
-        return;
-      }
-      let tenantId = d.kind === "continue" ? d.tenantId : slugTenantId;
-      if (!tenantId) { tenantId = `t${++n}`; tenants.set(tenantId, slug); }
-      if (!memberships.some((m) => m.userId === userId && m.tenantId === tenantId)) memberships.push({ userId, tenantId, role: "owner" });
-      if (billing.some((b) => b.tenantId === tenantId)) throw new Error("billing record creation failed"); // UNIQUE(tenant_id)
-      billing.push({ tenantId, plan: "founder_beta_299", subscriptionId: i.subscriptionId, customerId: i.customerId, entitlement: i.entitlement, status: i.subscriptionStatus, onboarding: "onboarding_required" });
+      await provisionFounderBeta(ops, i);
     },
     async updateSubscription(sub, patch) {
       const b = billing.find((x) => x.subscriptionId === sub);
@@ -72,7 +77,7 @@ function world() {
 
   const stripeState = new Map<string, string>(); // subscriptionId -> current status
   const fetchSub: SubscriptionFetcher = async (id) => ({ id, status: stripeState.get(id) ?? "active", metadata: { plan: "founder_beta_299" } });
-  return { store, fetchSub, stripeState, users, tenants, memberships, billing, ledger, seedTenant(id: string) { tenants.set(id, `internal-${id}`); } };
+  return { store, ops, faults, fetchSub, stripeState, users, tenants, memberships, billing, ledger, seedTenant(id: string) { tenants.set(id, `internal-${id}`); } };
 }
 
 const session = (type: string, over: Record<string, any> = {}, id = `evt_${type}`): StripeEvent => ({
@@ -234,6 +239,60 @@ describe("P1-2 safe repeat purchase / re-subscription", () => {
     expect(w.ledger.get("evt_dup_purchase")).toEqual({ status: "failed", error: "RECONCILIATION_REQUIRED:prior_entitlement_active" });
     await expect(run(resub("evt_dup_purchase"), w.store, w.fetchSub)).rejects.toThrow(); // Stripe retry
     expect(w.ledger.get("evt_dup_purchase")).toEqual({ status: "failed", error: "RECONCILIATION_REQUIRED:prior_entitlement_active" });
+  });
+});
+
+describe("P1-3 billing before membership (fail-closed provisioning order)", () => {
+  const paid = (id = "evt_paid") => session("checkout.session.completed", {}, id);
+  it("1. billing failure leaves NO owner membership and the event fails retryably", async () => {
+    const w = world(); w.faults.billing = 1;
+    await expect(run(paid(), w.store, w.fetchSub)).rejects.toThrow();
+    expect(w.memberships).toHaveLength(0);
+    expect(w.billing).toHaveLength(0);
+    expect(w.ledger.get("evt_paid")).toEqual({ status: "failed", error: "PROVISIONING:billing_record_creation_failed" });
+  });
+  it("2+3. billing ok + membership fails -> durable billing, no access; retry repairs membership", async () => {
+    const w = world(); w.faults.membership = 1;
+    await expect(run(paid(), w.store, w.fetchSub)).rejects.toThrow("membership creation failed");
+    expect(w.billing).toHaveLength(1);
+    expect(w.memberships).toHaveLength(0);
+    await run(paid(), w.store, w.fetchSub); // Stripe retry
+    expect(w.memberships).toEqual([{ userId: w.users.get("owner@acme.com"), tenantId: w.billing[0].tenantId, role: "owner" }]);
+    expect(w.billing).toHaveLength(1);
+    expect(w.billing[0].entitlement).toBe("active");
+  });
+  it("4+6+7+8. retries after complete success are idempotent (no duplicate tenant/billing/membership)", async () => {
+    const w = world();
+    await run(paid("a"), w.store, w.fetchSub);
+    await run(paid("b"), w.store, w.fetchSub);
+    await run(session("checkout.session.async_payment_succeeded", {}, "c"), w.store, w.fetchSub);
+    expect(w.tenants.size).toBe(1);
+    expect(w.billing).toHaveLength(1);
+    expect(w.memberships).toHaveLength(1);
+  });
+  it("5. existing exact-subscription billing with missing membership is repaired directly", async () => {
+    const w = world();
+    await run(paid(), w.store, w.fetchSub);
+    w.memberships.length = 0;
+    await provisionFounderBeta(w.ops, { email: "owner@acme.com", businessName: "x", customerId: "cus_1", subscriptionId: "sub_1", subscriptionStatus: "active", entitlement: "active", currentPeriodEnd: null });
+    expect(w.memberships).toHaveLength(1);
+  });
+  it("existing-subscription repair never alters an existing membership role or entitlement", async () => {
+    const w = world();
+    await run(paid(), w.store, w.fetchSub);
+    w.billing[0].entitlement = "restricted";
+    await provisionFounderBeta(w.ops, { email: "owner@acme.com", businessName: "x", customerId: "cus_1", subscriptionId: "sub_1", subscriptionStatus: "active", entitlement: "active", currentPeriodEnd: null });
+    expect(w.billing[0].entitlement).toBe("restricted");
+    expect(w.memberships).toHaveLength(1);
+  });
+  it("tenant created + billing failed: retry reuses the same deterministic tenant (no duplicate)", async () => {
+    const w = world(); w.faults.billing = 2;
+    await expect(run(paid(), w.store, w.fetchSub)).rejects.toThrow();
+    await expect(run(paid(), w.store, w.fetchSub)).rejects.toThrow();
+    await run(paid(), w.store, w.fetchSub);
+    expect(w.tenants.size).toBe(1);
+    expect(w.billing).toHaveLength(1);
+    expect(w.memberships).toHaveLength(1);
   });
 });
 
