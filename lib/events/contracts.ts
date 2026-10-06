@@ -236,7 +236,7 @@ function validateFollowThroughPayloadShape(payload: unknown): EventPayloadValida
  * transcripts, recording URLs, model prose, or provider error text.
  */
 const REVENUE_DESK_PAYLOAD_KEYS: Record<string, "id" | "code" | "codes" | "number" | "bool"> = {
-  callId: "id", leadId: "id", bookingId: "id", providerCallIdHash: "id",
+  callId: "id", leadId: "id", bookingId: "id", providerCallIdHash: "id", agentId: "id", toolName: "code", outcome: "code",
   priority: "code", requiredAction: "code", status: "code", failureCategory: "code", escalationReason: "code",
   escalationResult: "code", serviceCategory: "code", endedReason: "code", bookingOutcome: "code",
   reasons: "codes", signals: "codes",
@@ -270,6 +270,7 @@ const REVENUE_DESK_EVENT_TYPES = [
   "revenue_desk.escalation_requested",
   "revenue_desk.call_completed",
   "revenue_desk.call_failed",
+  "revenue_desk.tool_attempted",
 ] as const;
 
 export const EVENT_CONTRACTS: Record<string, EventContract> = {

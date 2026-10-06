@@ -44,7 +44,7 @@ export async function handleVapiRequest(
       const results = [];
       for (const tc of msg.toolCalls) {
         const result = ctx
-          ? await handleToolCall(deps, ctx, tc.name, tc.args)
+          ? await handleToolCall(deps, ctx, tc.name, tc.args, tc.id)
           : { ok: false, requiredAction: "escalate", reason: "tenant_unresolved", instruction: "Apologize; this line cannot take requests right now." };
         results.push({ toolCallId: tc.id, result: JSON.stringify(result) });
       }

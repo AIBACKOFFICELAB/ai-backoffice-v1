@@ -353,7 +353,7 @@ describe("Scenario A — routine booking end to end (fakes)", () => {
     expect(store.leads[0].payload).toMatchObject({ sourceRef: ctx.call.id, serviceType: "Water Heater", emergency: "No" });
     expect(bookings.rows.filter((r) => r.status === "confirmed")).toHaveLength(1);
     expect(calendar.events).toHaveLength(1);
-    expect(store.events.map((e) => e.eventType)).toEqual([
+    expect(store.events.filter((e) => e.eventType !== "revenue_desk.tool_attempted").map((e) => e.eventType)).toEqual([
       "revenue_desk.call_started", "revenue_desk.intake_captured", "revenue_desk.urgency_classified", "revenue_desk.availability_checked",
       "revenue_desk.booking_requested", "revenue_desk.booking_confirmed", "revenue_desk.call_completed",
     ]);
@@ -485,6 +485,50 @@ describe("Scenario E — tenant isolation / forging", () => {
   });
 });
 
+describe("tool-execution audit (every attempt reconstructable)", () => {
+  const attempts = (store: FakeStore) => store.events.filter((e) => e.eventType === "revenue_desk.tool_attempted").map((e) => e.payload);
+  it("records success for all five tools with tool, agent, call, lead, booking ids", async () => {
+    const { store, deps } = world();
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "tc1");
+    await handleToolCall(deps, ctx, "revenue_desk_classify_urgency", {}, "tc2");
+    const avail = (await handleToolCall(deps, ctx, "revenue_desk_check_availability", {}, "tc3")) as any;
+    await handleToolCall(deps, ctx, "revenue_desk_book_appointment", { slotStart: avail.slots[0].slotStart, durationMinutes: 120, callerConfirmed: true }, "tc4");
+    await handleToolCall(deps, ctx, "revenue_desk_get_escalation_route", { reason: "caller_requests_human" }, "tc5");
+    const a = attempts(store);
+    expect(a.map((x) => x.toolName)).toEqual(Object.keys(REVENUE_DESK_TOOLS));
+    expect(a.every((x) => x.outcome === "succeeded" && x.callId === ctx.call.id && x.agentId === `agent-${T_A}`)).toBe(true);
+    expect(a[3].bookingId).toEqual(expect.any(String));
+    expect(a[3].leadId).toEqual(store.leads[0].id);
+  });
+  it("records refusals, invalid input, unknown tools and failures — with sanitized codes and no arguments", async () => {
+    const { store, calendar, deps } = world();
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", { ...intakeArgs(), tenantId: T_B }, "bad");
+    await handleToolCall(deps, ctx, "send_sms", {}, "unk");
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "ok");
+    calendar.failGetBusy = true;
+    await handleToolCall(deps, ctx, "revenue_desk_check_availability", {}, "fail");
+    store.agents.set(T_A, agentFor(T_A, "inactive"));
+    await handleToolCall(deps, ctx, "revenue_desk_classify_urgency", {}, "deny");
+    expect(attempts(store).map((x) => [x.toolName, x.outcome, x.failureCategory])).toEqual([
+      ["revenue_desk_capture_intake", "invalid_input", "INVALID_REQUEST"],
+      ["unknown_tool", "refused", "unknown_tool"],
+      ["revenue_desk_capture_intake", "succeeded", null],
+      ["revenue_desk_check_availability", "failed", "CALENDAR_UNAVAILABLE"],
+      ["revenue_desk_classify_urgency", "refused", "policy_denied"],
+    ]);
+    expect(JSON.stringify(attempts(store))).not.toMatch(/Synthetic Caller|1 Test St|\+1305|Water heater not/);
+  });
+  it("a redelivered provider tool call is audited once", async () => {
+    const { store, deps } = world();
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_classify_urgency", {}, "same");
+    await handleToolCall(deps, ctx, "revenue_desk_classify_urgency", {}, "same");
+    expect(attempts(store)).toHaveLength(1);
+  });
+});
+
 describe("agent governance", () => {
   it("every Revenue Desk tool is allowed for the active receptionist agent and none needs approval", () => {
     const agent = agentFor(T_A);
@@ -520,7 +564,7 @@ describe("event privacy contracts", () => {
     expect(c.validatePayload({ callId: "x", [k]: v }).ok).toBe(false);
   });
   it("every revenue_desk event type is registered and requires idempotency", () => {
-    for (const t of ["call_started", "intake_captured", "urgency_classified", "availability_checked", "booking_requested", "booking_confirmed", "booking_failed", "escalation_requested", "call_completed", "call_failed"]) {
+    for (const t of ["tool_attempted", "call_started", "intake_captured", "urgency_classified", "availability_checked", "booking_requested", "booking_confirmed", "booking_failed", "escalation_requested", "call_completed", "call_failed"]) {
       expect(getEventContract(`revenue_desk.${t}`)?.idempotency).toBe("required");
     }
   });

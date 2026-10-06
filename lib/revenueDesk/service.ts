@@ -1,4 +1,4 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { evaluateToolCall } from "@/lib/agents/permissions";
 import type { Agent } from "@/lib/agents/types";
 import type { EmitEventInput } from "@/lib/events/types";
@@ -95,11 +95,45 @@ export function assistantContext(cfg: RevenueDeskConfig) {
   };
 }
 
+/**
+ * Tool-execution audit (replaces the agent_runs/tool_calls trail runAgent()
+ * would write): EVERY attempt — success, failure, refusal, invalid input,
+ * unknown tool — emits one `revenue_desk.tool_attempted` business event with
+ * tenant, call id (entity + correlation), agent id, tool name, outcome,
+ * sanitized failure code and affected lead/booking ids. Never arguments,
+ * transcript, model text or PII (enforced by the allowlist contract).
+ * Keyed by the provider's toolCallId, so a redelivered tool call dedupes.
+ */
 export async function handleToolCall(
   deps: RevenueDeskDeps,
   ctx: { config: RevenueDeskConfig; call: CallRow },
   toolName: string,
-  rawArgs: unknown
+  rawArgs: unknown,
+  providerToolCallId?: string
+): Promise<ToolResponse> {
+  const audit: { agentId: string | null } = { agentId: null };
+  const response = await executeTool(deps, ctx, toolName, rawArgs, audit);
+  const outcome = response.ok ? "succeeded" : response.reason === "policy_denied" || response.reason === "agent_not_registered" || response.reason === "unknown_tool" ? "refused" : response.error === "INVALID_REQUEST" ? "invalid_input" : "failed";
+  const failure = response.ok ? null : String(response.error ?? response.reason ?? "UNKNOWN").slice(0, 64);
+  const known = toolName in REVENUE_DESK_TOOLS;
+  await safeEmit(deps, ctx.config.tenantId, "revenue_desk.tool_attempted", ctx.call.id, `rd:${ctx.call.id}:tool:${providerToolCallId ?? randomUUID()}`, {
+    callId: ctx.call.id,
+    agentId: audit.agentId,
+    toolName: known ? toolName : "unknown_tool",
+    outcome,
+    failureCategory: failure,
+    leadId: ctx.call.leadId,
+    bookingId: typeof response.bookingId === "string" ? response.bookingId : null,
+  });
+  return response;
+}
+
+async function executeTool(
+  deps: RevenueDeskDeps,
+  ctx: { config: RevenueDeskConfig; call: CallRow },
+  toolName: string,
+  rawArgs: unknown,
+  audit: { agentId: string | null }
 ): Promise<ToolResponse> {
   const tool = REVENUE_DESK_TOOLS[toolName as RevenueDeskToolName];
   if (!tool) return escalate("unknown_tool");
@@ -107,6 +141,7 @@ export async function handleToolCall(
   // Policy engine: same evaluation every agent tool call goes through.
   const agent = await deps.store.getAgent(ctx.config.tenantId);
   if (!agent || agent.agentType !== "csr_lead_recovery") return escalate("agent_not_registered");
+  audit.agentId = agent.id;
   const decision = evaluateToolCall(agent, tool);
   if (decision.decision !== "allow") return escalate("policy_denied");
 
