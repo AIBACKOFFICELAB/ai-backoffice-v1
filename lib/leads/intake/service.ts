@@ -3,7 +3,7 @@ import type { LeadInsert, PlumbingLead } from "@/data/leadModel";
 import type { EmitEventInput } from "@/lib/events/types";
 import { IntakeError, validateIntake } from "./validation";
 
-export type IntakeSource = "website_form" | "manual";
+export type IntakeSource = "website_form" | "manual" | "voice_receptionist";
 export type IntakeTenant = { id: string; name: string; email: string | null };
 export interface IntakeDeps {
   persist(lead: LeadInsert, tenantId: string): Promise<{ lead: PlumbingLead; deduped: boolean }>;
@@ -17,7 +17,7 @@ export interface IntakeDeps {
  */
 export async function createCanonicalLeadFromIntake(raw: unknown, tenant: IntakeTenant, source: IntakeSource, actorUserId: string | null, deps: IntakeDeps) {
   const input = validateIntake(raw);
-  if (!tenant.id || (source !== "website_form" && source !== "manual") || (source === "manual" && !actorUserId)) throw new IntakeError("FORBIDDEN", "Unable to accept this request.", 403);
+  if (!tenant.id || (source !== "website_form" && source !== "manual" && source !== "voice_receptionist") || (source === "manual" && !actorUserId)) throw new IntakeError("FORBIDDEN", "Unable to accept this request.", 403);
   const { sourceRef, ...fields } = input;
   const receivedAt = new Date().toISOString();
   const result = await deps.persist({

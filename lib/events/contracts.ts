@@ -229,7 +229,57 @@ function validateFollowThroughPayloadShape(payload: unknown): EventPayloadValida
   return forbidRawEstimatePii(payload);
 }
 
+/**
+ * AIBO-RD-M001 Revenue Desk: ALLOWLIST payload contract (stricter than the
+ * denylist guards above). Only ids, enumerated codes and numbers may enter
+ * business_events — never phone numbers, addresses, names, job text,
+ * transcripts, recording URLs, model prose, or provider error text.
+ */
+const REVENUE_DESK_PAYLOAD_KEYS: Record<string, "id" | "code" | "codes" | "number" | "bool"> = {
+  callId: "id", leadId: "id", bookingId: "id", providerCallIdHash: "id",
+  priority: "code", requiredAction: "code", status: "code", failureCategory: "code", escalationReason: "code",
+  escalationResult: "code", serviceCategory: "code", endedReason: "code", bookingOutcome: "code",
+  reasons: "codes", signals: "codes",
+  slotCount: "number", durationSeconds: "number", costUsd: "number", durationMinutes: "number",
+  deduped: "bool", providerEventPresent: "bool",
+};
+const CODE = /^[A-Za-z0-9_:.\- ]{1,64}$/;
+function validateRevenueDeskPayload(payload: unknown): EventPayloadValidation {
+  if (!isRecord(payload)) return { ok: false, errors: ["payload must be an object"] };
+  const errors: string[] = [];
+  for (const [k, v] of Object.entries(payload)) {
+    const kind = REVENUE_DESK_PAYLOAD_KEYS[k];
+    if (!kind) { errors.push(`field '${k}' is not allowed in revenue_desk events`); continue; }
+    if (v === null) continue;
+    if (kind === "number" && typeof v !== "number") errors.push(`${k} must be a number`);
+    if (kind === "bool" && typeof v !== "boolean") errors.push(`${k} must be boolean`);
+    if ((kind === "id" || kind === "code") && (typeof v !== "string" || !CODE.test(v))) errors.push(`${k} must be a bounded code/id`);
+    if (kind === "codes" && (!Array.isArray(v) || v.length > 20 || v.some((x) => typeof x !== "string" || !CODE.test(x)))) errors.push(`${k} must be a bounded code list`);
+  }
+  return errors.length ? { ok: false, errors } : { ok: true };
+}
+
+const REVENUE_DESK_EVENT_TYPES = [
+  "revenue_desk.call_started",
+  "revenue_desk.intake_captured",
+  "revenue_desk.urgency_classified",
+  "revenue_desk.availability_checked",
+  "revenue_desk.booking_requested",
+  "revenue_desk.booking_confirmed",
+  "revenue_desk.booking_failed",
+  "revenue_desk.escalation_requested",
+  "revenue_desk.call_completed",
+  "revenue_desk.call_failed",
+] as const;
+
 export const EVENT_CONTRACTS: Record<string, EventContract> = {
+  ...Object.fromEntries(
+    REVENUE_DESK_EVENT_TYPES.map((eventType) => [
+      eventType,
+      // Provider callbacks redeliver: every Revenue Desk emission is keyed.
+      { eventType, schemaVersion: 1, idempotency: "required" as const, validatePayload: validateRevenueDeskPayload },
+    ])
+  ),
   "call.missed": {
     eventType: "call.missed",
     schemaVersion: 1,

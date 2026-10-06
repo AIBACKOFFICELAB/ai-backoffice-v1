@@ -34,6 +34,7 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Revenue",
     items: [
+      { href: "/revenue-desk", label: "Revenue Desk", icon: "inbox" },
       { href: "/lead-inbox", label: "Lead Inbox", icon: "inbox" },
       { href: "/estimates", label: "Estimates", icon: "wallet" },
       { href: "/follow-ups", label: "Follow-Ups", icon: "clock" },

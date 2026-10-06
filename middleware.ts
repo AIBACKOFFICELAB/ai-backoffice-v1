@@ -14,6 +14,7 @@ const protectedRoutes = [
   "/billing",
   "/approvals",
   "/estimates",
+  "/revenue-desk",
 ];
 
 export async function middleware(request: NextRequest) {

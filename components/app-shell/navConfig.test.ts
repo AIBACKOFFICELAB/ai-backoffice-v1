@@ -41,6 +41,7 @@ describe("resolveNavGroups", () => {
     const KNOWN_ROUTES = new Set([
       "/dashboard",
       "/lead-inbox",
+      "/revenue-desk",
       "/estimates",
       "/follow-ups",
       "/agentic",
