@@ -53,6 +53,15 @@ function isFounderBeta(obj: Record<string, any>): boolean {
   return (obj.metadata?.plan ?? obj.subscription_details?.metadata?.plan ?? obj.lines?.data?.[0]?.metadata?.plan) === FOUNDER_BETA_PLAN;
 }
 
+/** Bounded ledger text: known codes pass through; anything else is generic (no raw payload/PII). */
+export function sanitizeLedgerError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : "";
+  if (/^(RECONCILIATION_REQUIRED|INVALID_CHECKOUT):[a-z_]+$/.test(msg)) return msg;
+  if (/^subscription \S+ not provisioned yet$/.test(msg)) return "OUT_OF_ORDER:subscription_not_provisioned";
+  if (/^[a-z ]+ (failed|unavailable)$/.test(msg)) return `PROVISIONING:${msg.replace(/ /g, "_")}`;
+  return "PROCESSING_FAILED";
+}
+
 export async function processStripeEvent(event: StripeEvent, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<WebhookResult> {
   const claim = await store.claimEvent(event.id, event.type);
   if (claim === "duplicate") return { outcome: "duplicate" };
@@ -62,7 +71,7 @@ export async function processStripeEvent(event: StripeEvent, store: BillingStore
     await store.finishEvent(event.id, "processed");
     return result;
   } catch (err) {
-    await store.finishEvent(event.id, "failed", err instanceof Error ? err.message.slice(0, 500) : "unknown error");
+    await store.finishEvent(event.id, "failed", sanitizeLedgerError(err));
     throw err; // -> HTTP 500 so Stripe retries
   }
 }
@@ -87,31 +96,53 @@ async function syncFromStripe(subscriptionId: string, store: BillingStore, fetch
   return { found, status: sub.status };
 }
 
+/**
+ * The ONE paid-checkout provisioning path, shared by an immediately paid
+ * checkout.session.completed and checkout.session.async_payment_succeeded.
+ * Entitlement always comes from the authoritative Stripe subscription re-read.
+ */
+async function provisionPaidCheckout(obj: Record<string, any>, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<WebhookResult> {
+  const email = String(obj.customer_details?.email ?? obj.customer_email ?? "").trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || typeof obj.customer !== "string" || !obj.customer || typeof obj.subscription !== "string" || !obj.subscription) {
+    throw new Error("INVALID_CHECKOUT:missing_email_customer_or_subscription");
+  }
+  const field = (obj.custom_fields as any[] | undefined)?.find((f) => f?.key === "business_name");
+  const businessName = String(field?.text?.value ?? "").trim() || email;
+  const current = await fetchSubscription(obj.subscription); // authoritative, not the checkout snapshot
+  await store.provision({
+    email,
+    businessName: businessName.slice(0, 120),
+    customerId: obj.customer,
+    subscriptionId: obj.subscription,
+    subscriptionStatus: current.status,
+    entitlement: entitlementForStatus(current.status),
+    currentPeriodEnd: iso(current.current_period_end ?? current.items?.data?.[0]?.current_period_end),
+  });
+  return { outcome: "processed", detail: "provisioned" };
+}
+
 async function dispatch(event: StripeEvent, store: BillingStore, fetchSubscription: SubscriptionFetcher): Promise<WebhookResult> {
   const obj = event.data.object;
 
   switch (event.type) {
     case "checkout.session.completed": {
       if (obj.mode !== "subscription" || !isFounderBeta(obj)) return { outcome: "ignored", detail: "not-founder-beta" };
-      // Entitlement requires server-confirmed payment, never the browser return.
-      if (obj.payment_status !== "paid") return { outcome: "ignored", detail: "not-paid" };
-      const email = String(obj.customer_details?.email ?? obj.customer_email ?? "").trim().toLowerCase();
-      if (!email || typeof obj.customer !== "string" || typeof obj.subscription !== "string") {
-        throw new Error("checkout.session.completed missing email/customer/subscription");
-      }
-      const field = (obj.custom_fields as any[] | undefined)?.find((f) => f?.key === "business_name");
-      const businessName = String(field?.text?.value ?? "").trim() || email;
-      const current = await fetchSubscription(obj.subscription); // authoritative, not the checkout snapshot
-      await store.provision({
-        email,
-        businessName: businessName.slice(0, 120),
-        customerId: obj.customer,
-        subscriptionId: obj.subscription,
-        subscriptionStatus: current.status,
-        entitlement: entitlementForStatus(current.status),
-        currentPeriodEnd: iso(current.current_period_end ?? current.items?.data?.[0]?.current_period_end),
-      });
-      return { outcome: "processed", detail: "provisioned" };
+      // Delayed payment methods (e.g. ACH) complete Checkout before money
+      // clears: no entitlement yet; provisioning happens on async success.
+      if (obj.payment_status !== "paid") return { outcome: "processed", detail: "awaiting-async-payment" };
+      return provisionPaidCheckout(obj, store, fetchSubscription);
+    }
+
+    case "checkout.session.async_payment_succeeded": {
+      if (obj.mode !== "subscription" || !isFounderBeta(obj)) return { outcome: "ignored", detail: "not-founder-beta" };
+      if (obj.payment_status !== "paid") return { outcome: "processed", detail: "awaiting-async-payment" };
+      return provisionPaidCheckout(obj, store, fetchSubscription);
+    }
+
+    case "checkout.session.async_payment_failed": {
+      if (obj.mode !== "subscription" || !isFounderBeta(obj)) return { outcome: "ignored", detail: "not-founder-beta" };
+      // Truthful: payment never cleared -> no tenant, no billing row, no entitlement.
+      return { outcome: "processed", detail: "async-payment-failed-no-entitlement" };
     }
 
     case "customer.subscription.updated":

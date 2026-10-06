@@ -2,6 +2,7 @@ import "server-only";
 import { billingAdminClient } from "./admin";
 import type { BillingStore, ProvisionInput, SubscriptionPatch } from "./webhook";
 import type { Entitlement } from "./entitlement";
+import { decideTenantForPurchaser, type MembershipFact } from "./tenantResolution";
 
 type Admin = ReturnType<typeof billingAdminClient>;
 
@@ -33,15 +34,16 @@ export function createSupabaseBillingStore(): BillingStore {
       const { data, error } = await db.from("stripe_webhook_events").select("status").eq("event_id", eventId).maybeSingle();
       if (error || !data) throw new Error("webhook ledger unavailable");
       if (data.status === "processed") return "duplicate";
-      await db.from("stripe_webhook_events").update({ status: "processing", error: null }).eq("event_id", eventId);
+      // Keep the prior failure text: a retry must not erase reconciliation evidence.
+      await db.from("stripe_webhook_events").update({ status: "processing" }).eq("event_id", eventId);
       return "retry";
     },
 
     async finishEvent(eventId, status, error) {
-      await db
-        .from("stripe_webhook_events")
-        .update({ status, error: error ?? null, processed_at: new Date().toISOString() })
-        .eq("event_id", eventId);
+      // On success the last failure text (if any) is retained as history; on failure it is replaced by the newest bounded code.
+      const patch: Record<string, unknown> = { status, processed_at: new Date().toISOString() };
+      if (status === "failed") patch.error = error ?? "PROCESSING_FAILED";
+      await db.from("stripe_webhook_events").update(patch).eq("event_id", eventId);
     },
 
     async provision(input: ProvisionInput) {
@@ -61,32 +63,55 @@ export function createSupabaseBillingStore(): BillingStore {
         }
       }
 
-      // 2. tenant (deterministic slug -> idempotent)
+      // 2. which tenant? (pure policy: lib/billing/tenantResolution.ts)
       const slug = tenantSlugForSubscription(input.subscriptionId);
-      let tenantId: string | null = null;
       const t = await db.from("tenants").select("id").eq("slug", slug).maybeSingle();
       if (t.error) throw new Error("tenant lookup failed");
-      if (t.data) {
-        tenantId = t.data.id;
-      } else {
-        const ct = await db
-          .from("tenants")
-          .insert({ name: input.businessName, slug, email: input.email, status: "active" })
-          .select("id")
-          .single();
+      const slugTenantId: string | null = t.data?.id ?? null;
+
+      const mems = await db.from("tenant_memberships").select("tenant_id, role").eq("user_id", userId);
+      if (mems.error) throw new Error("membership lookup failed");
+      const facts: MembershipFact[] = [];
+      for (const m of mems.data ?? []) {
+        const bills = await db.from("billing_subscriptions").select("plan, entitlement").eq("tenant_id", m.tenant_id);
+        if (bills.error) throw new Error("billing lookup failed");
+        facts.push({ tenantId: m.tenant_id, role: m.role, isThisSubscriptionTenant: m.tenant_id === slugTenantId, billing: (bills.data ?? []) as MembershipFact["billing"] });
+      }
+      const decision = decideTenantForPurchaser(facts); // throws ReconciliationRequiredError when ambiguous
+
+      const now = new Date().toISOString();
+      if (decision.kind === "reuse") {
+        // 3a. Ended Founder Beta customer re-subscribing: SAME tenant, replace its single billing row.
+        // Onboarding state is preserved as recorded (never invented as complete).
+        const upd = await db
+          .from("billing_subscriptions")
+          .update({
+            stripe_customer_id: input.customerId,
+            stripe_subscription_id: input.subscriptionId,
+            purchaser_email: input.email,
+            subscription_status: input.subscriptionStatus,
+            entitlement: input.entitlement,
+            current_period_end: input.currentPeriodEnd,
+            cancel_at_period_end: false,
+            canceled_at: null,
+            updated_at: now,
+          })
+          .eq("tenant_id", decision.tenantId)
+          .eq("plan", "founder_beta_299")
+          .eq("entitlement", "revoked") // guard: never overwrite a live/restricted relationship
+          .select("id");
+        if (upd.error || (upd.data ?? []).length !== 1) throw new Error("billing record replacement failed");
+        return;
+      }
+
+      // 3b. new customer (or retry of this subscription's own partial provisioning)
+      let tenantId = decision.kind === "continue" ? decision.tenantId : slugTenantId;
+      if (!tenantId) {
+        const ct = await db.from("tenants").insert({ name: input.businessName, slug, email: input.email, status: "active" }).select("id").single();
         if (ct.error || !ct.data) throw new Error("tenant creation failed");
         tenantId = ct.data.id;
       }
-
-      // 3. owner membership — refuse to wire a user already attached to ANOTHER tenant
-      const other = await db.from("tenant_memberships").select("tenant_id").eq("user_id", userId);
-      if (other.error) throw new Error("membership lookup failed");
-      if ((other.data ?? []).some((m) => m.tenant_id !== tenantId)) {
-        throw new Error("purchaser already belongs to another tenant; Founder reconciliation required");
-      }
-      const mem = await db
-        .from("tenant_memberships")
-        .upsert({ tenant_id: tenantId, user_id: userId, role: "owner" }, { onConflict: "tenant_id,user_id" });
+      const mem = await db.from("tenant_memberships").upsert({ tenant_id: tenantId, user_id: userId, role: "owner" }, { onConflict: "tenant_id,user_id" });
       if (mem.error) throw new Error("membership creation failed");
 
       // 4. billing record: PAID — ONBOARDING REQUIRED
@@ -101,7 +126,7 @@ export function createSupabaseBillingStore(): BillingStore {
           entitlement: input.entitlement,
           onboarding_status: "onboarding_required",
           current_period_end: input.currentPeriodEnd,
-          updated_at: new Date().toISOString(),
+          updated_at: now,
         },
         { onConflict: "stripe_subscription_id" }
       );

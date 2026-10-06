@@ -92,7 +92,7 @@ describe("Founder Beta webhook lifecycle", () => {
   });
   it("unpaid checkout, wrong mode, or non-Founder-Beta plan never grants entitlement", async () => {
     const s = fakeStore(); const f = fakeStripe();
-    expect((await run(checkout({ payment_status: "unpaid" }, "e1"), s, f)).outcome).toBe("ignored");
+    expect(await run(checkout({ payment_status: "unpaid" }, "e1"), s, f)).toMatchObject({ outcome: "processed", detail: "awaiting-async-payment" });
     expect((await run(checkout({ mode: "payment" }, "e2"), s, f)).outcome).toBe("ignored");
     expect((await run(checkout({ metadata: {} }, "e3"), s, f)).outcome).toBe("ignored");
     expect(s.subs.size).toBe(0);
