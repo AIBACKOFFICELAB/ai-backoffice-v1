@@ -5,12 +5,12 @@ import { describe, expect, it, vi } from "vitest";
 import { parseRevenueDeskConfig, ConfigError, type RevenueDeskConfig } from "./config";
 import { classifyUrgency } from "./urgency";
 import { generateSlots, isSlotWithinPolicy, zonedToUtc } from "./slots";
-import { bookAppointment, bookingIdempotencyKey, bookingUniqueViolation, BookingKeyConflictError, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
+import { bookAppointment, BOOKING_CONFIRMATION_FOLLOW_UP, bookingIdempotencyKey, bookingUniqueViolation, BookingKeyConflictError, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
 import { CalendarError, type CalendarProvider, type ProviderEvent } from "./calendar/types";
 import { handleToolCall, startOrResumeCall, completeCall, type CallRow, type RevenueDeskStore, type RevenueDeskDeps } from "./service";
 import { revenueDeskAgentDefinition, REVENUE_DESK_TOOLS } from "./tools";
 import { toCanonicalIntakePayload } from "./intake";
-import { summarizeCalls, computeAllowance, FOUNDER_BETA_INCLUDED_MINUTES } from "./readModel";
+import { summarizeCalls, computeAllowance, ownerFollowUp, FOUNDER_BETA_INCLUDED_MINUTES } from "./readModel";
 import { verifyVapiRequest } from "@/lib/integrations/vapi/auth";
 import { parseVapiMessage } from "@/lib/integrations/vapi/parse";
 import { handleVapiRequest } from "@/lib/integrations/vapi/handler";
@@ -96,6 +96,7 @@ class FakeBookingStore implements BookingStore {
   rows: Booking[] = [];
   /** Postgres may report ANY violated unique guard for a concurrent duplicate. */
   duplicateReportsAs: "per_call" | "slot" | "key" = "per_call";
+  /** The DATABASE clock (insert default / trigger / lease RPC), distinct from the app's deps.now. */
   constructor(public clock: () => Date = () => new Date()) {}
   async findByIdempotencyKey(tenantId: string, key: string) {
     const r = this.rows.find((r) => r.tenantId === tenantId && r.idempotencyKey === key);
@@ -113,11 +114,13 @@ class FakeBookingStore implements BookingStore {
     return r;
   }
   claims = 0;
-  async claimPending(tenantId: string, id: string, expectedUpdatedAt: string) {
+  /** Models migration 027: lease expiry judged ONLY by the database clock, atomically. */
+  async claimPending(tenantId: string, id: string, leaseSeconds: number) {
     const r = this.rows.find((x) => x.tenantId === tenantId && x.id === id);
-    if (!r || r.status !== "pending" || r.updatedAt !== expectedUpdatedAt) return null;
+    if (!r || r.status !== "pending" || leaseSeconds < 1 || leaseSeconds > 3600) return null;
+    if (this.clock().getTime() - Date.parse(r.updatedAt) < leaseSeconds * 1000) return null;
     this.claims++;
-    r.updatedAt = new Date(Date.parse(expectedUpdatedAt) + 1).toISOString();
+    r.updatedAt = this.clock().toISOString();
     return { ...r };
   }
   async update(tenantId: string, id: string, patch: Partial<Booking>) {
@@ -345,12 +348,13 @@ describe("booking state machine", () => {
     expect(calendar.calls.create).toBe(0);
   });
   it("expired pending lease with no provider event -> one retry with the SAME booking id", async () => {
-    const { calendar, store } = base();
+    let dbNow = MON_6AM.getTime();
+    const { calendar, store } = base(new FakeCalendar(), new FakeBookingStore(() => new Date(dbNow)));
     const cfg = cfgA();
     const key = bookingIdempotencyKey("call-1", "2026-10-12T14:00:00.000Z", 60);
     const pending = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
-    const later = { calendar, store, now: () => new Date(Date.parse(pending.updatedAt) + PENDING_LEASE_MS + 1000) };
-    expect(await bookAppointment(later, req())).toMatchObject({ confirmed: true, bookingId: pending.id });
+    dbNow += PENDING_LEASE_MS + 1000; // lease expires by the DATABASE clock
+    expect(await bookAppointment({ calendar, store, now: () => MON_6AM }, req())).toMatchObject({ confirmed: true, bookingId: pending.id });
     expect(calendar.events[0].aiboBookingId).toBe(pending.id);
   });
   it("AIBO slot guard: a second call cannot book a slot already live for this calendar", async () => {
@@ -856,13 +860,14 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
   });
 
   it("unique conflict never takes over the winner's row, even if its lease looks expired", async () => {
-    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    let dbNow = MON_6AM.getTime();
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(dbNow));
     const cfg = cfgA();
     const key = bookingIdempotencyKey("call-1", SLOT, 60);
     await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
     const raced = racing(store);
-    const later = () => new Date(MON_6AM.getTime() + PENDING_LEASE_MS * 10);
-    expect(await bookAppointment({ calendar, store: raced, now: later }, req({ start: SLOT }))).toMatchObject(NOT_FINAL);
+    dbNow += PENDING_LEASE_MS * 10;
+    expect(await bookAppointment({ calendar, store: raced, now: () => MON_6AM }, req({ start: SLOT }))).toMatchObject(NOT_FINAL);
     expect(store.claims).toBe(0);
     expect(calendar.calls.create).toBe(0);
   });
@@ -881,11 +886,13 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
   });
 
   it("concurrent retries of an EXPIRED lease: exactly one claims and writes; the other is non-final", async () => {
-    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    let dbNow = MON_6AM.getTime();
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(dbNow));
     const cfg = cfgA();
     const key = bookingIdempotencyKey("call-1", SLOT, 60);
     const p = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
-    const deps = { calendar, store, now: () => new Date(Date.parse(p.updatedAt) + PENDING_LEASE_MS + 1000) };
+    dbNow = Date.parse(p.updatedAt) + PENDING_LEASE_MS + 1000;
+    const deps = { calendar, store, now: () => MON_6AM };
     const g = gate();
     calendar.createGate = g.p;
     const a = bookAppointment(deps, req());
@@ -897,6 +904,28 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     expect(rs.filter((r) => !r.confirmed && r.statusUnknown)).toHaveLength(1);
     expect(store.claims).toBe(1);
     expect(calendar.calls.create).toBe(1);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("clock skew: an app clock far AHEAD of the database cannot expire a live lease", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfg = cfgA();
+    await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: bookingIdempotencyKey("call-1", SLOT, 60), calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    const skewedAhead = () => new Date(MON_6AM.getTime() + 3 * 3600_000); // app instance 3h fast
+    expect(await bookAppointment({ calendar, store, now: skewedAhead }, req())).toMatchObject(NOT_FINAL);
+    expect(store.claims).toBe(0);
+    expect(calendar.calls.create).toBe(0);
+  });
+
+  it("clock skew: an app clock BEHIND the database still lets an expired lease be reclaimed exactly once", async () => {
+    let dbNow = MON_6AM.getTime();
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(dbNow));
+    const cfg = cfgA();
+    const p = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: bookingIdempotencyKey("call-1", SLOT, 60), calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    dbNow += PENDING_LEASE_MS + 1000;
+    const skewedBehind = () => new Date(MON_6AM.getTime() - 3600_000); // app instance 1h slow
+    expect(await bookAppointment({ calendar, store, now: skewedBehind }, req())).toMatchObject({ confirmed: true, bookingId: p.id });
+    expect(store.claims).toBe(1);
     expect(calendar.events).toHaveLength(1);
   });
 
@@ -936,14 +965,16 @@ describe("assistant-facing booking outcomes are truthful", () => {
   }
   const args = (s: { slotStart: string; durationMinutes: number }) => ({ slotStart: s.slotStart, durationMinutes: s.durationMinutes, callerConfirmed: true });
 
-  it("in-flight duplicate -> pending_confirmation: callback offered, neither booked nor failed claimed, call evidence untouched", async () => {
+  it("in-flight duplicate -> pending_confirmation: callback offered only with a durable owner follow-up; neither booked nor failed claimed", async () => {
     const { deps, ctx, slot, calendar, store } = await bookedWorld();
     let release!: () => void;
     calendar.createGate = new Promise<void>((r) => (release = r));
     const first = handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
     await new Promise((r) => setTimeout(r, 0));
     const dup = await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), "tc-2");
-    expect(dup).toMatchObject({ ok: false, booked: false, outcome: "pending_confirmation", requiredAction: "offer_callback" });
+    expect(dup).toMatchObject({ ok: false, booked: false, outcome: "pending_confirmation", requiredAction: "offer_callback", followUpRecorded: true });
+    // The owner-facing follow-up was durable BEFORE the promise was returned.
+    expect(store.calls[0]).toMatchObject({ escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP, escalationResult: "requested" });
     expect(String(dup.instruction)).toMatch(/NOT confirmed yet/);
     expect(String(dup.instruction)).toMatch(/has NOT failed/);
     expect(String(dup.instruction)).toMatch(/call them back/);
@@ -951,11 +982,71 @@ describe("assistant-facing booking outcomes are truthful", () => {
     expect(await first).toMatchObject({ ok: true, booked: true });
     const callRow = store.calls[0];
     expect(callRow.bookingOutcome).toBe("confirmed");
+    expect(callRow.status).toBe("booked"); // the follow-up never changes call status
+    expect(callRow.escalationReason).toBe(BOOKING_CONFIRMATION_FOLLOW_UP); // the promise survives the later confirmation
     expect(callRow.failureCategory).toBeUndefined();
+    expect(store.events.filter((e) => e.eventType === "revenue_desk.escalation_requested").map((e) => e.payload.escalationReason)).toEqual([BOOKING_CONFIRMATION_FOLLOW_UP]);
     expect(store.events.filter((e) => e.eventType === "revenue_desk.booking_failed")).toHaveLength(0);
     const audit = store.events.filter((e) => e.eventType === "revenue_desk.tool_attempted" && e.payload.toolName === "revenue_desk_book_appointment").map((e) => e.payload.outcome);
     expect(audit.sort()).toEqual(["pending_confirmation", "succeeded"]);
     expect(calendar.events).toHaveLength(1);
+  });
+
+  it("if the owner follow-up cannot be recorded, the assistant must NOT promise a callback", async () => {
+    const { deps, ctx, slot, calendar, store } = await bookedWorld();
+    let release!: () => void;
+    calendar.createGate = new Promise<void>((r) => (release = r));
+    const first = handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    await new Promise((r) => setTimeout(r, 0));
+    const realUpdate = store.updateCall.bind(store);
+    store.updateCall = async (t, id, patch) => {
+      if ((patch as any).escalationReason === BOOKING_CONFIRMATION_FOLLOW_UP) throw new Error("db down");
+      return realUpdate(t, id, patch);
+    };
+    const dup = await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), "tc-2");
+    expect(dup).toMatchObject({ ok: false, booked: false, outcome: "pending_confirmation", followUpRecorded: false, requiredAction: "do_not_promise_callback" });
+    const text = String(dup.instruction);
+    expect(text).toMatch(/do not promise that anyone will call back/);
+    expect(text).not.toMatch(/team has been asked|will call (them|you) back/i);
+    expect(text).toMatch(/NOT confirmed/);
+    expect(text).toMatch(/has NOT failed/);
+    expect(store.events.filter((e) => e.eventType === "revenue_desk.escalation_requested")).toHaveLength(0);
+    release();
+    expect(await first).toMatchObject({ ok: true, booked: true });
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("concurrent duplicates that both land in pending record ONE follow-up and one escalation event", async () => {
+    const { deps, ctx, slot, calendar, store } = await bookedWorld();
+    let release!: () => void;
+    calendar.createGate = new Promise<void>((r) => (release = r));
+    const first = handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    await new Promise((r) => setTimeout(r, 0));
+    const dups = await Promise.all(["tc-2", "tc-3"].map((id) => handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), id)));
+    for (const d of dups) expect(d).toMatchObject({ outcome: "pending_confirmation", followUpRecorded: true });
+    release();
+    await first;
+    expect(store.calls).toHaveLength(1);
+    expect(store.calls[0].escalationReason).toBe(BOOKING_CONFIRMATION_FOLLOW_UP);
+    expect(store.events.filter((e) => e.eventType === "revenue_desk.escalation_requested")).toHaveLength(1);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("the follow-up is owner-visible and the call's end-of-call report does not erase or mislabel it", async () => {
+    const { deps, ctx, slot, calendar, store } = await bookedWorld();
+    let release!: () => void;
+    calendar.createGate = new Promise<void>((r) => (release = r));
+    const first = handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    await new Promise((r) => setTimeout(r, 0));
+    await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), "tc-2");
+    release();
+    await first;
+    const resumed = await startCall(deps);
+    await completeCall(deps, resumed, { endedAt: null, startedAt: null, durationSeconds: 90, costUsd: null, endedReason: "customer-ended-call", transferred: false });
+    expect(store.calls[0]).toMatchObject({ escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP, escalationResult: "requested" });
+    expect(ownerFollowUp({ escalation_reason: store.calls[0].escalationReason })).toMatchObject({ label: "Call back to confirm booking" });
+    expect(ownerFollowUp({ escalation_reason: "caller_requests_human" })).toBeNull();
+    expect(ownerFollowUp({ escalation_reason: null })).toBeNull();
   });
 
   it("different toolCallIds for the same slot dedupe to the same confirmed booking", async () => {
@@ -1022,8 +1113,8 @@ describe("Founder Beta usage allowance (500 min/month, metering only)", () => {
 describe("read model", () => {
   it("summarizes calls and only reports cost when the provider supplied it", () => {
     const s = summarizeCalls([
-      { id: "1", created_at: "", status: "booked", priority: "routine", service_category: null, booking_outcome: "confirmed", escalation_result: null, duration_seconds: 120, provider_cost_usd: "0.24", failure_category: null, lead_id: null, intake: null },
-      { id: "2", created_at: "", status: "escalated", priority: null, service_category: null, booking_outcome: null, escalation_result: "transferred", duration_seconds: 60, provider_cost_usd: null, failure_category: null, lead_id: null, intake: null },
+      { id: "1", created_at: "", status: "booked", priority: "routine", service_category: null, booking_outcome: "confirmed", escalation_result: null, escalation_reason: null, duration_seconds: 120, provider_cost_usd: "0.24", failure_category: null, lead_id: null, intake: null },
+      { id: "2", created_at: "", status: "escalated", priority: null, service_category: null, booking_outcome: null, escalation_result: "transferred", escalation_reason: null, duration_seconds: 60, provider_cost_usd: null, failure_category: null, lead_id: null, intake: null },
     ]);
     expect(s).toMatchObject({ calls: 2, booked: 1, escalated: 1, failed: 0, minutes: 3, costUsd: 0.24, costPerMinute: 0.12 });
     expect(summarizeCalls([]).costUsd).toBeNull();

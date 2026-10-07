@@ -3,10 +3,11 @@ export const dynamic = "force-dynamic";
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { getTenantContext } from "@/lib/tenant";
-import { getRevenueDeskCall } from "@/lib/revenueDesk/readModel";
+import { getRevenueDeskCall, ownerFollowUp } from "@/lib/revenueDesk/readModel";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardBody } from "@/components/ui/Card";
 import { formatOperationalTimestamp } from "@/lib/format/timestamp";
+import { Alert } from "@/components/ui/Alert";
 
 const ts = (v: string | null | undefined) => formatOperationalTimestamp(v)?.display ?? "—";
 
@@ -18,6 +19,7 @@ export default async function RevenueDeskCallPage({ params }: { params: Promise<
   if (!data) notFound();
   const { call, bookings, events } = data;
   const intake = (call.intake ?? {}) as Record<string, any>;
+  const followUp = ownerFollowUp(call);
 
   const rows: Array<[string, string]> = [
     ["Started", ts(call.started_at ?? call.created_at)],
@@ -38,6 +40,7 @@ export default async function RevenueDeskCallPage({ params }: { params: Promise<
     <div className="space-y-6">
       <Link href="/revenue-desk" className="text-sm font-semibold text-brand-700">← Revenue Desk</Link>
       <PageHeader title={`Call · ${ts(call.created_at)}`} description="Structured operational evidence. Audio and full transcripts are not stored." />
+      {followUp && <Alert tone="warning"><strong>Action needed: {followUp.label}.</strong> {followUp.detail}</Alert>}
       <div className="grid gap-6 lg:grid-cols-2">
         <Card><CardBody>
           <h2 className="text-sm font-semibold text-ink-900">Service request</h2>

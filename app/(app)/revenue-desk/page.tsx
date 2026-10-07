@@ -3,7 +3,7 @@ export const dynamic = "force-dynamic";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getTenantContext } from "@/lib/tenant";
-import { getRevenueDeskOverview } from "@/lib/revenueDesk/readModel";
+import { getRevenueDeskOverview, ownerFollowUp } from "@/lib/revenueDesk/readModel";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardBody } from "@/components/ui/Card";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -64,7 +64,11 @@ export default async function RevenueDeskPage() {
                       <span className="font-medium text-ink-900">{formatOperationalTimestamp(c.created_at)?.display}</span>
                       <span className="text-ink-700">{c.intake?.customerName ?? "Caller"} · {c.service_category ?? "Service not captured"}</span>
                       <span className="text-ink-500">{c.priority ? PRIORITY_LABEL[c.priority] : "Unclassified"}</span>
-                      <span className="font-semibold text-ink-900">{c.booking_outcome ? OUTCOME_LABEL[c.booking_outcome] : c.status === "escalated" ? "Escalated" : c.status === "failed" ? "Failed" : c.status.replace("_", " ")}</span>
+                      {ownerFollowUp(c) ? (
+                        <span className="font-semibold text-gold-700">{ownerFollowUp(c)!.label}</span>
+                      ) : (
+                        <span className="font-semibold text-ink-900">{c.booking_outcome ? OUTCOME_LABEL[c.booking_outcome] : c.status === "escalated" ? "Escalated" : c.status === "failed" ? "Failed" : c.status.replace("_", " ")}</span>
+                      )}
                     </Link>
                   </li>
                 ))}

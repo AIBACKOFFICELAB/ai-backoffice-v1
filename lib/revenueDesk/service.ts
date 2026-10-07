@@ -5,7 +5,7 @@ import type { EmitEventInput } from "@/lib/events/types";
 import { bookingConfigProblem, durationFor, type RevenueDeskConfig } from "./config";
 import { classifyUrgency, type UrgencyDecision } from "./urgency";
 import { generateSlots, zonedToUtc } from "./slots";
-import { bookAppointment, type BookingStore } from "./booking";
+import { bookAppointment, BOOKING_CONFIRMATION_FOLLOW_UP, type BookingStore } from "./booking";
 import { CalendarError, type CalendarProvider } from "./calendar/types";
 import { REVENUE_DESK_TOOLS, type CaptureIntakeInput, type RevenueDeskToolName } from "./tools";
 import { toCanonicalIntakePayload } from "./intake";
@@ -266,16 +266,27 @@ async function book(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; cal
   }
   if (result.statusUnknown) {
     // Non-final: a concurrent/in-flight attempt may have created this exact
-    // appointment. Record nothing as failed (the winner may already have marked
-    // the call booked) and never let the assistant claim either outcome. The
-    // per-attempt tool audit records BOOKING_PENDING_CONFIRMATION.
+    // appointment, so nothing is recorded as booked or failed (the winner may
+    // already have marked the call booked). A callback may be promised ONLY
+    // once an owner-facing follow-up is durably on the call record.
+    const base = { ok: false, booked: false, outcome: "pending_confirmation", error: "BOOKING_PENDING_CONFIRMATION" };
+    try {
+      await deps.store.updateCall(config.tenantId, call.id, { escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP, escalationResult: "requested" });
+    } catch {
+      return {
+        ...base,
+        followUpRecorded: false,
+        requiredAction: "do_not_promise_callback",
+        instruction: "This appointment is NOT confirmed, and it has NOT failed. Do not say it is booked, do not say it failed, and do not promise that anyone will call back. Tell the caller the appointment could not be confirmed on this call and ask them to call the business again to confirm. Do not try to book again.",
+      };
+    }
+    ctx.call = { ...ctx.call, escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP };
+    await safeEmit(deps, config.tenantId, "revenue_desk.escalation_requested", call.id, `rd:${call.id}:escalation:${BOOKING_CONFIRMATION_FOLLOW_UP}`, { callId: call.id, escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP });
     return {
-      ok: false,
-      booked: false,
-      outcome: "pending_confirmation",
-      error: "BOOKING_PENDING_CONFIRMATION",
+      ...base,
+      followUpRecorded: true,
       requiredAction: "offer_callback",
-      instruction: "This appointment is NOT confirmed yet, and it has NOT failed. Do not say it is booked and do not say it failed. Do not try to book again or offer another time. Tell the caller the team will call them back to confirm the appointment.",
+      instruction: "This appointment is NOT confirmed yet, and it has NOT failed. Do not say it is booked and do not say it failed. Do not try to book again or offer another time. Tell the caller the team has been asked to call them back to confirm the appointment.",
     };
   }
   if (result.callAlreadyBooked) {

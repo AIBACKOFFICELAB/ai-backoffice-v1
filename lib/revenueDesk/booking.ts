@@ -36,9 +36,9 @@ export interface BookingStore {
   findByIdempotencyKey(tenantId: string, key: string): Promise<Booking | null>;
   /** Throws SlotTakenError / CallAlreadyBookedError / BookingKeyConflictError on the DB unique guards. */
   insertPending(b: Omit<Booking, "id" | "providerEventId" | "status" | "failureCategory" | "updatedAt">): Promise<Booking>;
-  /** Atomically takes over an expired pending lease: succeeds only if the row is
-   * still pending with exactly `expectedUpdatedAt`; returns null if another request won. */
-  claimPending(tenantId: string, id: string, expectedUpdatedAt: string): Promise<Booking | null>;
+  /** Atomically takes over a pending row whose lease has expired by the
+   * DATABASE clock; returns null while the lease is live or if another request won. */
+  claimPending(tenantId: string, id: string, leaseSeconds: number): Promise<Booking | null>;
   update(tenantId: string, id: string, patch: Partial<Pick<Booking, "status" | "providerEventId" | "failureCategory">>): Promise<Booking>;
 }
 
@@ -46,7 +46,11 @@ export type BookingResult =
   | { confirmed: true; bookingId: string; providerEventId: string; start: string; end: string; timezone: string; deduped: boolean }
   | { confirmed: false; failure: CalendarFailure; bookingId: string | null; statusUnknown?: boolean; callAlreadyBooked?: boolean };
 
-/** A pending row younger than this is presumed in flight on another request. */
+/** Call escalation_reason recording that the owner must confirm an appointment
+ * the receptionist could not confirm (or rule out) during the call. */
+export const BOOKING_CONFIRMATION_FOLLOW_UP = "booking_pending_confirmation";
+
+/** A pending row younger than this (by the database clock) is presumed in flight on another request. */
 export const PENDING_LEASE_MS = 45_000;
 
 export function bookingIdempotencyKey(callId: string, start: string, durationMinutes: number) {
@@ -78,7 +82,7 @@ export async function bookAppointment(
 
   let booking = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
   if (booking) {
-    const resumed = await resumeExisting(deps, booking, start, end, now);
+    const resumed = await resumeExisting(deps, booking, start, end);
     if ("done" in resumed) return resumed.done;
     booking = resumed.claimed;
   } else {
@@ -91,7 +95,7 @@ export async function bookAppointment(
       // authoritative row; never take over a row another request just inserted.
       const winner = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
       if (winner) {
-        const resumed = await resumeExisting(deps, winner, start, end, now, false);
+        const resumed = await resumeExisting(deps, winner, start, end, false);
         return "done" in resumed ? resumed.done : pending(winner.id);
       }
       if (e instanceof SlotTakenError) return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: null };
@@ -137,16 +141,15 @@ export async function bookAppointment(
 /**
  * Answers a duplicate from the existing row. Final states are authoritative;
  * a pending row is confirmed only via the provider event carrying its AIBO id
- * (+ post-write verification). Otherwise it stays non-final, unless its lease
- * expired AND this request atomically claims it (then the caller writes once
- * more with the SAME booking id).
+ * (+ post-write verification). Otherwise it stays non-final, unless the
+ * database atomically grants this request its expired lease (then the caller
+ * writes once more with the SAME booking id). No application clock is consulted.
  */
 async function resumeExisting(
   deps: { store: BookingStore; calendar: CalendarProvider },
   booking: Booking,
   start: string,
   end: string,
-  now: Date,
   allowClaim = true
 ): Promise<{ done: BookingResult } | { claimed: Booking }> {
   if (booking.status === "confirmed") return { done: ok(booking, true) };
@@ -156,9 +159,9 @@ async function resumeExisting(
   const recovered = await safeFind(deps.calendar, booking.calendarId, booking.id, start, end);
   if (recovered === "error") return { done: pending(booking.id, "CALENDAR_UNAVAILABLE") };
   if (recovered) return { done: await finalize(deps, booking, recovered.eventId, start, end) };
-  if (!allowClaim || now.getTime() - Date.parse(booking.updatedAt) < PENDING_LEASE_MS) return { done: pending(booking.id) };
-  // Lease expired and provider has no event for this id -> exactly one request may retry with the SAME id.
-  const claimed = await deps.store.claimPending(booking.tenantId, booking.id, booking.updatedAt);
+  if (!allowClaim) return { done: pending(booking.id) };
+  // Provider has no event for this id: only a request the DB grants the expired lease may retry with the SAME id.
+  const claimed = await deps.store.claimPending(booking.tenantId, booking.id, PENDING_LEASE_MS / 1000);
   return claimed ? { claimed } : { done: pending(booking.id) };
 }
 

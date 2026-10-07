@@ -175,23 +175,85 @@ DESCRIBE("Revenue Desk concurrency (separate real transactions)", () => {
     }
   });
 
-  it("expired-lease claim is a real compare-and-set: of concurrent claimers on the same PostgREST-format updated_at, exactly one wins", async () => {
+  it("migration 027 lease RPC: of concurrent service-role claimers on an expired lease, exactly one wins (database clock only)", async () => {
     const pool = getPgTestPool();
     const tA = (await pool.query(`INSERT INTO public.tenants (name, slug) VALUES ('rd-conc4', $1) RETURNING id`, [`rd-${randomUUID()}`])).rows[0].id;
     try {
       const callId = (await pool.query(`INSERT INTO public.revenue_desk_calls (tenant_id, provider_call_id) VALUES ($1,'lease') RETURNING id`, [tA])).rows[0].id;
-      const b = (await pool.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone) VALUES ($1,$2,'lease-key','cal','2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC') RETURNING id, to_json(updated_at) #>> '{}' AS updated_at`, [tA, callId])).rows[0];
-      // Same predicate as store.server.ts claimPending (tenant, id, status pending, exact updated_at).
-      const results = await runConcurrently(Array.from({ length: 5 }, () => async (c: C) =>
-        (await c.query(`UPDATE public.revenue_desk_bookings SET updated_at = clock_timestamp() WHERE tenant_id=$1 AND id=$2 AND status='pending' AND updated_at=$3::timestamptz`, [tA, b.id, b.updated_at])).rowCount
-      ));
+      // Lease last written 10 minutes ago by the database.
+      const id = (await pool.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone, updated_at) VALUES ($1,$2,'lease-key','cal','2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC', now() - interval '10 minutes') RETURNING id`, [tA, callId])).rows[0].id;
+      const results = await runConcurrently(Array.from({ length: 6 }, () => async (c: C) => {
+        await c.query("BEGIN");
+        await c.query("SET LOCAL ROLE service_role");
+        const r = await c.query(`SELECT id FROM public.revenue_desk_claim_booking_lease($1, $2, 45)`, [tA, id]);
+        await c.query("COMMIT");
+        return r.rowCount;
+      }));
+      expect(results.every((r) => r.status === "fulfilled")).toBe(true);
       expect(results.map((r) => (r as any).value).filter((n) => n === 1)).toHaveLength(1);
-      // A settled (non-pending) row can never be claimed.
-      await pool.query(`UPDATE public.revenue_desk_bookings SET status='conflict' WHERE id=$1`, [b.id]);
-      const cur = (await pool.query(`SELECT to_json(updated_at) #>> '{}' AS u FROM public.revenue_desk_bookings WHERE id=$1`, [b.id])).rows[0].u;
-      expect((await pool.query(`UPDATE public.revenue_desk_bookings SET updated_at = now() WHERE tenant_id=$1 AND id=$2 AND status='pending' AND updated_at=$3::timestamptz`, [tA, b.id, cur])).rowCount).toBe(0);
+      // The winner's claim refreshed the lease with the DB clock: an immediate re-claim is refused.
+      expect((await pool.query(`SELECT * FROM public.revenue_desk_claim_booking_lease($1, $2, 45)`, [tA, id])).rowCount).toBe(0);
     } finally {
       await pool.query(`DELETE FROM public.tenants WHERE id=$1`, [tA]);
     }
   });
+});
+
+DESCRIBE("Revenue Desk booking lease (migration 027, real Postgres)", () => {
+  const claim = (c: C, t: string, id: string, secs = 45) => c.query(`SELECT * FROM public.revenue_desk_claim_booking_lease($1, $2, $3)`, [t, id, secs]);
+  async function pendingRow(c: C, t: string, ageSql = "0 seconds") {
+    const callId = await call(c, t);
+    return (await c.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone, updated_at) VALUES ($1,$2,$3,$3,'2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC', now() - $4::interval) RETURNING id`, [t, callId, randomUUID(), ageSql])).rows[0].id as string;
+  }
+
+  it("a fresh (DB-timestamped) pending lease cannot be claimed; an expired one can, once", () =>
+    withRollback(async (c) => {
+      const tA = await insertTenant(c);
+      await setRole(c, "service_role");
+      expect((await claim(c, tA, await pendingRow(c, tA))).rowCount).toBe(0);
+      const old = await pendingRow(c, tA, "1 minute");
+      expect((await claim(c, tA, old)).rowCount).toBe(1);
+      expect((await claim(c, tA, old)).rowCount).toBe(0);
+    }));
+
+  it("application-supplied updated_at is ignored: the trigger stamps the database clock, so app skew cannot expire or extend a lease", () =>
+    withRollback(async (c) => {
+      const tA = await insertTenant(c);
+      const id = await pendingRow(c, tA, "1 minute");
+      // An app clock far in the PAST would make the lease look expired forever...
+      await c.query(`UPDATE public.revenue_desk_bookings SET updated_at = '2000-01-01T00:00:00Z' WHERE id=$1`, [id]);
+      expect((await c.query(`SELECT updated_at = now() AS db FROM public.revenue_desk_bookings WHERE id=$1`, [id])).rows[0].db).toBe(true);
+      await setRole(c, "service_role");
+      expect((await claim(c, tA, id)).rowCount).toBe(0);
+      // ...and one far in the FUTURE would hold a dead lease forever.
+      const id2 = await pendingRow(c, tA, "1 minute");
+      await c.query(`SET LOCAL ROLE postgres`);
+      await c.query(`UPDATE public.revenue_desk_bookings SET failure_category = NULL, updated_at = '2999-01-01T00:00:00Z' WHERE id=$1`, [id2]);
+      expect((await c.query(`SELECT updated_at <= now() AS sane FROM public.revenue_desk_bookings WHERE id=$1`, [id2])).rows[0].sane).toBe(true);
+    }));
+
+  it("never claims another tenant's row, a settled row, or with an out-of-range lease", () =>
+    withRollback(async (c) => {
+      const tA = await insertTenant(c), tB = await insertTenant(c);
+      const old = await pendingRow(c, tA, "10 minutes");
+      const settled = (await c.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone, status, failure_category, updated_at) VALUES ($1,$2,$3,'cal','2026-10-13T14:00:00Z','2026-10-13T15:00:00Z','UTC','conflict','SLOT_UNAVAILABLE', now() - interval '10 minutes') RETURNING id`, [tA, await call(c, tA), randomUUID()])).rows[0].id;
+      await setRole(c, "service_role");
+      expect((await claim(c, tB, old)).rowCount).toBe(0);
+      expect((await claim(c, tA, settled)).rowCount).toBe(0);
+      expect((await claim(c, tA, old, 0)).rowCount).toBe(0);
+      expect((await claim(c, tA, old, 99999)).rowCount).toBe(0);
+      expect((await claim(c, tA, old)).rowCount).toBe(1);
+    }));
+
+  it("anon and authenticated cannot execute the lease RPC", () =>
+    withRollback(async (c) => {
+      const tA = await insertTenant(c); const uA = randomUUID(); await insertMembership(c, tA, uA);
+      const id = await pendingRow(c, tA, "10 minutes");
+      await c.query("SAVEPOINT sp");
+      await setRole(c, "authenticated", uA);
+      await expect(claim(c, tA, id)).rejects.toMatchObject({ code: "42501" });
+      await c.query("ROLLBACK TO SAVEPOINT sp");
+      await setRole(c, "anon");
+      await expect(claim(c, tA, id)).rejects.toMatchObject({ code: "42501" });
+    }));
 });

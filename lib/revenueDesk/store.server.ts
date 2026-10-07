@@ -127,19 +127,15 @@ export function createBookingStore(): BookingStore {
       if (guard) throw guard; // caller re-reads the authoritative row before answering
       throw new Error("booking persist failed");
     },
-    async claimPending(tenantId, id, expectedUpdatedAt) {
-      // Compare-and-set on the lease timestamp: at most one concurrent retry wins.
-      const { data, error } = await client
-        .from("revenue_desk_bookings")
-        .update({ updated_at: new Date().toISOString() })
-        .eq("tenant_id", tenantId).eq("id", id).eq("status", "pending").eq("updated_at", expectedUpdatedAt)
-        .select("*")
-        .maybeSingle();
+    async claimPending(tenantId, id, leaseSeconds) {
+      // Lease expiry is decided and taken atomically by Postgres (migration 027).
+      const { data, error } = await client.rpc("revenue_desk_claim_booking_lease", { p_tenant_id: tenantId, p_booking_id: id, p_lease_seconds: leaseSeconds });
       if (error) throw new Error("booking claim failed");
-      return data ? mapBooking(data) : null;
+      const row = Array.isArray(data) ? data[0] : data;
+      return row ? mapBooking(row) : null;
     },
     async update(tenantId, id, patch) {
-      const row: Record<string, unknown> = { updated_at: new Date().toISOString() };
+      const row: Record<string, unknown> = {}; // updated_at is set by Postgres (migration 027 trigger)
       if (patch.status !== undefined) row.status = patch.status;
       if (patch.providerEventId !== undefined) row.provider_event_id = patch.providerEventId;
       if (patch.failureCategory !== undefined) row.failure_category = patch.failureCategory;

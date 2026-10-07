@@ -1,4 +1,5 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { BOOKING_CONFIRMATION_FOLLOW_UP } from "./booking";
 
 export type CallSummaryRow = {
   id: string;
@@ -8,6 +9,7 @@ export type CallSummaryRow = {
   service_category: string | null;
   booking_outcome: string | null;
   escalation_result: string | null;
+  escalation_reason: string | null;
   duration_seconds: number | null;
   provider_cost_usd: number | string | null;
   failure_category: string | null;
@@ -42,6 +44,15 @@ export function summarizeCalls(rows: CallSummaryRow[]): RevenueDeskSummary {
   };
 }
 
+/** Pure: the owner action a call still carries, if any. The receptionist only
+ * promises a callback after this is durably recorded on the call. */
+export function ownerFollowUp(call: { escalation_reason: string | null }): { label: string; detail: string } | null {
+  if (call.escalation_reason === BOOKING_CONFIRMATION_FOLLOW_UP) {
+    return { label: "Call back to confirm booking", detail: "The appointment could not be confirmed during the call. The caller was told the team would call back to confirm it — check the booking attempts below, then call the customer." };
+  }
+  return null;
+}
+
 /** Founder-approved Founder Beta allowance (2026-10-06): 500 inbound minutes/month
  * included in $299/month. Metering + surfacing ONLY — no overage billing, no cutoff. */
 export const FOUNDER_BETA_INCLUDED_MINUTES = 500;
@@ -64,7 +75,7 @@ export function computeAllowance(rows: Array<Pick<CallSummaryRow, "created_at" |
   };
 }
 
-const SUMMARY_COLS = "id, created_at, status, priority, service_category, booking_outcome, escalation_result, duration_seconds, provider_cost_usd, failure_category, lead_id, intake";
+const SUMMARY_COLS = "id, created_at, status, priority, service_category, booking_outcome, escalation_result, escalation_reason, duration_seconds, provider_cost_usd, failure_category, lead_id, intake";
 
 /** Operator view: every tenant's month-to-date usage (service-role caller only). */
 export async function getAllowanceForTenant(tenantId: string) {
