@@ -6,7 +6,7 @@ import { createCanonicalLeadFromIntake } from "@/lib/leads/intake/service";
 import { createLiveIntakeDeps } from "@/lib/leads/intake/server";
 import type { Agent } from "@/lib/agents/types";
 import { parseRevenueDeskConfig, ConfigError } from "./config";
-import { CallAlreadyBookedError, SlotTakenError, type Booking, type BookingStore } from "./booking";
+import { bookingUniqueViolation, type Booking, type BookingStore } from "./booking";
 import type { CallPatch, CallRow, RevenueDeskStore } from "./service";
 import { revenueDeskAgentDefinition } from "./tools";
 
@@ -123,11 +123,20 @@ export function createBookingStore(): BookingStore {
         .select("*")
         .single();
       if (!error) return mapBooking(data);
-      if (error.code === "23505") {
-        if (/live_slot/.test(error.message)) throw new SlotTakenError();
-        if (/live_per_call/.test(error.message)) throw new CallAlreadyBookedError();
-      }
+      const guard = error.code === "23505" ? bookingUniqueViolation(error.message) : null;
+      if (guard) throw guard; // caller re-reads the authoritative row before answering
       throw new Error("booking persist failed");
+    },
+    async claimPending(tenantId, id, expectedUpdatedAt) {
+      // Compare-and-set on the lease timestamp: at most one concurrent retry wins.
+      const { data, error } = await client
+        .from("revenue_desk_bookings")
+        .update({ updated_at: new Date().toISOString() })
+        .eq("tenant_id", tenantId).eq("id", id).eq("status", "pending").eq("updated_at", expectedUpdatedAt)
+        .select("*")
+        .maybeSingle();
+      if (error) throw new Error("booking claim failed");
+      return data ? mapBooking(data) : null;
     },
     async update(tenantId, id, patch) {
       const row: Record<string, unknown> = { updated_at: new Date().toISOString() };

@@ -21,17 +21,30 @@ export type Booking = {
 
 export class SlotTakenError extends Error {}
 export class CallAlreadyBookedError extends Error {}
+/** Another request already inserted this exact idempotency key. */
+export class BookingKeyConflictError extends Error {}
+
+/** Maps a Postgres unique-violation message to the guard that fired. */
+export function bookingUniqueViolation(message: string): SlotTakenError | CallAlreadyBookedError | BookingKeyConflictError | null {
+  if (/live_slot/.test(message)) return new SlotTakenError();
+  if (/live_per_call/.test(message)) return new CallAlreadyBookedError();
+  if (/idempotency_key/.test(message)) return new BookingKeyConflictError();
+  return null;
+}
 
 export interface BookingStore {
   findByIdempotencyKey(tenantId: string, key: string): Promise<Booking | null>;
-  /** Throws SlotTakenError / CallAlreadyBookedError on the DB live-booking guards. */
+  /** Throws SlotTakenError / CallAlreadyBookedError / BookingKeyConflictError on the DB unique guards. */
   insertPending(b: Omit<Booking, "id" | "providerEventId" | "status" | "failureCategory" | "updatedAt">): Promise<Booking>;
+  /** Atomically takes over an expired pending lease: succeeds only if the row is
+   * still pending with exactly `expectedUpdatedAt`; returns null if another request won. */
+  claimPending(tenantId: string, id: string, expectedUpdatedAt: string): Promise<Booking | null>;
   update(tenantId: string, id: string, patch: Partial<Pick<Booking, "status" | "providerEventId" | "failureCategory">>): Promise<Booking>;
 }
 
 export type BookingResult =
   | { confirmed: true; bookingId: string; providerEventId: string; start: string; end: string; timezone: string; deduped: boolean }
-  | { confirmed: false; failure: CalendarFailure; bookingId: string | null; statusUnknown?: boolean };
+  | { confirmed: false; failure: CalendarFailure; bookingId: string | null; statusUnknown?: boolean; callAlreadyBooked?: boolean };
 
 /** A pending row younger than this is presumed in flight on another request. */
 export const PENDING_LEASE_MS = 45_000;
@@ -65,24 +78,25 @@ export async function bookAppointment(
 
   let booking = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
   if (booking) {
-    if (booking.status === "confirmed") return ok(booking, true);
-    if (booking.status === "conflict") return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id };
-    if (booking.status === "failed" || booking.status === "cancelled") return { confirmed: false, failure: (booking.failureCategory as CalendarFailure) ?? "PROVIDER_ERROR", bookingId: booking.id };
-    // pending: maybe the provider already created it before we recorded success.
-    const recovered = await safeFind(deps.calendar, calendarId, booking.id, start, end);
-    if (recovered === "error") return { confirmed: false, failure: "CALENDAR_UNAVAILABLE", bookingId: booking.id, statusUnknown: true };
-    if (recovered) return finalize(deps, booking, recovered.eventId, start, end);
-    if (now.getTime() - Date.parse(booking.updatedAt) < PENDING_LEASE_MS) {
-      return { confirmed: false, failure: "PROVIDER_ERROR", bookingId: booking.id, statusUnknown: true };
-    }
-    // Lease expired and provider has no event for this id -> safe to attempt once more with the SAME id.
+    const resumed = await resumeExisting(deps, booking, start, end, now);
+    if ("done" in resumed) return resumed.done;
+    booking = resumed.claimed;
   } else {
     try {
       booking = await deps.store.insertPending({ tenantId: cfg.tenantId, callId: req.callId, leadId: req.leadId, idempotencyKey: key, calendarId, start, end, timezone: cfg.timezone });
     } catch (e) {
+      if (!(e instanceof SlotTakenError || e instanceof CallAlreadyBookedError || e instanceof BookingKeyConflictError)) throw e;
+      // A concurrent duplicate of THIS request may own the appointment (Postgres
+      // may report any of the three unique guards). Answer from the
+      // authoritative row; never take over a row another request just inserted.
+      const winner = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
+      if (winner) {
+        const resumed = await resumeExisting(deps, winner, start, end, now, false);
+        return "done" in resumed ? resumed.done : pending(winner.id);
+      }
       if (e instanceof SlotTakenError) return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: null };
-      if (e instanceof CallAlreadyBookedError) return { confirmed: false, failure: "INVALID_REQUEST", bookingId: null };
-      throw e;
+      if (e instanceof CallAlreadyBookedError) return { confirmed: false, failure: "INVALID_REQUEST", bookingId: null, callAlreadyBooked: true };
+      return pending(null);
     }
   }
 
@@ -118,6 +132,39 @@ export async function bookAppointment(
     }
   }
   return finalize(deps, booking, eventId, start, end);
+}
+
+/**
+ * Answers a duplicate from the existing row. Final states are authoritative;
+ * a pending row is confirmed only via the provider event carrying its AIBO id
+ * (+ post-write verification). Otherwise it stays non-final, unless its lease
+ * expired AND this request atomically claims it (then the caller writes once
+ * more with the SAME booking id).
+ */
+async function resumeExisting(
+  deps: { store: BookingStore; calendar: CalendarProvider },
+  booking: Booking,
+  start: string,
+  end: string,
+  now: Date,
+  allowClaim = true
+): Promise<{ done: BookingResult } | { claimed: Booking }> {
+  if (booking.status === "confirmed") return { done: ok(booking, true) };
+  if (booking.status === "conflict") return { done: { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id } };
+  if (booking.status === "failed" || booking.status === "cancelled") return { done: { confirmed: false, failure: (booking.failureCategory as CalendarFailure) ?? "PROVIDER_ERROR", bookingId: booking.id } };
+  // pending: maybe the provider already created it before we recorded success.
+  const recovered = await safeFind(deps.calendar, booking.calendarId, booking.id, start, end);
+  if (recovered === "error") return { done: pending(booking.id, "CALENDAR_UNAVAILABLE") };
+  if (recovered) return { done: await finalize(deps, booking, recovered.eventId, start, end) };
+  if (!allowClaim || now.getTime() - Date.parse(booking.updatedAt) < PENDING_LEASE_MS) return { done: pending(booking.id) };
+  // Lease expired and provider has no event for this id -> exactly one request may retry with the SAME id.
+  const claimed = await deps.store.claimPending(booking.tenantId, booking.id, booking.updatedAt);
+  return claimed ? { claimed } : { done: pending(booking.id) };
+}
+
+/** Indeterminate: neither success nor failure is established. */
+function pending(bookingId: string | null, failure: CalendarFailure = "PROVIDER_ERROR"): BookingResult {
+  return { confirmed: false, failure, bookingId, statusUnknown: true };
 }
 
 /** 3. post-write verification: any OTHER overlapping event -> remove ours, report conflict. */

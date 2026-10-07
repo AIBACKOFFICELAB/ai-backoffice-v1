@@ -38,6 +38,10 @@ export type RevenueDeskConfig = {
   calendarId: string | null;
   escalationPhone: string | null;
   faqs: Array<{ q: string; a: string }>;
+  /** Founder-configured SAVED Vapi assistant. Its server URL + credentialId
+   * (and its saved tools') carry the HMAC credential; a transient assistant
+   * or server override would be sent WITHOUT it. */
+  vapiAssistantId: string | null;
 };
 
 export const DEFAULT_URGENCY_RULES: UrgencyRules = {
@@ -62,6 +66,7 @@ export class ConfigError extends Error {}
 
 const HHMM = /^([01]\d|2[0-3]):[0-5]\d$/;
 const E164 = /^\+[1-9]\d{6,14}$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function isValidTimeZone(tz: string): boolean {
   try {
@@ -110,6 +115,9 @@ export function parseRevenueDeskConfig(row: Record<string, any>, businessName: s
   const escalationPhone = row.escalation_phone ? String(row.escalation_phone) : null;
   if (escalationPhone && !E164.test(escalationPhone)) throw new ConfigError("escalation phone must be E.164");
 
+  const vapiAssistantId = row.vapi_assistant_id ? String(row.vapi_assistant_id).trim() : null;
+  if (vapiAssistantId && !UUID.test(vapiAssistantId)) throw new ConfigError("vapi assistant id must be a Vapi assistant UUID");
+
   const zips = strArray(row.service_area?.zips);
   const faqs = Array.isArray(row.faqs)
     ? row.faqs.filter((f: any) => typeof f?.q === "string" && typeof f?.a === "string").map((f: any) => ({ q: f.q, a: f.a }))
@@ -133,6 +141,7 @@ export function parseRevenueDeskConfig(row: Record<string, any>, businessName: s
     calendarId: row.calendar_id ? String(row.calendar_id) : null,
     escalationPhone,
     faqs,
+    vapiAssistantId,
   };
 }
 

@@ -112,8 +112,8 @@ export async function handleToolCall(
   providerToolCallId?: string
 ): Promise<ToolResponse> {
   const audit: { agentId: string | null } = { agentId: null };
-  const response = await executeTool(deps, ctx, toolName, rawArgs, audit);
-  const outcome = response.ok ? "succeeded" : response.reason === "policy_denied" || response.reason === "agent_not_registered" || response.reason === "unknown_tool" ? "refused" : response.error === "INVALID_REQUEST" ? "invalid_input" : "failed";
+  const response = await executeTool(deps, ctx, toolName, rawArgs, audit, providerToolCallId);
+  const outcome = response.ok ? "succeeded" : response.outcome === "pending_confirmation" ? "pending_confirmation" : response.reason === "policy_denied" || response.reason === "agent_not_registered" || response.reason === "unknown_tool" ? "refused" : response.error === "INVALID_REQUEST" ? "invalid_input" : "failed";
   const failure = response.ok ? null : String(response.error ?? response.reason ?? "UNKNOWN").slice(0, 64);
   const known = toolName in REVENUE_DESK_TOOLS;
   await safeEmit(deps, ctx.config.tenantId, "revenue_desk.tool_attempted", ctx.call.id, `rd:${ctx.call.id}:tool:${providerToolCallId ?? randomUUID()}`, {
@@ -133,7 +133,8 @@ async function executeTool(
   ctx: { config: RevenueDeskConfig; call: CallRow },
   toolName: string,
   rawArgs: unknown,
-  audit: { agentId: string | null }
+  audit: { agentId: string | null },
+  providerToolCallId?: string
 ): Promise<ToolResponse> {
   const tool = REVENUE_DESK_TOOLS[toolName as RevenueDeskToolName];
   if (!tool) return escalate("unknown_tool");
@@ -155,7 +156,7 @@ async function executeTool(
       case "revenue_desk_classify_urgency":
         return classify(ctx);
       case "revenue_desk_check_availability":
-        return await checkAvailability(deps, ctx, (parsed.value as { preferredDate: string | null }).preferredDate);
+        return await checkAvailability(deps, ctx, (parsed.value as { preferredDate: string | null }).preferredDate, providerToolCallId);
       case "revenue_desk_book_appointment":
         return await book(deps, ctx, parsed.value as { slotStart: string; durationMinutes: number; callerConfirmed: boolean });
       case "revenue_desk_get_escalation_route":
@@ -209,7 +210,7 @@ function classify(ctx: { config: RevenueDeskConfig; call: CallRow }): ToolRespon
   return { ok: true, priority: d.priority, requiredAction: d.requiredAction, reasons: d.reasons };
 }
 
-async function checkAvailability(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }, preferredDate: string | null): Promise<ToolResponse> {
+async function checkAvailability(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }, preferredDate: string | null, providerToolCallId?: string): Promise<ToolResponse> {
   const { config, call } = ctx;
   if (!call.intake) return { ok: false, error: "INTAKE_REQUIRED", instruction: "Capture intake first." };
   const d = decide(config, call.intake);
@@ -227,17 +228,19 @@ async function checkAvailability(deps: RevenueDeskDeps, ctx: { config: RevenueDe
   const timeMin = from.toISOString();
   const timeMax = new Date(from.getTime() + days * 86400000).toISOString();
   const duration = durationFor(config, call.intake.serviceCategory ?? "");
+  // A provider redelivery of the same tool call audits once; a new check is a new toolCallId.
+  const attempt = providerToolCallId ?? String(now.getTime());
   try {
     const busy = await deps.calendar.getBusy(config.calendarId!, timeMin, timeMax);
     const slots = generateSlots(config, { now: from.getTime() > now.getTime() ? new Date(from.getTime()) : now, durationMinutes: duration, busy, days, maxSlots: 3 }).filter((s) => Date.parse(s.start) > now.getTime());
     await deps.store.updateCall(config.tenantId, call.id, { availabilityCheckedAt: now.toISOString(), ...(slots.length === 0 ? { bookingOutcome: "unavailable" as const } : {}) });
-    await safeEmit(deps, config.tenantId, "revenue_desk.availability_checked", call.id, `rd:${call.id}:availability:${now.getTime()}`, { callId: call.id, slotCount: slots.length });
+    await safeEmit(deps, config.tenantId, "revenue_desk.availability_checked", call.id, `rd:${call.id}:availability:${attempt}`, { callId: call.id, slotCount: slots.length });
     if (slots.length === 0) return { ok: true, slots: [], instruction: "No open times were found. Offer to have the team call back; do not invent a time." };
     return { ok: true, slots: slots.map((s) => ({ slotStart: s.start, end: s.end, timezone: s.timezone, durationMinutes: s.durationMinutes, local: localLabel(s.start, s.timezone) })) };
   } catch (e) {
     const cat = e instanceof CalendarError ? e.category : "CALENDAR_UNAVAILABLE";
     await deps.store.updateCall(config.tenantId, call.id, { failureCategory: cat, bookingOutcome: "unavailable" });
-    await safeEmit(deps, config.tenantId, "revenue_desk.availability_checked", call.id, `rd:${call.id}:availability-failed:${now.getTime()}`, { callId: call.id, slotCount: 0, failureCategory: cat });
+    await safeEmit(deps, config.tenantId, "revenue_desk.availability_checked", call.id, `rd:${call.id}:availability-failed:${attempt}`, { callId: call.id, slotCount: 0, failureCategory: cat });
     return { ok: false, error: cat, requiredAction: "escalate", instruction: "The schedule could not be checked. Do not offer a time. Offer a transfer or a team callback." };
   }
 }
@@ -261,8 +264,25 @@ async function book(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; cal
     await safeEmit(deps, config.tenantId, "revenue_desk.booking_confirmed", call.id, `rd:booking:${result.bookingId}:confirmed`, { callId: call.id, bookingId: result.bookingId, leadId: call.leadId, providerEventPresent: true, deduped: result.deduped });
     return { ok: true, booked: true, bookingId: result.bookingId, start: result.start, end: result.end, timezone: result.timezone, local: localLabel(result.start, result.timezone), instruction: "The calendar confirmed this appointment. You may tell the caller it is booked." };
   }
+  if (result.statusUnknown) {
+    // Non-final: a concurrent/in-flight attempt may have created this exact
+    // appointment. Record nothing as failed (the winner may already have marked
+    // the call booked) and never let the assistant claim either outcome. The
+    // per-attempt tool audit records BOOKING_PENDING_CONFIRMATION.
+    return {
+      ok: false,
+      booked: false,
+      outcome: "pending_confirmation",
+      error: "BOOKING_PENDING_CONFIRMATION",
+      requiredAction: "offer_callback",
+      instruction: "This appointment is NOT confirmed yet, and it has NOT failed. Do not say it is booked and do not say it failed. Do not try to book again or offer another time. Tell the caller the team will call them back to confirm the appointment.",
+    };
+  }
+  if (result.callAlreadyBooked) {
+    return { ok: false, booked: false, error: "CALL_ALREADY_HAS_BOOKING", instruction: "This call already has an appointment booked or being confirmed. Do not book another. If the caller wants to change it, offer a team callback." };
+  }
   const outcome = result.failure === "SLOT_UNAVAILABLE" ? "conflict" : "failed";
-  await deps.store.updateCall(config.tenantId, call.id, { bookingOutcome: outcome, failureCategory: result.statusUnknown ? "BOOKING_STATUS_UNKNOWN" : result.failure });
+  await deps.store.updateCall(config.tenantId, call.id, { bookingOutcome: outcome, failureCategory: result.failure });
   await safeEmit(deps, config.tenantId, "revenue_desk.booking_failed", call.id, `rd:${call.id}:book-fail:${input.slotStart}:${result.failure}`, { callId: call.id, bookingId: result.bookingId, failureCategory: result.failure });
   return {
     ok: false,

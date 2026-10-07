@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import { parseRevenueDeskConfig, ConfigError, type RevenueDeskConfig } from "./config";
 import { classifyUrgency } from "./urgency";
 import { generateSlots, isSlotWithinPolicy, zonedToUtc } from "./slots";
-import { bookAppointment, bookingIdempotencyKey, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
+import { bookAppointment, bookingIdempotencyKey, bookingUniqueViolation, BookingKeyConflictError, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
 import { CalendarError, type CalendarProvider, type ProviderEvent } from "./calendar/types";
 import { handleToolCall, startOrResumeCall, completeCall, type CallRow, type RevenueDeskStore, type RevenueDeskDeps } from "./service";
 import { revenueDeskAgentDefinition, REVENUE_DESK_TOOLS } from "./tools";
@@ -24,6 +24,8 @@ vi.mock("@/lib/supabase/server", () => ({ createServerSupabaseClient: async () =
 const TZ = "America/New_York";
 const T_A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const T_B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const ASST_A = "11111111-1111-4111-8111-111111111111";
+const ASST_B = "22222222-2222-4222-8222-222222222222";
 
 function row(over: Record<string, any> = {}) {
   return {
@@ -41,6 +43,7 @@ function row(over: Record<string, any> = {}) {
     calendar_id: "cal-a@group.calendar.google.com",
     escalation_phone: "+13055550100",
     faqs: [],
+    vapi_assistant_id: ASST_A,
     ...over,
   };
 }
@@ -57,6 +60,8 @@ class FakeCalendar implements CalendarProvider {
   failCreateAfterWrite = false; // provider accepted but response lost
   failCreateBeforeWrite = false;
   injectCompetitorOnCreate = false;
+  /** Holds createEvent open (provider write in flight) until released. */
+  createGate: Promise<void> | null = null;
   calls = { getBusy: 0, create: 0, find: 0, delete: 0 };
   async getBusy(calendarId: string, timeMin: string, timeMax: string) {
     this.calls.getBusy++;
@@ -66,6 +71,7 @@ class FakeCalendar implements CalendarProvider {
   }
   async createEvent(calendarId: string, i: { aiboBookingId: string; start: string; end: string }) {
     this.calls.create++;
+    if (this.createGate) await this.createGate;
     if (this.failCreateBeforeWrite) throw new CalendarError("PROVIDER_ERROR");
     const ev = { calendarId, eventId: `ev-${this.calls.create}`, start: i.start, end: i.end, aiboBookingId: i.aiboBookingId };
     this.events.push(ev);
@@ -88,20 +94,35 @@ class FakeCalendar implements CalendarProvider {
 
 class FakeBookingStore implements BookingStore {
   rows: Booking[] = [];
+  /** Postgres may report ANY violated unique guard for a concurrent duplicate. */
+  duplicateReportsAs: "per_call" | "slot" | "key" = "per_call";
+  constructor(public clock: () => Date = () => new Date()) {}
   async findByIdempotencyKey(tenantId: string, key: string) {
-    return this.rows.find((r) => r.tenantId === tenantId && r.idempotencyKey === key) ?? null;
+    const r = this.rows.find((r) => r.tenantId === tenantId && r.idempotencyKey === key);
+    return r ? { ...r } : null; // a snapshot, like a real DB read
   }
   async insertPending(b: Omit<Booking, "id" | "providerEventId" | "status" | "failureCategory" | "updatedAt">) {
     const live = this.rows.filter((r) => r.tenantId === b.tenantId && (r.status === "pending" || r.status === "confirmed"));
+    if (this.rows.some((r) => r.tenantId === b.tenantId && r.idempotencyKey === b.idempotencyKey)) {
+      throw this.duplicateReportsAs === "key" ? new BookingKeyConflictError() : this.duplicateReportsAs === "slot" && live.length ? new SlotTakenError() : live.length ? new CallAlreadyBookedError() : new BookingKeyConflictError();
+    }
     if (live.some((r) => r.callId === b.callId)) throw new CallAlreadyBookedError();
     if (live.some((r) => r.calendarId === b.calendarId && r.start === b.start)) throw new SlotTakenError();
-    const r: Booking = { ...b, id: randomUUID(), providerEventId: null, status: "pending", failureCategory: null, updatedAt: new Date().toISOString() };
+    const r: Booking = { ...b, id: randomUUID(), providerEventId: null, status: "pending", failureCategory: null, updatedAt: this.clock().toISOString() };
     this.rows.push(r);
     return r;
   }
+  claims = 0;
+  async claimPending(tenantId: string, id: string, expectedUpdatedAt: string) {
+    const r = this.rows.find((x) => x.tenantId === tenantId && x.id === id);
+    if (!r || r.status !== "pending" || r.updatedAt !== expectedUpdatedAt) return null;
+    this.claims++;
+    r.updatedAt = new Date(Date.parse(expectedUpdatedAt) + 1).toISOString();
+    return { ...r };
+  }
   async update(tenantId: string, id: string, patch: Partial<Booking>) {
     const r = this.rows.find((x) => x.tenantId === tenantId && x.id === id)!;
-    Object.assign(r, patch, { updatedAt: new Date().toISOString() });
+    Object.assign(r, patch, { updatedAt: this.clock().toISOString() });
     return r;
   }
 }
@@ -158,13 +179,13 @@ class FakeStore implements RevenueDeskStore {
 function world(now = MON_6AM) {
   const store = new FakeStore();
   const a = cfgA();
-  const b = parseRevenueDeskConfig(row({ tenant_id: T_B, calendar_id: "cal-b@group.calendar.google.com", escalation_phone: "+13055550199" }), "Bravo HVAC");
+  const b = parseRevenueDeskConfig(row({ tenant_id: T_B, calendar_id: "cal-b@group.calendar.google.com", escalation_phone: "+13055550199", vapi_assistant_id: ASST_B }), "Bravo HVAC");
   store.configs.set("pn-A", a);
   store.configs.set("pn-B", b);
   store.agents.set(T_A, agentFor(T_A));
   store.agents.set(T_B, agentFor(T_B));
   const calendar = new FakeCalendar();
-  const bookings = new FakeBookingStore();
+  const bookings = new FakeBookingStore(() => now);
   const deps: RevenueDeskDeps = { store, calendar, bookings, now: () => now };
   return { store, calendar, bookings, deps };
 }
@@ -188,6 +209,15 @@ async function startCall(deps: RevenueDeskDeps, pn = "pn-A", providerCallId = "v
 }
 
 // ================================================================= tests
+
+describe("config — saved Vapi assistant", () => {
+  it("parses a saved assistant UUID, allows none, and rejects malformed ids as CONFIGURATION_ERROR", () => {
+    expect(cfgA().vapiAssistantId).toBe(ASST_A);
+    expect(cfgA({ vapi_assistant_id: null }).vapiAssistantId).toBeNull();
+    expect(() => cfgA({ vapi_assistant_id: "asst; drop" })).toThrow(ConfigError);
+    expect(() => cfgA({ vapi_assistant_id: "https://evil.example/assistant" })).toThrow(ConfigError);
+  });
+});
 
 describe("config", () => {
   it("parses a valid config and always forces safety signals to escalate", () => {
@@ -625,6 +655,45 @@ describe("Vapi adapter", () => {
     const unknown = await handleVapiRequest(signed({ message: { type: "assistant-request", call: { ...call, phoneNumberId: "pn-zzz" } } }), deps, secret);
     expect(JSON.stringify(unknown.body)).not.toMatch(/Acme|Bravo/);
   });
+  it("assistant-request selects the tenant's SAVED assistant by trusted phone-number id (Vapi documented form)", async () => {
+    const { deps } = world();
+    const a = await handleVapiRequest(signed({ message: { type: "assistant-request", call } }), deps, secret);
+    expect(a.status).toBe(200);
+    expect(a.body).toEqual({
+      assistantId: ASST_A,
+      assistantOverrides: { firstMessage: expect.stringContaining("Acme Plumbing"), variableValues: { businessName: "Acme Plumbing", serviceCategories: "Water Heater, Drain Cleaning, Leak Detection", bookingAvailable: true, faqs: "[]" } },
+    });
+    const b = await handleVapiRequest(signed({ message: { type: "assistant-request", call: { ...call, id: "vapi-call-b", phoneNumberId: "pn-B" } } }), deps, secret);
+    expect((b.body as any).assistantId).toBe(ASST_B);
+  });
+  it("assistant-request ignores model/payload-supplied tenant, assistant, server and destination fields", async () => {
+    const { deps, store } = world();
+    const forged = { message: { type: "assistant-request", tenantId: T_B, assistantId: ASST_B, assistant: { serverUrl: "https://evil.example" }, destination: { number: "+19990000000" }, call: { ...call, tenantId: T_B, assistantId: ASST_B, metadata: { tenantId: T_B } } } };
+    const r = await handleVapiRequest(signed(forged), deps, secret);
+    expect((r.body as any).assistantId).toBe(ASST_A);
+    expect(JSON.stringify(r.body)).not.toMatch(/Bravo|evil|\+1999/);
+    expect(store.calls.every((c) => c.tenantId === T_A)).toBe(true);
+  });
+  it("assistant-request overrides never replace the saved assistant's server, credential, model or tools", async () => {
+    const { deps } = world();
+    const r = await handleVapiRequest(signed({ message: { type: "assistant-request", call } }), deps, secret);
+    expect(Object.keys(r.body).sort()).toEqual(["assistantId", "assistantOverrides"]);
+    expect(Object.keys((r.body as any).assistantOverrides).sort()).toEqual(["firstMessage", "variableValues"]);
+    expect(JSON.stringify(r.body)).not.toMatch(/server|credential|model|tools|transfer|"assistant"|\+1305555/i);
+  });
+  it("assistant-request fails closed (Vapi `error` form) for unknown, disabled, assistant-less or number-less requests", async () => {
+    const { deps, store } = world();
+    store.configs.set("pn-off", cfgA({ enabled: false }));
+    store.configs.set("pn-noasst", cfgA({ vapi_assistant_id: null }));
+    for (const pn of ["pn-zzz", "pn-off", "pn-noasst"]) {
+      const r = await handleVapiRequest(signed({ message: { type: "assistant-request", call: { ...call, id: `c-${pn}`, phoneNumberId: pn } } }), deps, secret);
+      expect(r.status).toBe(200);
+      expect(Object.keys(r.body)).toEqual(["error"]);
+      expect(JSON.stringify(r.body)).not.toMatch(/Acme|Bravo|assistantId/);
+    }
+    const missingNumber = await handleVapiRequest(signed({ message: { type: "assistant-request", call: { id: "c-none" } } }), deps, secret);
+    expect(Object.keys(missingNumber.body)).toEqual(["error"]);
+  });
   it("transfer-destination comes from tenant config, never from the payload", async () => {
     const { deps } = world();
     const r = await handleVapiRequest(signed({ message: { type: "transfer-destination-request", call, destination: { number: "+19990000000" } } }), deps, secret);
@@ -636,6 +705,302 @@ describe("Vapi adapter", () => {
     const results = (r.body as any).results;
     expect(results[0].toolCallId).toBe("t1");
     expect(JSON.parse(results[0].result)).toMatchObject({ ok: true, saved: true });
+  });
+});
+
+describe("Vapi retry / replay inside the signature window (durable idempotency, not request rejection)", () => {
+  const secret = "s";
+  const call = { id: "vapi-call-r", phoneNumberId: "pn-A", customer: { number: "+13055551234" } };
+  function signed(payload: unknown) {
+    const body = JSON.stringify(payload);
+    const ts = String(Math.floor(Date.now() / 1000));
+    const sig = createHmac("sha256", secret).update(`${ts}.${body}`).digest("hex");
+    const h: Record<string, string> = { "x-vapi-timestamp": ts, "x-vapi-signature": sig };
+    return { body, contentType: "application/json", headers: { get: (n: string) => h[n.toLowerCase()] ?? null } };
+  }
+  const toolReq = (id: string, name: string, args: unknown) => signed({ message: { type: "tool-calls", call, toolCallList: [{ id, function: { name, arguments: args } }] } });
+  const result = (r: { body: Record<string, unknown> }) => JSON.parse((r.body as any).results[0].result);
+
+  it("byte-identical redelivery of every message type is accepted and produces no duplicate business effect", async () => {
+    const { deps, store, bookings, calendar } = world();
+    const assistant = signed({ message: { type: "assistant-request", call } });
+    const a1 = await handleVapiRequest(assistant, deps, secret);
+    const a2 = await handleVapiRequest(assistant, deps, secret);
+    expect(a2).toEqual(a1);
+
+    const intake = toolReq("t-intake", "revenue_desk_capture_intake", intakeArgs());
+    expect(result(await handleVapiRequest(intake, deps, secret))).toMatchObject({ ok: true, saved: true });
+    expect(result(await handleVapiRequest(intake, deps, secret))).toMatchObject({ ok: true, saved: true });
+
+    const slots = result(await handleVapiRequest(toolReq("t-avail", "revenue_desk_check_availability", {}), deps, secret)).slots;
+    const book = toolReq("t-book", "revenue_desk_book_appointment", { slotStart: slots[0].slotStart, durationMinutes: slots[0].durationMinutes, callerConfirmed: true });
+    const b1 = result(await handleVapiRequest(book, deps, secret));
+    const b2 = result(await handleVapiRequest(book, deps, secret));
+    expect(b1).toMatchObject({ ok: true, booked: true });
+    expect(b2).toMatchObject({ ok: true, booked: true, bookingId: b1.bookingId });
+
+    const esc = toolReq("t-esc", "revenue_desk_get_escalation_route", { reason: "caller_requests_human" });
+    await handleVapiRequest(esc, deps, secret);
+    await handleVapiRequest(esc, deps, secret);
+    const transfer = signed({ message: { type: "transfer-destination-request", call } });
+    expect((await handleVapiRequest(transfer, deps, secret)).body).toEqual((await handleVapiRequest(transfer, deps, secret)).body);
+    const end = signed({ message: { type: "end-of-call-report", call, endedReason: "customer-ended-call", durationSeconds: 120 } });
+    expect((await handleVapiRequest(end, deps, secret)).status).toBe(200);
+    expect((await handleVapiRequest(end, deps, secret)).status).toBe(200);
+
+    expect(store.calls).toHaveLength(1);
+    expect(store.leads).toHaveLength(1);
+    expect(bookings.rows).toHaveLength(1);
+    expect(calendar.events).toHaveLength(1);
+    const count = (t: string) => store.events.filter((e) => e.eventType === t).length;
+    expect(count("revenue_desk.call_started")).toBe(1);
+    expect(count("revenue_desk.intake_captured")).toBe(1);
+    expect(count("revenue_desk.booking_confirmed")).toBe(1);
+    expect(count("revenue_desk.escalation_requested")).toBe(1);
+    expect(count("revenue_desk.call_completed")).toBe(1);
+    // One audit row per provider toolCallId, not per delivery.
+    expect(count("revenue_desk.tool_attempted")).toBe(4);
+  });
+
+  it("concurrent duplicate booking delivery never creates a second booking row or calendar event", async () => {
+    const { deps, bookings, calendar } = world();
+    await handleVapiRequest(toolReq("t-intake", "revenue_desk_capture_intake", intakeArgs()), deps, secret);
+    const slots = result(await handleVapiRequest(toolReq("t-avail", "revenue_desk_check_availability", {}), deps, secret)).slots;
+    const book = toolReq("t-book", "revenue_desk_book_appointment", { slotStart: slots[0].slotStart, durationMinutes: slots[0].durationMinutes, callerConfirmed: true });
+    const rs = (await Promise.all([handleVapiRequest(book, deps, secret), handleVapiRequest(book, deps, secret)])).map(result);
+    expect(rs.filter((r) => r.booked === true).length).toBeGreaterThanOrEqual(1);
+    // The other delivery is either the deduped confirmation or explicitly non-final — never a definitive failure.
+    for (const r of rs) expect(r.booked === true || r.outcome === "pending_confirmation").toBe(true);
+    expect(bookings.rows.filter((b) => b.status === "confirmed")).toHaveLength(1);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("a NEW toolCallId with a different slot after a confirmed booking is refused, not double-booked", async () => {
+    const { deps, bookings, calendar } = world();
+    await handleVapiRequest(toolReq("t-intake", "revenue_desk_capture_intake", intakeArgs()), deps, secret);
+    const slots = result(await handleVapiRequest(toolReq("t-avail", "revenue_desk_check_availability", {}), deps, secret)).slots;
+    await handleVapiRequest(toolReq("t-book-1", "revenue_desk_book_appointment", { slotStart: slots[0].slotStart, durationMinutes: slots[0].durationMinutes, callerConfirmed: true }), deps, secret);
+    const second = result(await handleVapiRequest(toolReq("t-book-2", "revenue_desk_book_appointment", { slotStart: slots[1].slotStart, durationMinutes: slots[1].durationMinutes, callerConfirmed: true }), deps, secret));
+    expect(second).toMatchObject({ ok: false, booked: false });
+    expect(bookings.rows).toHaveLength(1);
+    expect(calendar.events).toHaveLength(1);
+  });
+});
+
+describe("booking reliability under concurrent / indeterminate duplicates", () => {
+  const SLOT = "2026-10-12T14:00:00Z";
+  const req = (over: Record<string, any> = {}) => ({ cfg: cfgA(), callId: "call-1", leadId: "lead-1", start: SLOT, durationMinutes: 60, callerConfirmed: true, summary: "x", ...over });
+  const gate = () => { let release!: () => void; const p = new Promise<void>((r) => (release = r)); return { p, release }; };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  const NOT_FINAL = { confirmed: false, statusUnknown: true };
+  /** The insert race: this request's first lookup misses, so its insert collides and it must re-read. */
+  const racing = (store: FakeBookingStore): BookingStore => ({
+    findByIdempotencyKey: vi.fn().mockResolvedValueOnce(null).mockImplementation((t: string, k: string) => store.findByIdempotencyKey(t, k)),
+    insertPending: (b) => store.insertPending(b),
+    claimPending: (t, id, u) => store.claimPending(t, id, u),
+    update: (t, id, p) => store.update(t, id, p),
+  });
+
+  it("maps real Postgres unique-violation messages to the guard that fired", () => {
+    expect(bookingUniqueViolation('duplicate key value violates unique constraint "uq_rd_bookings_live_slot"')).toBeInstanceOf(SlotTakenError);
+    expect(bookingUniqueViolation('duplicate key value violates unique constraint "uq_rd_bookings_live_per_call"')).toBeInstanceOf(CallAlreadyBookedError);
+    expect(bookingUniqueViolation('duplicate key value violates unique constraint "revenue_desk_bookings_tenant_id_idempotency_key_key"')).toBeInstanceOf(BookingKeyConflictError);
+    expect(bookingUniqueViolation('duplicate key value violates unique constraint "something_else"')).toBeNull();
+  });
+
+  for (const reportsAs of ["key", "per_call", "slot"] as const) {
+    it(`concurrent identical requests (Postgres reports ${reportsAs}): loser re-reads the authoritative row, is non-final while in flight, one event total`, async () => {
+      const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+      store.duplicateReportsAs = reportsAs;
+      const deps = { calendar, store, now: () => MON_6AM };
+      const g = gate();
+      calendar.createGate = g.p;
+      const first = bookAppointment(deps, req());
+      await tick(); // winner has inserted pending and is waiting on the provider write
+      const dup = await bookAppointment({ ...deps, store: racing(store) }, req());
+      expect(dup).toMatchObject({ ...NOT_FINAL, bookingId: store.rows[0].id });
+      g.release();
+      expect(await first).toMatchObject({ confirmed: true });
+      expect(calendar.calls.create).toBe(1);
+      expect(calendar.events).toHaveLength(1);
+      expect(store.rows).toHaveLength(1);
+    });
+  }
+
+  it("delayed success: a duplicate after the winner finishes gets the deduped confirmation", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const deps = { calendar, store, now: () => MON_6AM };
+    const g = gate();
+    calendar.createGate = g.p;
+    const first = bookAppointment(deps, req());
+    await tick();
+    expect(await bookAppointment(deps, req())).toMatchObject(NOT_FINAL);
+    g.release();
+    await first;
+    expect(await bookAppointment(deps, req())).toMatchObject({ confirmed: true, deduped: true, bookingId: store.rows[0].id });
+    expect(calendar.calls.create).toBe(1);
+  });
+
+  it("unique conflict whose winner row is calendar-confirmed but not yet recorded -> verified success, no second write", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfg = cfgA();
+    const key = bookingIdempotencyKey("call-1", SLOT, 60);
+    const winner = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    calendar.events.push({ calendarId: cfg.calendarId!, eventId: "ev-winner", start: winner.start, end: winner.end, aiboBookingId: winner.id });
+    // Simulate the insert race: lookup misses, insert collides, re-read finds the winner.
+    const raced = racing(store);
+    const r = await bookAppointment({ calendar, store: raced, now: () => MON_6AM }, req());
+    expect(r).toMatchObject({ confirmed: true, providerEventId: "ev-winner", bookingId: winner.id });
+    expect(calendar.calls.create).toBe(0);
+    expect(store.rows[0].status).toBe("confirmed");
+  });
+
+  it("unique conflict never takes over the winner's row, even if its lease looks expired", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfg = cfgA();
+    const key = bookingIdempotencyKey("call-1", SLOT, 60);
+    await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    const raced = racing(store);
+    const later = () => new Date(MON_6AM.getTime() + PENDING_LEASE_MS * 10);
+    expect(await bookAppointment({ calendar, store: raced, now: later }, req({ start: SLOT }))).toMatchObject(NOT_FINAL);
+    expect(store.claims).toBe(0);
+    expect(calendar.calls.create).toBe(0);
+  });
+
+  it("unresolved pending booking stays non-final; calendar lookup failure is also non-final", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfg = cfgA();
+    const key = bookingIdempotencyKey("call-1", SLOT, 60);
+    const p = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    const inLease = { calendar, store, now: () => new Date(Date.parse(p.updatedAt) + 1000) };
+    expect(await bookAppointment(inLease, req())).toMatchObject(NOT_FINAL);
+    calendar.findByAiboBookingId = async () => { throw new CalendarError("CALENDAR_UNAVAILABLE"); };
+    expect(await bookAppointment(inLease, req())).toMatchObject({ ...NOT_FINAL, failure: "CALENDAR_UNAVAILABLE" });
+    expect(calendar.calls.create).toBe(0);
+    expect(store.rows[0].status).toBe("pending");
+  });
+
+  it("concurrent retries of an EXPIRED lease: exactly one claims and writes; the other is non-final", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfg = cfgA();
+    const key = bookingIdempotencyKey("call-1", SLOT, 60);
+    const p = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
+    const deps = { calendar, store, now: () => new Date(Date.parse(p.updatedAt) + PENDING_LEASE_MS + 1000) };
+    const g = gate();
+    calendar.createGate = g.p;
+    const a = bookAppointment(deps, req());
+    const b = bookAppointment(deps, req());
+    await tick();
+    g.release();
+    const rs = await Promise.all([a, b]);
+    expect(rs.filter((r) => r.confirmed)).toHaveLength(1);
+    expect(rs.filter((r) => !r.confirmed && r.statusUnknown)).toHaveLength(1);
+    expect(store.claims).toBe(1);
+    expect(calendar.calls.create).toBe(1);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("genuine failures stay definitive: provider outage, another call holding the slot", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    calendar.failGetBusy = true;
+    expect(await bookAppointment({ calendar, store, now: () => MON_6AM }, req())).toMatchObject({ confirmed: false, failure: "CALENDAR_UNAVAILABLE" });
+    expect(await bookAppointment({ calendar, store, now: () => MON_6AM }, req())).not.toHaveProperty("statusUnknown");
+    const c2 = new FakeCalendar(), s2 = new FakeBookingStore(() => MON_6AM);
+    const other = await bookAppointment({ calendar: c2, store: s2, now: () => MON_6AM }, req({ callId: "call-other" }));
+    expect(other).toMatchObject({ confirmed: true });
+    const mine = await bookAppointment({ calendar: c2, store: s2, now: () => MON_6AM }, req());
+    expect(mine).toMatchObject({ confirmed: false, failure: "SLOT_UNAVAILABLE" });
+    expect(mine).not.toHaveProperty("statusUnknown");
+    expect(c2.events).toHaveLength(1);
+  });
+
+  it("tenant isolation: identical call id + slot in another tenant is independent and never dedupes across tenants", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM);
+    const cfgB = parseRevenueDeskConfig(row({ tenant_id: T_B, calendar_id: "cal-b@group.calendar.google.com", vapi_assistant_id: ASST_B }), "Bravo HVAC");
+    const a = await bookAppointment({ calendar, store, now: () => MON_6AM }, req());
+    const b = await bookAppointment({ calendar, store, now: () => MON_6AM }, req({ cfg: cfgB }));
+    expect(a).toMatchObject({ confirmed: true, deduped: false });
+    expect(b).toMatchObject({ confirmed: true, deduped: false });
+    expect(a.confirmed && b.confirmed && a.bookingId !== b.bookingId).toBe(true);
+    expect(store.rows.map((r) => r.tenantId).sort()).toEqual([T_A, T_B].sort());
+  });
+});
+
+describe("assistant-facing booking outcomes are truthful", () => {
+  async function bookedWorld() {
+    const w = world();
+    const ctx = await startCall(w.deps);
+    await handleToolCall(w.deps, ctx, "revenue_desk_capture_intake", intakeArgs());
+    const avail = (await handleToolCall(w.deps, ctx, "revenue_desk_check_availability", {})) as any;
+    return { ...w, ctx, slot: avail.slots[0] as { slotStart: string; durationMinutes: number } };
+  }
+  const args = (s: { slotStart: string; durationMinutes: number }) => ({ slotStart: s.slotStart, durationMinutes: s.durationMinutes, callerConfirmed: true });
+
+  it("in-flight duplicate -> pending_confirmation: callback offered, neither booked nor failed claimed, call evidence untouched", async () => {
+    const { deps, ctx, slot, calendar, store } = await bookedWorld();
+    let release!: () => void;
+    calendar.createGate = new Promise<void>((r) => (release = r));
+    const first = handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    await new Promise((r) => setTimeout(r, 0));
+    const dup = await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), "tc-2");
+    expect(dup).toMatchObject({ ok: false, booked: false, outcome: "pending_confirmation", requiredAction: "offer_callback" });
+    expect(String(dup.instruction)).toMatch(/NOT confirmed yet/);
+    expect(String(dup.instruction)).toMatch(/has NOT failed/);
+    expect(String(dup.instruction)).toMatch(/call them back/);
+    release();
+    expect(await first).toMatchObject({ ok: true, booked: true });
+    const callRow = store.calls[0];
+    expect(callRow.bookingOutcome).toBe("confirmed");
+    expect(callRow.failureCategory).toBeUndefined();
+    expect(store.events.filter((e) => e.eventType === "revenue_desk.booking_failed")).toHaveLength(0);
+    const audit = store.events.filter((e) => e.eventType === "revenue_desk.tool_attempted" && e.payload.toolName === "revenue_desk_book_appointment").map((e) => e.payload.outcome);
+    expect(audit.sort()).toEqual(["pending_confirmation", "succeeded"]);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("different toolCallIds for the same slot dedupe to the same confirmed booking", async () => {
+    const { deps, ctx, slot, calendar, bookings } = await bookedWorld();
+    const a = await handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    const b = await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(slot), "tc-2");
+    expect(a).toMatchObject({ ok: true, booked: true });
+    expect(b).toMatchObject({ ok: true, booked: true, bookingId: a.bookingId });
+    expect(calendar.events).toHaveLength(1);
+    expect(bookings.rows).toHaveLength(1);
+  });
+
+  it("a different slot on an already-booked call is refused without saying nothing is booked", async () => {
+    const { deps, ctx, calendar } = await bookedWorld();
+    const avail = (await handleToolCall(deps, ctx, "revenue_desk_check_availability", {})) as any;
+    await handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(avail.slots[0]), "tc-1");
+    const other = await handleToolCall(deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args(avail.slots[1]), "tc-2");
+    expect(other).toMatchObject({ ok: false, booked: false, error: "CALL_ALREADY_HAS_BOOKING" });
+    expect(String(other.instruction)).toMatch(/already has an appointment/);
+    expect(calendar.events).toHaveLength(1);
+  });
+
+  it("genuine failure still says NOT booked and records the failure", async () => {
+    const { deps, ctx, slot, calendar, store } = await bookedWorld();
+    calendar.failGetBusy = true;
+    const r = await handleToolCall(deps, ctx, "revenue_desk_book_appointment", args(slot), "tc-1");
+    expect(r).toMatchObject({ ok: false, booked: false, error: "CALENDAR_UNAVAILABLE" });
+    expect(r.outcome).toBeUndefined();
+    expect(String(r.instruction)).toMatch(/NOT booked/);
+    expect(store.calls[0]).toMatchObject({ bookingOutcome: "failed", failureCategory: "CALENDAR_UNAVAILABLE" });
+  });
+});
+
+describe("availability audit dedupe", () => {
+  it("a redelivered availability tool call audits once; a new toolCallId audits again", async () => {
+    const { deps, store } = world();
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs());
+    const r1 = await handleToolCall(deps, ctx, "revenue_desk_check_availability", {}, "tc-avail-1");
+    const r2 = await handleToolCall(deps, ctx, "revenue_desk_check_availability", {}, "tc-avail-1");
+    expect(r2).toEqual(r1);
+    const count = () => store.events.filter((e) => e.eventType === "revenue_desk.availability_checked").length;
+    expect(count()).toBe(1);
+    await handleToolCall(deps, ctx, "revenue_desk_check_availability", {}, "tc-avail-2");
+    expect(count()).toBe(2);
   });
 });
 

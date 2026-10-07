@@ -1,5 +1,6 @@
 import { describe, it, expect, afterAll } from "vitest";
 import { randomUUID } from "crypto";
+import { bookingUniqueViolation } from "./booking";
 import { getPgTestUrl, getPgTestPool, withRollback, setRole, insertTenant, insertMembership, insertLead, runConcurrently } from "../testHarness/pgTestDb";
 
 /**
@@ -147,6 +148,48 @@ DESCRIBE("Revenue Desk concurrency (separate real transactions)", () => {
       }));
       expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
       expect((await pool.query(`SELECT count(*)::int n FROM public.revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows[0].n).toBe(1);
+    } finally {
+      await pool.query(`DELETE FROM public.tenants WHERE id=$1`, [tA]);
+    }
+  });
+
+  it("concurrent IDENTICAL booking inserts: one winner; every loser's real 23505 message maps to a typed guard (never a generic failure)", async () => {
+    const pool = getPgTestPool();
+    const tA = (await pool.query(`INSERT INTO public.tenants (name, slug) VALUES ('rd-conc3', $1) RETURNING id`, [`rd-${randomUUID()}`])).rows[0].id;
+    try {
+      const callId = (await pool.query(`INSERT INTO public.revenue_desk_calls (tenant_id, provider_call_id) VALUES ($1,'dup') RETURNING id`, [tA])).rows[0].id;
+      const results = await runConcurrently(Array.from({ length: 6 }, () => async (c: C) => {
+        await c.query("BEGIN");
+        await c.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone) VALUES ($1,$2,'same-key','cal','2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC')`, [tA, callId]);
+        await c.query("COMMIT");
+      }));
+      expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+      const losers = results.filter((r) => r.status === "rejected").map((r) => (r as any).reason);
+      expect(losers.every((e) => code(e) === "23505" && bookingUniqueViolation(e.message) !== null)).toBe(true);
+      // A plain sequential duplicate reports a guard the store also maps.
+      const seq = await pool.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone) VALUES ($1,$2,'same-key','cal','2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC')`, [tA, callId]).catch((e) => e);
+      expect(bookingUniqueViolation(seq.message)).not.toBeNull();
+      expect((await pool.query(`SELECT count(*)::int n FROM public.revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows[0].n).toBe(1);
+    } finally {
+      await pool.query(`DELETE FROM public.tenants WHERE id=$1`, [tA]);
+    }
+  });
+
+  it("expired-lease claim is a real compare-and-set: of concurrent claimers on the same PostgREST-format updated_at, exactly one wins", async () => {
+    const pool = getPgTestPool();
+    const tA = (await pool.query(`INSERT INTO public.tenants (name, slug) VALUES ('rd-conc4', $1) RETURNING id`, [`rd-${randomUUID()}`])).rows[0].id;
+    try {
+      const callId = (await pool.query(`INSERT INTO public.revenue_desk_calls (tenant_id, provider_call_id) VALUES ($1,'lease') RETURNING id`, [tA])).rows[0].id;
+      const b = (await pool.query(`INSERT INTO public.revenue_desk_bookings (tenant_id, call_id, idempotency_key, calendar_id, requested_start, requested_end, timezone) VALUES ($1,$2,'lease-key','cal','2026-10-12T14:00:00Z','2026-10-12T15:00:00Z','UTC') RETURNING id, to_json(updated_at) #>> '{}' AS updated_at`, [tA, callId])).rows[0];
+      // Same predicate as store.server.ts claimPending (tenant, id, status pending, exact updated_at).
+      const results = await runConcurrently(Array.from({ length: 5 }, () => async (c: C) =>
+        (await c.query(`UPDATE public.revenue_desk_bookings SET updated_at = clock_timestamp() WHERE tenant_id=$1 AND id=$2 AND status='pending' AND updated_at=$3::timestamptz`, [tA, b.id, b.updated_at])).rowCount
+      ));
+      expect(results.map((r) => (r as any).value).filter((n) => n === 1)).toHaveLength(1);
+      // A settled (non-pending) row can never be claimed.
+      await pool.query(`UPDATE public.revenue_desk_bookings SET status='conflict' WHERE id=$1`, [b.id]);
+      const cur = (await pool.query(`SELECT to_json(updated_at) #>> '{}' AS u FROM public.revenue_desk_bookings WHERE id=$1`, [b.id])).rows[0].u;
+      expect((await pool.query(`UPDATE public.revenue_desk_bookings SET updated_at = now() WHERE tenant_id=$1 AND id=$2 AND status='pending' AND updated_at=$3::timestamptz`, [tA, b.id, cur])).rowCount).toBe(0);
     } finally {
       await pool.query(`DELETE FROM public.tenants WHERE id=$1`, [tA]);
     }

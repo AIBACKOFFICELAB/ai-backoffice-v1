@@ -35,10 +35,21 @@ export async function handleVapiRequest(
 
   switch (msg.kind) {
     case "assistant-request": {
-      // Unknown/disabled number: no business identity is revealed.
-      if (!ctx) return { status: 200, body: { error: "This number is not available right now. Please try again later." } };
+      // Unknown/disabled number, or no saved assistant configured: fail closed
+      // with Vapi's documented `{ error }` form; no business identity is revealed.
+      if (!ctx?.config.vapiAssistantId) return { status: 200, body: { error: "This number is not available right now. Please try again later." } };
       const c = assistantContext(ctx.config);
-      return { status: 200, body: { assistantOverrides: { firstMessage: c.greeting, variableValues: { businessName: c.businessName, serviceCategories: c.serviceCategories.join(", "), bookingAvailable: c.bookingAvailable, faqs: JSON.stringify(c.faqs) } } } };
+      // Saved assistant selected server-side from the trusted phone-number id.
+      // Overrides carry ONLY greeting + variables: never server/serverUrl,
+      // model, tools or credentials, so Vapi keeps using the saved assistant's
+      // and saved tools' server credential for every later webhook.
+      return {
+        status: 200,
+        body: {
+          assistantId: ctx.config.vapiAssistantId,
+          assistantOverrides: { firstMessage: c.greeting, variableValues: { businessName: c.businessName, serviceCategories: c.serviceCategories.join(", "), bookingAvailable: c.bookingAvailable, faqs: JSON.stringify(c.faqs) } },
+        },
+      };
     }
     case "tool-calls": {
       const results = [];
