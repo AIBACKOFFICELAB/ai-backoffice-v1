@@ -77,6 +77,66 @@ describe("founderBetaEnrollmentGate (pure)", () => {
   });
 });
 
+describe("exact Stripe values — padded configuration keeps enrollment closed (Codex P1, PR #32)", () => {
+  // The webhook path reads the RAW env values (signature secret, subscription
+  // read key), so Checkout must never succeed with a trimmed variant of them.
+  const ON = { ...FULL, [ENROLLMENT_FLAG_ENV]: "true" };
+  const PADDED: Array<[string, string, string]> = [
+    ["1. leading whitespace in the secret key", "STRIPE_SECRET_KEY", " sk_test_mock"],
+    ["2. trailing whitespace in the secret key", "STRIPE_SECRET_KEY", "sk_test_mock "],
+    ["2b. trailing newline in the secret key", "STRIPE_SECRET_KEY", "sk_test_mock\n"],
+    ["3. leading whitespace in the price id", "STRIPE_PRICE_ID_FOUNDER_BETA", " price_mock"],
+    ["3b. trailing tab in the price id", "STRIPE_PRICE_ID_FOUNDER_BETA", "price_mock\t"],
+    ["4. leading whitespace in the webhook secret", "STRIPE_WEBHOOK_SECRET", " whsec_mock"],
+    ["4b. trailing whitespace in the webhook secret", "STRIPE_WEBHOOK_SECRET", "whsec_mock "],
+  ];
+  const REASON: Record<string, string> = {
+    STRIPE_SECRET_KEY: "malformed_stripe_secret_key",
+    STRIPE_PRICE_ID_FOUNDER_BETA: "malformed_price_id",
+    STRIPE_WEBHOOK_SECRET: "malformed_webhook_secret",
+  };
+
+  for (const [name, key, value] of PADDED) {
+    it(`${name} closes the gate`, () => {
+      expect(founderBetaEnrollmentGate({ ...ON, [key]: value })).toEqual({ open: false, reason: REASON[key] });
+    });
+  }
+
+  it("5. no Stripe Checkout session is created for ANY rejected (padded) configuration", async () => {
+    for (const [name, key, value] of PADDED) {
+      setEnv({ ...ON, [key]: value });
+      const res = await checkoutPOST();
+      expect(res.status, name).toBe(503);
+      expect(await res.json(), name).toEqual({ ok: false, reason: "enrollment-unavailable" });
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("6. valid exact credentials with the flag ABSENT remain disabled (no Stripe call)", async () => {
+    expect(founderBetaEnrollmentGate({ ...FULL })).toEqual({ open: false, reason: "disabled" });
+    setEnv({ ...FULL });
+    expect((await checkoutPOST()).status).toBe(503);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("7. valid exact credentials + flag enabled: the authorized Checkout path uses the EXACT configured values", async () => {
+    expect(founderBetaEnrollmentGate(ON)).toEqual({ open: true, config: { secretKey: "sk_test_mock", priceId: "price_mock", appUrl: "https://app.example.test" } });
+    setEnv(ON);
+    const res = await checkoutPOST();
+    expect(res.status).toBe(303);
+    expect(stripeCalls()).toHaveLength(1);
+    const [, init] = stripeCalls()[0];
+    expect(new Headers((init as RequestInit).headers).get("authorization")).toBe("Bearer sk_test_mock");
+    expect(new URLSearchParams(String((init as RequestInit).body)).get("line_items[0][price]")).toBe("price_mock");
+  });
+
+  it("8. redirect-origin validation is unchanged (padded app URL still accepted as before; bad origins still rejected)", () => {
+    expect(founderBetaEnrollmentGate({ ...ON, NEXT_PUBLIC_APP_URL: " https://app.example.test/ " })).toMatchObject({ open: true, config: { appUrl: "https://app.example.test" } });
+    expect(founderBetaEnrollmentGate({ ...ON, NEXT_PUBLIC_APP_URL: "http://app.example.test" })).toEqual({ open: false, reason: "invalid_app_url" });
+    expect(founderBetaEnrollmentGate({ ...ON, NEXT_PUBLIC_APP_URL: "https://app.example.test/path" })).toEqual({ open: false, reason: "invalid_app_url" });
+  });
+});
+
 describe("POST /api/billing/checkout (direct access)", () => {
   it("disabled (default) with ALL Stripe credentials present: 503, no Stripe call, no session", async () => {
     setEnv({ ...FULL });
