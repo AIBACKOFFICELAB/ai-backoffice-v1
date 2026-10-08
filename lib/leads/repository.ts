@@ -4,13 +4,24 @@ import { fetchLeadsFromDb, fetchLeadByIdFromDb, insertLeadToDb, updateLeadInDb, 
 
 export type LeadDataSource = "supabase" | "google-sheets" | "mock-fallback";
 
+export const LEGACY_SHEET_TENANT_ENV = "AIBO_LEGACY_SHEET_TENANT_IDS";
+
 /**
- * Google Sheets / mock fallback data has no tenant boundary. It only remains
- * as the existing bootstrap path only after a successful empty Supabase read.
- * It is read-only compatibility, never an intake source or a DB-error fallback.
- * The legacy Sheet configuration is global: restrict bootstrap use to the
- * existing pilot until retired; it is not a multi-tenant integration.
+ * Google Sheets data has no tenant boundary (one global sheet). It is a
+ * read-only legacy bootstrap for the existing pilot ONLY: it is served
+ * solely to tenant ids the Founder explicitly lists in
+ * AIBO_LEGACY_SHEET_TENANT_IDS, and only after a confirmed empty Supabase
+ * read. Every other tenant (every paid Founder Beta tenant) gets an honest
+ * empty result — never global or foreign data. Fails closed when unset.
  */
+export function isLegacySheetTenant(tenantId: string): boolean {
+  const allowed = (process.env[LEGACY_SHEET_TENANT_ENV] ?? "")
+    .split(",")
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+  return allowed.includes(tenantId.trim().toLowerCase());
+}
+
 export async function getLeads(tenantId: string): Promise<{ leads: PlumbingLead[]; source: LeadDataSource; error?: boolean; message?: string }> {
   try {
     const dbLeads = await fetchLeadsFromDb(tenantId);
@@ -20,6 +31,10 @@ export async function getLeads(tenantId: string): Promise<{ leads: PlumbingLead[
   } catch (error) {
     console.error("[leads] Supabase fetch failed.", error);
     return { leads: [], source: "supabase", error: true, message: "Lead Inbox is temporarily unavailable." };
+  }
+
+  if (!isLegacySheetTenant(tenantId)) {
+    return { leads: [], source: "supabase" };
   }
 
   try {

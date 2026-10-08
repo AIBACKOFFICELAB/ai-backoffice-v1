@@ -1,5 +1,6 @@
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { sendSms } from "@/lib/sms/twilio";
+import { checkOutboundAllowed } from "@/lib/execution/outboundGuard";
 import { PlumbingLead } from "@/data/leadModel";
 import { renderTemplate } from "@/lib/templates";
 
@@ -218,6 +219,13 @@ async function processSequence(seq: Record<string, any>) {
     return { leadId: seq.lead_id, action: "skipped", reason: "module-disabled" };
   }
 
+  // Founder Beta server-authoritative no-send boundary: checked BEFORE any
+  // state mutation so a denied send never marks a step as sent. The tenant's
+  // own `enabled` flag is NOT authorization (any tenant member can flip it).
+  if (!checkOutboundAllowed({ tenantId: seq.tenant_id }).allowed) {
+    return { leadId: seq.lead_id, action: "skipped", reason: "outbound-denied" };
+  }
+
   const lead = Array.isArray(seq.leads) ? seq.leads[0] : seq.leads;
   if (!lead) {
     return { leadId: seq.lead_id, action: "skipped", reason: "lead-missing" };
@@ -250,7 +258,7 @@ async function processSequence(seq: Record<string, any>) {
     service_type: lead.service_type ?? "your project",
   });
 
-  const smsResult = await sendSms(lead.phone, message);
+  const smsResult = await sendSms(lead.phone, message, { tenantId: seq.tenant_id });
 
   const update: Record<string, unknown> = { updated_at: new Date().toISOString() };
   update[`${due.key}_sent_at`] = new Date().toISOString();

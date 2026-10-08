@@ -18,6 +18,48 @@ export type TenantContext = {
  * this is the seam future multi-tenant-per-user work (org switching) hangs off.
  */
 export async function getTenantContext(): Promise<TenantContext | null> {
+  const ctx = await getTenantContextUnchecked();
+  if (!ctx) return null;
+  // Server-authoritative entitlement: a tenant WITH a billing record must be
+  // entitled. Tenants without one (Founder/internal/pilot) are unaffected.
+  // Fails closed if the billing lookup errors. Applies to every API route
+  // and page that resolves the tenant through this seam.
+  const billing = await getBillingState(ctx.tenantId);
+  if (billing === "error") return null;
+  if (billing && billing.entitlement !== "active") return null;
+  return ctx;
+}
+
+export type BillingState = {
+  entitlement: "active" | "restricted" | "revoked";
+  onboardingStatus: "onboarding_required" | "in_progress" | "complete";
+  subscriptionStatus: string;
+  cancelAtPeriodEnd: boolean;
+  currentPeriodEnd: string | null;
+};
+
+/** null = no billing record (internal/pilot tenant); "error" = lookup failed. */
+export async function getBillingState(tenantId: string): Promise<BillingState | null | "error"> {
+  const supabase = await createServerSupabaseClient();
+  const { data, error } = await supabase
+    .from("billing_subscriptions")
+    .select("entitlement, onboarding_status, subscription_status, cancel_at_period_end, current_period_end")
+    .eq("tenant_id", tenantId)
+    .maybeSingle();
+  if (error) return "error";
+  if (!data) return null;
+  return {
+    entitlement: data.entitlement,
+    onboardingStatus: data.onboarding_status,
+    subscriptionStatus: data.subscription_status,
+    cancelAtPeriodEnd: data.cancel_at_period_end,
+    currentPeriodEnd: data.current_period_end,
+  };
+}
+
+/** Membership resolution WITHOUT the entitlement check — only for the
+ * billing/onboarding surfaces that must still work for a restricted tenant. */
+export async function getTenantContextUnchecked(): Promise<TenantContext | null> {
   const supabase = await createServerSupabaseClient();
 
   const {

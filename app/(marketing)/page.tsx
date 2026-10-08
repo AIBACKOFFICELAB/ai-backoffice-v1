@@ -1,39 +1,39 @@
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
-import { AUDIT_URL } from "@/lib/constants";
+import { FounderBetaCheckoutButton } from "@/components/FounderBetaCheckoutButton";
 
 const painFixPairs = [
   {
-    pain: "A missed call after 5 PM turns into a job your competitor books first thing in the morning.",
-    fix: "Every missed call gets an instant text-back with your booking link — day or night.",
+    pain: "Estimates go out and then nobody knows which ones are quietly going cold.",
+    fix: "See every open estimate ranked by what needs attention first, with the reason shown.",
   },
   {
-    pain: "Leads from web forms and social ads sit for hours before anyone replies.",
-    fix: "New leads land in one inbox, sorted by urgency, the moment they come in.",
+    pain: "Follow-up depends on someone remembering — and on a busy week, nobody does.",
+    fix: "Get a clear, evidence-backed recommendation for each estimate. You review it and decide.",
   },
   {
-    pain: "Unsigned estimates get forgotten instead of followed up on.",
-    fix: "Open estimates get automatic Day 1 / 3 / 7 follow-up until they close or die.",
+    pain: "You can't tell whether the follow-up you did actually moved a job forward.",
+    fix: "A timeline shows what was recommended, what was done, and what happened next.",
   },
   {
-    pain: "Review requests happen only when someone remembers to send them.",
-    fix: "Completed jobs are flagged for a review request the moment they're marked done.",
+    pain: "Leads and estimates live in separate places, so the full picture is always out of date.",
+    fix: "Leads and estimates in one workspace, kept in sync during Founder-assisted onboarding.",
   },
 ];
 
 const steps = [
   {
-    title: "Capture every inquiry",
-    description: "Missed calls, website forms, and message leads land in one inbox so nothing gets lost.",
+    title: "We connect your data with you",
+    description: "Founder-assisted onboarding: we set up your business and connect your lead and estimate source together.",
   },
   {
-    title: "Respond and follow up automatically",
-    description: "Callers get an instant text-back; open estimates get a Day 1/3/7 reminder sequence until they close.",
+    title: "AI BackOffice reads your open estimates",
+    description: "It highlights the estimates most worth a follow-up and explains why, using your own data as evidence.",
   },
   {
-    title: "See where revenue is stuck",
-    description: "Your dashboard flags emergency leads, overdue follow-ups, and pending reviews — the daily worklist writes itself.",
+    title: "You review and act",
+    description: "Shadow mode: recommendations come to you. Nothing is sent to your customers automatically.",
   },
 ];
 
@@ -41,20 +41,20 @@ const trades = ["Plumbers", "HVAC Teams", "Electricians", "Roofers", "Cleaning C
 
 const faqs = [
   {
-    q: "Does this replace my receptionist or dispatcher?",
-    a: "No — it catches what falls through today: after-hours calls, quiet web leads, and estimates nobody got back to. If you have staff answering calls, this backs them up instead of replacing them.",
+    q: "Does AI BackOffice contact my customers for me?",
+    a: "No. Founder Beta runs in Shadow mode: it recommends and you decide. It does not send texts or emails to your customers on its own.",
   },
   {
-    q: "What actually happens when a call comes in after hours?",
-    a: "The caller gets an immediate text with your booking link and, if it's flagged urgent, emergency instructions. You get notified by SMS and email the moment it happens, with the full context waiting in your Lead Inbox.",
+    q: "What does Founder Beta cost?",
+    a: "$299 per month, month-to-month, with $0 setup during Founder Beta. It covers one business. Founder Beta pricing applies during the beta.",
   },
   {
-    q: "Do I need new phone hardware or a new number?",
-    a: "No — it runs on your existing business line. Setup is a configuration step, not a hardware swap.",
+    q: "What is Founder-assisted onboarding?",
+    a: "A hands-on session where we connect your lead and estimate data and configure your workspace with you. It is included, and it starts automatically after you subscribe.",
   },
   {
-    q: "Can I control what the automated text says?",
-    a: "Yes. The recovery message, your emergency line, and your intake form link are all editable from Settings, with a preview before anything goes live.",
+    q: "Will it increase my close rate?",
+    a: "We can't promise results. It is built to make sure no open estimate slips through unnoticed, and to show you the evidence behind each recommendation.",
   },
 ];
 
@@ -64,19 +64,17 @@ export default function HomePage() {
       <section className="relative overflow-hidden bg-gradient-to-b from-brand-950 to-brand-900 text-white">
         <div className="mx-auto max-w-page px-5 py-20 sm:px-8 sm:py-28">
           <p className="text-sm font-semibold uppercase tracking-[0.16em] text-brand-200">
-            Built for home service contractors
+            AI BackOffice Founder Beta — for home service contractors
           </p>
           <h1 className="mt-5 max-w-3xl text-4xl font-extrabold leading-[1.1] tracking-tight sm:text-5xl lg:text-[56px]">
-            Every missed call is a job your competitor just booked.
+            Know which open estimates are about to go cold — and what to do about each one.
           </h1>
           <p className="mt-6 max-w-2xl text-lg text-brand-100 sm:text-xl">
-            AI BackOffice answers the call, chases the unsigned estimate, and asks for the review — automatically.
-            A two-person crew runs its front office like it has a full-time dispatcher.
+            Estimate Closing intelligence for your business: evidence-backed recommendations on the estimates worth a follow-up,
+            delivered for your review. $299/month, $0 setup during Founder Beta, one business, Founder-assisted onboarding.
           </p>
           <div className="mt-9 flex flex-wrap gap-3">
-            <Button href={AUDIT_URL} target="_blank" rel="noopener noreferrer" size="lg">
-              Get My Free Missed-Call Audit
-            </Button>
+            <FounderBetaCheckoutButton variant="secondary" />
             <Button href="#how-it-works" variant="outline" size="lg">
               See how it works
             </Button>
@@ -85,8 +83,8 @@ export default function HomePage() {
       </section>
 
       <section className="mx-auto max-w-page px-5 py-16 sm:px-8 sm:py-20">
-        <h2 className="text-2xl font-bold sm:text-3xl">Where the jobs are actually leaking</h2>
-        <p className="mt-2 max-w-2xl text-ink-500">Four real failure points, and what closes each one.</p>
+        <h2 className="text-2xl font-bold sm:text-3xl">Where estimates quietly stall</h2>
+        <p className="mt-2 max-w-2xl text-ink-500">Four common failure points, and what Estimate Closing intelligence does about each.</p>
         <div className="mt-8 grid gap-4 sm:grid-cols-2">
           {painFixPairs.map((pair) => (
             <Card key={pair.pain} className="p-6">
@@ -105,7 +103,7 @@ export default function HomePage() {
       <section id="how-it-works" className="bg-white py-16 sm:py-20">
         <div className="mx-auto max-w-page px-5 sm:px-8">
           <h2 className="text-2xl font-bold sm:text-3xl">How AI BackOffice works</h2>
-          <p className="mt-2 max-w-2xl text-ink-500">Three steps, running continuously in the background.</p>
+          <p className="mt-2 max-w-2xl text-ink-500">Three steps, with you in control.</p>
           <div className="mt-8 grid gap-5 md:grid-cols-3">
             {steps.map((step, index) => (
               <Card key={step.title} className="p-6">
@@ -150,18 +148,14 @@ export default function HomePage() {
 
       <section id="get-started" className="mx-auto max-w-page px-5 py-16 sm:px-8 sm:py-24">
         <div className="mx-auto max-w-2xl text-center">
-          <h2 className="text-2xl font-bold sm:text-3xl">Get your free missed-call audit</h2>
-          <p className="mt-2 text-ink-500">
-            We&apos;ll show you exactly how many jobs are slipping through — no cost, no commitment.
-          </p>
+          <h2 className="text-2xl font-bold sm:text-3xl">Join AI BackOffice Founder Beta</h2>
+          <p className="mt-2 text-ink-500">$299/month · $0 setup during Founder Beta · One business · Founder-assisted onboarding</p>
           <Card className="mt-8 flex flex-col items-center gap-5 p-8">
             <p className="max-w-md text-[15px] text-ink-700">
-              Audits are run through our business intelligence partner — tell them a bit about your business and
-              they&apos;ll walk you through where revenue is leaking.
+              Subscribe, set your password, and we&apos;ll schedule your onboarding. Shadow mode: AI BackOffice recommends, you decide.
+              No results are guaranteed.
             </p>
-            <Button href={AUDIT_URL} target="_blank" rel="noopener noreferrer" size="lg">
-              Start My Free Audit
-            </Button>
+            <FounderBetaCheckoutButton />
           </Card>
           <p className="mt-6 text-sm text-ink-400">
             Already a customer?{" "}

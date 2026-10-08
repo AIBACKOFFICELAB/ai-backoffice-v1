@@ -1,3 +1,5 @@
+import { checkOutboundAllowed, OutboundContext } from "@/lib/execution/outboundGuard";
+
 const TWILIO_API_BASE = "https://api.twilio.com/2010-04-01";
 
 export type EmergencyLeadPayload = {
@@ -33,11 +35,17 @@ export function buildEmergencySmsMessage(payload: EmergencyLeadPayload): string 
 
 export type SendSmsResult =
   | { ok: true; skipped: false; sid?: string }
-  | { ok: false; skipped: true; reason: "missing-env" }
+  | { ok: false; skipped: true; reason: "missing-env" | "outbound-denied" }
   | { ok: false; skipped: false; reason: "twilio-error" | "unexpected-error"; status?: number };
 
 /** Generic single-recipient SMS send, shared by every module's Execution layer. */
-export async function sendSms(toPhone: string, message: string): Promise<SendSmsResult> {
+export async function sendSms(toPhone: string, message: string, ctx?: OutboundContext): Promise<SendSmsResult> {
+  // Server-authoritative Founder Beta no-send boundary (see outboundGuard.ts).
+  if (!checkOutboundAllowed(ctx).allowed) {
+    console.warn("[SMS] outbound send denied by server boundary", { tenantId: ctx?.tenantId ?? null });
+    return { ok: false, skipped: true, reason: "outbound-denied" };
+  }
+
   const env = getTwilioBaseEnv();
 
   if (!env.configured) {
@@ -100,7 +108,12 @@ function getTwilioEnv() {
   return { configured: true as const, ...baseFields, toPhone };
 }
 
-export async function sendOwnerEmergencySms(payload: EmergencyLeadPayload) {
+export async function sendOwnerEmergencySms(payload: EmergencyLeadPayload, ctx?: OutboundContext) {
+  if (!checkOutboundAllowed(ctx).allowed) {
+    console.warn("[SMS] emergency owner alert denied by server boundary", { tenantId: ctx?.tenantId ?? null });
+    return { ok: false as const, skipped: true as const, reason: "outbound-denied" as const };
+  }
+
   const env = getTwilioEnv();
 
   if (!env.configured) {

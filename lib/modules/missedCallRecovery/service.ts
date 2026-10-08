@@ -207,7 +207,7 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
     emergency_phone: settings.emergencyPhone ?? "",
     business_tagline: settings.businessTagline ?? "",
   });
-  const recoverySmsResult = await sendSms(payload.callerPhone, recoveryMessage);
+  const recoverySmsResult = await sendSms(payload.callerPhone, recoveryMessage, { tenantId });
 
   // 2. Create the lead
   let leadId: string | null = null;
@@ -261,7 +261,7 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
   let ownerSmsResult: SendSmsResult = { ok: false, skipped: true, reason: "missing-env" };
   if (settings.ownerAlertPhone) {
     const ownerMessage = `AI BackOffice Alert: Missed call recovered for ${tenantName}. Caller: ${payload.callerPhone}. Recovery SMS sent. Check Lead Inbox: ${leadUrl}`;
-    ownerSmsResult = await sendSms(settings.ownerAlertPhone, ownerMessage);
+    ownerSmsResult = await sendSms(settings.ownerAlertPhone, ownerMessage, { tenantId });
   }
 
   // 4. Notify the owner by email
@@ -274,7 +274,7 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
       `Recovery SMS status: ${outcomeFromSms(recoverySmsResult)}`,
       `Next action: Review the lead and follow up with the caller.`,
     ].join("\n");
-    ownerEmailResult = await sendEmail(settings.ownerNotificationEmail, "New Missed Call Lead Recovered", emailBody);
+    ownerEmailResult = await sendEmail(settings.ownerNotificationEmail, "New Missed Call Lead Recovered", emailBody, { tenantId });
   }
 
   // Legacy status vocabulary — UNCHANGED. "recovered" here means "the

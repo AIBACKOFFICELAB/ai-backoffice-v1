@@ -10,6 +10,10 @@ const protectedRoutes = [
   "/settings",
   "/prospects",
   "/agentic",
+  "/onboarding",
+  "/billing",
+  "/approvals",
+  "/estimates",
 ];
 
 export async function middleware(request: NextRequest) {
