@@ -1,17 +1,20 @@
 import { NextResponse } from "next/server";
-import { createFounderBetaCheckoutSession, getCheckoutConfig } from "@/lib/billing/stripe";
+import { createFounderBetaCheckoutSession } from "@/lib/billing/stripe";
+import { founderBetaEnrollmentGate } from "@/lib/billing/enrollment";
 
 export const dynamic = "force-dynamic";
 
-/** Public CTA target: form POST -> 303 to Stripe-hosted Checkout ($299/mo). */
+/** Public CTA target: form POST -> 303 to Stripe-hosted Checkout ($299/mo).
+ * Fails closed unless the Founder Beta enrollment gate is open; no Stripe call
+ * is made otherwise. The response never reveals which setting is missing. */
 export async function POST() {
-  const cfg = getCheckoutConfig();
-  if (!cfg) {
-    console.error("[billing] checkout unavailable: STRIPE_SECRET_KEY / STRIPE_PRICE_ID_FOUNDER_BETA not configured");
-    return NextResponse.json({ ok: false, reason: "checkout-unavailable" }, { status: 503 });
+  const gate = founderBetaEnrollmentGate();
+  if (!gate.open) {
+    console.warn("[billing] checkout refused: enrollment gate closed", { reason: gate.reason });
+    return NextResponse.json({ ok: false, reason: "enrollment-unavailable" }, { status: 503, headers: { "Cache-Control": "no-store" } });
   }
   try {
-    const session = await createFounderBetaCheckoutSession(cfg);
+    const session = await createFounderBetaCheckoutSession(gate.config);
     return NextResponse.redirect(session.url, 303);
   } catch (error) {
     console.error("[billing] checkout session creation failed", error);

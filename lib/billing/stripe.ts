@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "crypto";
+import type { CheckoutConfig } from "./enrollment";
 
 const STRIPE_API = "https://api.stripe.com/v1";
 export const SIGNATURE_TOLERANCE_SECONDS = 300;
@@ -32,15 +33,8 @@ export function verifyStripeSignature(
   });
 }
 
-export type CheckoutConfig = { secretKey: string; priceId: string; appUrl: string };
-
-export function getCheckoutConfig(): CheckoutConfig | null {
-  const secretKey = process.env.STRIPE_SECRET_KEY;
-  const priceId = process.env.STRIPE_PRICE_ID_FOUNDER_BETA;
-  const appUrl = (process.env.NEXT_PUBLIC_APP_URL || "https://aibackoffice.app").replace(/\/$/, "");
-  if (!secretKey || !priceId) return null;
-  return { secretKey, priceId, appUrl };
-}
+// Checkout configuration is obtained ONLY through founderBetaEnrollmentGate()
+// (lib/billing/enrollment.ts): credentials alone never open enrollment.
 
 /** Creates a $299/mo Founder Beta Checkout Session. Payment truth is NOT
  * derived from the browser returning from this session — only the webhook. */
