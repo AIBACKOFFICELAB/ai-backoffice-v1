@@ -1095,6 +1095,53 @@ describe("availability audit dedupe", () => {
   });
 });
 
+describe("owner follow-up survives a later human hand-off (reliability admission)", () => {
+  const secret = "s";
+  const call = { id: "vapi-call-fu", phoneNumberId: "pn-A", customer: { number: "+13055551234" } };
+  const SLOT_START = "2026-10-12T14:00:00Z";
+  const gate = () => { let release!: () => void; const p = new Promise<void>((r) => (release = r)); return { p, release }; };
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+
+  async function pendingFollowUpWorld() {
+    const w = world();
+    const ctx = await startCall(w.deps);
+    await handleToolCall(w.deps, ctx, "revenue_desk_capture_intake", intakeArgs());
+    const avail = (await handleToolCall(w.deps, ctx, "revenue_desk_check_availability", {})) as any;
+    const slot = avail.slots[0] as { slotStart: string; durationMinutes: number };
+    const args = { slotStart: slot.slotStart, durationMinutes: slot.durationMinutes, callerConfirmed: true };
+    let release!: () => void;
+    w.calendar.createGate = new Promise<void>((r) => (release = r));
+    const first = handleToolCall(w.deps, ctx, "revenue_desk_book_appointment", args, "tc-1");
+    await tick();
+    const dup = await handleToolCall(w.deps, { ...ctx, call: { ...ctx.call } }, "revenue_desk_book_appointment", args, "tc-2");
+    expect(dup).toMatchObject({ outcome: "pending_confirmation", followUpRecorded: true });
+    return { ...w, ctx, release, first };
+  }
+
+  it("a later human hand-off keeps the pending-booking follow-up and the owner banner, and still records the hand-off event", async () => {
+    const { deps, store, release, first, ctx } = await pendingFollowUpWorld();
+    const esc = await handleToolCall(deps, { ...ctx, call: { ...store.calls[0] } as CallRow }, "revenue_desk_get_escalation_route", { reason: "caller_requests_human" }, "tc-esc");
+    expect(esc).toMatchObject({ ok: true });
+    expect(store.calls[0].escalationReason).toBe(BOOKING_CONFIRMATION_FOLLOW_UP);
+    expect(ownerFollowUp({ escalation_reason: store.calls[0].escalationReason })).not.toBeNull();
+    expect(store.events.filter((e) => e.eventType === "revenue_desk.escalation_requested").map((e) => e.payload.escalationReason)).toEqual(
+      expect.arrayContaining([BOOKING_CONFIRMATION_FOLLOW_UP, "caller_requests_human"])
+    );
+    release();
+    await first;
+    expect(store.calls[0].escalationReason).toBe(BOOKING_CONFIRMATION_FOLLOW_UP);
+  });
+
+  it("a hand-off on a call with NO pending follow-up still records its own reason (no regression)", async () => {
+    const { store, deps } = world();
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs());
+    await handleToolCall(deps, ctx, "revenue_desk_get_escalation_route", { reason: "caller_requests_human" }, "tc-esc");
+    expect(store.calls[0]).toMatchObject({ escalationReason: "caller_requests_human", escalationResult: "requested" });
+    expect(ownerFollowUp({ escalation_reason: store.calls[0].escalationReason })).toBeNull();
+  });
+});
+
 describe("Founder Beta usage allowance (500 min/month, metering only)", () => {
   const now = new Date("2026-10-20T12:00:00Z");
   const r = (created_at: string, minutes: number) => ({ created_at, duration_seconds: minutes * 60 });

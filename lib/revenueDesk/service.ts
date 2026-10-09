@@ -309,8 +309,12 @@ async function book(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; cal
 async function escalationRoute(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }, reason: string): Promise<ToolResponse> {
   const { config, call } = ctx;
   const status: CallStatus = call.status === "booked" ? "booked" : "escalated";
-  await deps.store.updateCall(config.tenantId, call.id, { status, escalationReason: reason, escalationResult: "requested" });
-  ctx.call = { ...call, status, escalationReason: reason };
+  // A pending-booking follow-up is a callback the receptionist already promised;
+  // a later hand-off must not overwrite it, or the owner action disappears. The
+  // hand-off itself is still recorded below (its own event carries the reason).
+  const recordedReason = call.escalationReason === BOOKING_CONFIRMATION_FOLLOW_UP ? BOOKING_CONFIRMATION_FOLLOW_UP : reason;
+  await deps.store.updateCall(config.tenantId, call.id, { status, escalationReason: recordedReason, escalationResult: "requested" });
+  ctx.call = { ...call, status, escalationReason: recordedReason };
   await safeEmit(deps, config.tenantId, "revenue_desk.escalation_requested", call.id, `rd:${call.id}:escalation`, { callId: call.id, escalationReason: reason });
   if (!config.escalationPhone) {
     return { ok: true, transferAvailable: false, instruction: "No live transfer is configured. Tell the caller the team will call them back; do not promise a time." };
