@@ -21,6 +21,8 @@
  * Activation is a separate Founder decision.
  */
 
+import { validatedAppOrigin } from "@/lib/appOrigin";
+
 export const ENROLLMENT_FLAG_ENV = "AIBO_FOUNDER_BETA_ENROLLMENT_ENABLED";
 
 export type CheckoutConfig = { secretKey: string; priceId: string; appUrl: string };
@@ -43,21 +45,6 @@ const present = (v: string | undefined) => typeof v === "string" && v.trim().len
 /** Exact-value rule for Stripe settings: no leading/trailing whitespace. */
 const unpadded = (v: string) => v === v.trim();
 
-/** Absolute origin for Stripe success/cancel redirects: https, or http only for local development. */
-function appOrigin(raw: string | undefined): string | null {
-  if (!present(raw)) return null;
-  let url: URL;
-  try {
-    url = new URL(raw!.trim());
-  } catch {
-    return null;
-  }
-  const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return null;
-  if (url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "")) return null;
-  return url.origin;
-}
-
 export function founderBetaEnrollmentGate(env: Env = process.env): EnrollmentGate {
   if (env[ENROLLMENT_FLAG_ENV] !== "true") return { open: false, reason: "disabled" };
   const secretKey = env.STRIPE_SECRET_KEY;
@@ -69,7 +56,7 @@ export function founderBetaEnrollmentGate(env: Env = process.env): EnrollmentGat
   if (!unpadded(priceId!)) return { open: false, reason: "malformed_price_id" };
   if (!present(webhookSecret)) return { open: false, reason: "missing_webhook_secret" };
   if (!unpadded(webhookSecret!)) return { open: false, reason: "malformed_webhook_secret" };
-  const appUrl = appOrigin(env.NEXT_PUBLIC_APP_URL);
+  const appUrl = validatedAppOrigin(env.NEXT_PUBLIC_APP_URL);
   if (!appUrl) return { open: false, reason: "invalid_app_url" };
   // Exact values — the same ones the webhook path reads from the environment.
   return { open: true, config: { secretKey: secretKey!, priceId: priceId!, appUrl } };

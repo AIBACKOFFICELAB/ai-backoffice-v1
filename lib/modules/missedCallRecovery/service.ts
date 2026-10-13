@@ -5,8 +5,13 @@ import { sendSms, SendSmsResult } from "@/lib/sms/twilio";
 import { sendEmail, SendEmailResult } from "@/lib/email/resend";
 import { emitEventSafely } from "@/lib/events/service";
 import { renderTemplate } from "@/lib/templates";
+import { operationalAppOrigin } from "@/lib/appOrigin";
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL ?? "https://aibackoffice.app";
+/** Owner lead link for this deployment, or null when no origin may be used (never a Production default outside Production). */
+export function ownerLeadLink(origin: string | null, leadId: string | null): string | null {
+  if (!origin) return null;
+  return leadId ? `${origin}/leads/${leadId}` : origin;
+}
 
 export type MissedCallSettings = {
   tenantId: string;
@@ -255,12 +260,12 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
     console.error("[missed-call-recovery] failed to create lead", error);
   }
 
-  const leadUrl = leadId ? `${APP_URL}/leads/${leadId}` : APP_URL;
+  const leadUrl = ownerLeadLink(operationalAppOrigin(), leadId);
 
   // 3. Notify the owner by SMS
   let ownerSmsResult: SendSmsResult = { ok: false, skipped: true, reason: "missing-env" };
   if (settings.ownerAlertPhone) {
-    const ownerMessage = `AI BackOffice Alert: Missed call recovered for ${tenantName}. Caller: ${payload.callerPhone}. Recovery SMS sent. Check Lead Inbox: ${leadUrl}`;
+    const ownerMessage = `AI BackOffice Alert: Missed call recovered for ${tenantName}. Caller: ${payload.callerPhone}. Recovery SMS sent. Check Lead Inbox${leadUrl ? `: ${leadUrl}` : "."}`;
     ownerSmsResult = await sendSms(settings.ownerAlertPhone, ownerMessage, { tenantId });
   }
 
@@ -270,7 +275,7 @@ export async function executeMissedCallRecovery(tenantId: string, settings: Miss
     const emailBody = [
       `Caller phone: ${payload.callerPhone}`,
       `Timestamp: ${new Date().toISOString()}`,
-      `Lead link: ${leadUrl}`,
+      `Lead link: ${leadUrl ?? "not available in this environment"}`,
       `Recovery SMS status: ${outcomeFromSms(recoverySmsResult)}`,
       `Next action: Review the lead and follow up with the caller.`,
     ].join("\n");

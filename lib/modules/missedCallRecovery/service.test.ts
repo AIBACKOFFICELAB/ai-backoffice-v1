@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { computeOverallStatus } from "./service";
+import { readFileSync } from "fs";
+import { join } from "path";
+import { computeOverallStatus, ownerLeadLink } from "./service";
 
 /**
  * Missed Call Recovery (P0.9 Slice C). `executeMissedCallRecovery` itself
@@ -40,5 +42,31 @@ describe("computeOverallStatus — legacy status vocabulary (unchanged by H-03)"
 
   it("SMS send failed -> 'failed'", () => {
     expect(computeOverallStatus({ ok: false, skipped: false, reason: "twilio-error", status: 500 })).toBe("failed");
+  });
+});
+
+describe("ownerLeadLink — operational lead link (AIBO-RD-M002A)", () => {
+  it("with no origin (staging without an approved origin) produces no link, with or without a lead", () => {
+    expect(ownerLeadLink(null, "lead-1")).toBeNull();
+    expect(ownerLeadLink(null, null)).toBeNull();
+  });
+
+  it("with the Production origin, links to the lead in Lead Inbox (existing behavior preserved)", () => {
+    expect(ownerLeadLink("https://aibackoffice.app", "lead-1")).toBe("https://aibackoffice.app/leads/lead-1");
+    expect(ownerLeadLink("https://aibackoffice.app", null)).toBe("https://aibackoffice.app");
+  });
+
+  it("never emits a Production domain for a staging origin", () => {
+    const link = ownerLeadLink("https://staging.example.test", "lead-1");
+    expect(link).toBe("https://staging.example.test/leads/lead-1");
+    expect(link).not.toMatch(/aibackoffice\.app/);
+  });
+});
+
+describe("missed-call service has no hardcoded Production origin (static guard)", () => {
+  it("the source references no Production domain literal; origin comes only from lib/appOrigin", () => {
+    const src = readFileSync(join(__dirname, "service.ts"), "utf8");
+    expect(src).not.toMatch(/aibackoffice\.app/);
+    expect(src).toMatch(/operationalAppOrigin\(\)/);
   });
 });

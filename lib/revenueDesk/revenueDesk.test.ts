@@ -97,7 +97,7 @@ class FakeBookingStore implements BookingStore {
   /** Postgres may report ANY violated unique guard for a concurrent duplicate. */
   duplicateReportsAs: "per_call" | "slot" | "key" = "per_call";
   /** The DATABASE clock (insert default / trigger / lease RPC), distinct from the app's deps.now. */
-  constructor(public clock: () => Date = () => new Date()) {}
+  constructor(public clock: () => Date = () => MON_6AM) {}
   async findByIdempotencyKey(tenantId: string, key: string) {
     const r = this.rows.find((r) => r.tenantId === tenantId && r.idempotencyKey === key);
     return r ? { ...r } : null; // a snapshot, like a real DB read
@@ -283,7 +283,8 @@ describe("slots (timezone, hours, busy, DST)", () => {
 });
 
 describe("booking state machine", () => {
-  const base = (calendar = new FakeCalendar(), store = new FakeBookingStore()) => ({ calendar, store, deps: { calendar, store, now: () => MON_6AM } });
+  // Fixed database clock: the store must not read the wall clock (the slot is Monday 2026-10-12; a real-clock fixture fails once that date has passed).
+  const base = (calendar = new FakeCalendar(), store = new FakeBookingStore(() => MON_6AM)) => ({ calendar, store, deps: { calendar, store, now: () => MON_6AM } });
   const req = (over: Record<string, any> = {}) => ({ cfg: cfgA(), callId: "call-1", leadId: "lead-1", start: "2026-10-12T14:00:00Z", durationMinutes: 60, callerConfirmed: true, summary: "x", ...over });
 
   it("open slot -> exactly one confirmed booking with provider event id", async () => {
