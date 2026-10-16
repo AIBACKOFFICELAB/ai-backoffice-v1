@@ -1,6 +1,6 @@
 import type { BusyInterval } from "../slots";
 
-export type CalendarFailure = "SLOT_UNAVAILABLE" | "CALENDAR_UNAVAILABLE" | "CONFIGURATION_ERROR" | "INVALID_REQUEST" | "PROVIDER_ERROR";
+export type CalendarFailure = "SLOT_UNAVAILABLE" | "CALENDAR_UNAVAILABLE" | "CONFIGURATION_ERROR" | "INVALID_REQUEST" | "PROVIDER_ERROR" | "CONFIRMATION_UNAVAILABLE";
 
 export class CalendarError extends Error {
   constructor(public category: CalendarFailure, message: string = category) {
