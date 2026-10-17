@@ -9,6 +9,9 @@ import { transferEvidenceLabel, transferLabel, transferOutcome } from "./transfe
 
 // A real 027 -> 028 upgrade, not a fresh-schema approximation. Only a local
 // disposable PostgreSQL server is permitted; no hosted URL can create a DB.
+// Deliberately retains the canonical historical profile for legacy backfill
+// regressions. Final H001 security acceptance uses the separate Preview
+// SEC-01 profile (npm run test:db:bootstrap), checked by previewProfile.pg.test.ts.
 const url = getPgTestUrl();
 const suite = url ? describe : describe.skip;
 const database = `rd_f01_${randomUUID().replaceAll("-", "")}`;

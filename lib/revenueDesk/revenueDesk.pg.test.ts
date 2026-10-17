@@ -52,11 +52,19 @@ DESCRIBE("Revenue Desk schema + RLS (real Postgres)", () => {
       const tA = await insertTenant(c); const uA = randomUUID(); await insertMembership(c, tA, uA);
       await c.query(`INSERT INTO public.revenue_desk_settings (tenant_id, escalation_phone) VALUES ($1,'+13055550100')`, [tA]);
       const callId = await call(c, tA);
+      const beforeSettings = (await c.query(`SELECT * FROM revenue_desk_settings WHERE tenant_id=$1`, [tA])).rows;
+      const beforeCalls = (await c.query(`SELECT * FROM revenue_desk_calls WHERE tenant_id=$1`, [tA])).rows;
+      const beforeBookings = (await c.query(`SELECT * FROM revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows;
       await setRole(c, "authenticated", uA);
-      expect((await c.query(`UPDATE public.revenue_desk_settings SET escalation_phone='+19995550000', enabled=true WHERE tenant_id=$1`, [tA])).rowCount).toBe(0);
-      expect((await c.query(`UPDATE public.revenue_desk_calls SET status='booked' WHERE tenant_id=$1`, [tA])).rowCount).toBe(0);
+      // Preview SEC-01 denies SQL UPDATE privileges before RLS is evaluated.
+      await expectCode(c, () => c.query(`UPDATE public.revenue_desk_settings SET escalation_phone='+19995550000', enabled=true WHERE tenant_id=$1`, [tA]), "42501");
+      await expectCode(c, () => c.query(`UPDATE public.revenue_desk_calls SET status='booked' WHERE tenant_id=$1`, [tA]), "42501");
       await expectCode(c, () => c.query(`INSERT INTO public.revenue_desk_calls (tenant_id, provider_call_id) VALUES ($1,'x')`, [tA]), "42501");
       await expectCode(c, () => booking(c, tA, callId), "42501");
+      await c.query("RESET ROLE");
+      expect((await c.query(`SELECT * FROM revenue_desk_settings WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeSettings);
+      expect((await c.query(`SELECT * FROM revenue_desk_calls WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeCalls);
+      expect((await c.query(`SELECT * FROM revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeBookings);
     }));
 
   it("anon is refused", () =>
@@ -246,10 +254,14 @@ DESCRIBE("H001 atomic corrections and evidence (proposal 028, disposable Postgre
   it("intake receipts are tenant-readable and immutable to members", () => withRollback(async c => {
     const a=await insertTenant(c),b=await insertTenant(c),user=randomUUID();
     await insertMembership(c,a,user); await save(c,a,await call(c,a),0,"a"); await save(c,b,await call(c,b),0,"b");
+    const receipts = () => c.query(`SELECT * FROM revenue_desk_intake_receipts WHERE tenant_id=ANY($1::uuid[]) ORDER BY tenant_id,call_id,request_id`, [[a,b]]);
+    const before = (await receipts()).rows;
     await setRole(c,"authenticated",user);
     expect((await c.query(`SELECT tenant_id FROM revenue_desk_intake_receipts`)).rows.map(r=>r.tenant_id)).toEqual([a]);
-    expect((await c.query(`UPDATE revenue_desk_intake_receipts SET revision=999`)).rowCount).toBe(0);
-    expect((await c.query(`DELETE FROM revenue_desk_intake_receipts`)).rowCount).toBe(0);
+    await expectCode(c,()=>c.query(`UPDATE revenue_desk_intake_receipts SET revision=999`),"42501");
+    await expectCode(c,()=>c.query(`DELETE FROM revenue_desk_intake_receipts`),"42501");
+    await c.query("RESET ROLE");
+    expect((await receipts()).rows).toEqual(before);
   }));
 });
 

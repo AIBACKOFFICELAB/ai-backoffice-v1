@@ -9,6 +9,7 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:db:bootstrap": "node scripts/bootstrap-preview-test-db.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

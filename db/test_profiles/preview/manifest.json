@@ -1,0 +1,163 @@
+{
+  "profile": "preview-sec01-h001",
+  "postgres_major": 17,
+  "baseline_commit": "ba8824807c23cc90c8668184f2cafa8ef89fe772",
+  "h001_commit": "fb7ad75e9afccec1689cc5168442e481c43c6c4b",
+  "sequence": [
+    {
+      "stage": "001",
+      "file": "db/migrations/001_create_leads_table.sql",
+      "sha256": "35c16e7c367f4e670445bf5f6e5cc3516f4f76591354eeadf71281753628ebcc"
+    },
+    {
+      "stage": "002",
+      "file": "db/migrations/002_multi_tenant_rls.sql",
+      "sha256": "eec019b417f95b85c5b3d26adef3942f6fc321cd1bdb2e0bb35bfe02261eead3"
+    },
+    {
+      "stage": "003",
+      "file": "db/migrations/003_lock_down_is_tenant_member_rpc.sql",
+      "sha256": "6096df0fc0eedf9abaadf3345acaaebb1226c3a97264b9bbf5ad1d9b6a820a99"
+    },
+    {
+      "stage": "004",
+      "file": "db/migrations/004_missed_call_recovery_module.sql",
+      "sha256": "df88b667613439f9643aa8dc978cc1865d1684f6a362c5e791569045fb0bdf75"
+    },
+    {
+      "stage": "005",
+      "file": "db/migrations/005_estimate_followup_module.sql",
+      "sha256": "ba05278f012bbdc842a051da83b94dd8343fce7c7c5ccbe77c2553fb3899b663"
+    },
+    {
+      "stage": "006",
+      "file": "db/migrations/006_platform_prospects.sql",
+      "sha256": "4c71eefe42689b4e8f1aed052a1079a6c2d4a4c3bfe2dfc47ac20742b7bcaff9"
+    },
+    {
+      "stage": "007",
+      "file": "db/migrations/007_restore_is_tenant_member_execute_grant.sql",
+      "sha256": "65d0053cacd625c62b5d22ad95338cb197182895411186f6dce4df12e767620e"
+    },
+    {
+      "stage": "008",
+      "file": "db/test_profiles/preview/008_preview.sql",
+      "sha256": "0cb39ece06fef17daaae9374aae2c6e74099738ab16ab903d7edcf22ed29e268"
+    },
+    {
+      "stage": "SEC-01",
+      "file": "db/test_profiles/preview/SEC-01.sql",
+      "sha256": "99f84ab33f522edd3ed2c97be20a36bcec182d943d4aecf196a9fc0cd8a2b041"
+    },
+    {
+      "stage": "009",
+      "file": "db/migrations/009_business_events.sql",
+      "sha256": "466701e5f36aef81135f706938df7b052bb9d803986a593eb30188326bd916dd"
+    },
+    {
+      "stage": "010",
+      "file": "db/migrations/010_agent_registry.sql",
+      "sha256": "3741f1aae07793d2447af1c5b0289e661d8ec7258a97bee6b135676c039fb98c"
+    },
+    {
+      "stage": "011",
+      "file": "db/migrations/011_agent_runs.sql",
+      "sha256": "738f14b6e35ceb2c381c325468846dd199e3bfd547ccd91ab63177561668651a"
+    },
+    {
+      "stage": "012",
+      "file": "db/migrations/012_approvals.sql",
+      "sha256": "981236a7ef2684500a0f8bdee3cdd0e3fef2b6899a24e7274572e740254114a5"
+    },
+    {
+      "stage": "013",
+      "file": "db/migrations/013_tool_calls.sql",
+      "sha256": "1da8ad4d938f994947a5b17037014593ac4ac42c98a1dfae706c4467310a7ba7"
+    },
+    {
+      "stage": "014",
+      "file": "db/migrations/014_model_invocations.sql",
+      "sha256": "df5c318fd83ba84906afb589291a19e1311ef7fab73c07dce776fde3e9233725"
+    },
+    {
+      "stage": "015",
+      "file": "db/migrations/015_outcomes.sql",
+      "sha256": "ebc7c578f9f89bfe44fe2d9b5a7feacaa121f8848b5385e19432ba20715803ca"
+    },
+    {
+      "stage": "016",
+      "file": "db/migrations/016_durable_jobs.sql",
+      "sha256": "e12f9aedf8cb6459076c9fa1b3ffb92f65326605c5f499594f85efeb152b1d9e"
+    },
+    {
+      "stage": "017",
+      "file": "db/migrations/017_p0_agentic_foundation_hardening.sql",
+      "sha256": "0fdb7f8ac9eb61d1e40bd54e51087cae80c55d28652ef63ab0d4c3c5eced169f"
+    },
+    {
+      "stage": "018",
+      "file": "db/migrations/018_p0_durable_execution_audit_hardening.sql",
+      "sha256": "72f18d98b93aaf5efbdb4364ea3cbc4325752ba8878e068d9f554768ebd6d44a"
+    },
+    {
+      "stage": "019",
+      "file": "db/migrations/019_p0_production_compatibility_privacy.sql",
+      "sha256": "f0174b161c594103254fa7e27819a0a5ef8dfc98fb208d2853a5168657c5a282"
+    },
+    {
+      "stage": "020",
+      "file": "db/migrations/020_p0_final_security_hardening.sql",
+      "sha256": "fe2aec2e4d5f80fb8492515873a2768a1752d1c242a7b2c156cb81b44cb230b3"
+    },
+    {
+      "stage": "021",
+      "file": "db/migrations/021_direct_revenue_aggregate.sql",
+      "sha256": "e36c49d6ff8452e482e3393cbe35a90721974d2ada865024e1f314a8a6feda28"
+    },
+    {
+      "stage": "022",
+      "file": "db/migrations/022_revoke_anon_direct_revenue_aggregate.sql",
+      "sha256": "502b59494d3f3fac60390596fa1867592593377ae1d0038e9251c7c935510aab"
+    },
+    {
+      "stage": "023",
+      "file": "db/migrations/023_canonical_lead_intake_provenance.sql",
+      "sha256": "290bd337632ff01ab5492e57773c0649d3ca6788187dd301ae4028fd521ef701"
+    },
+    {
+      "stage": "024",
+      "file": "db/migrations/024_estimate_followup_lifecycle_write_policies.sql",
+      "sha256": "aae7931fc3f7f9df1f88d05417a86f722fd85d37c80a06222e1157d9f7f460e0"
+    },
+    {
+      "stage": "025",
+      "file": "db/migrations/025_founder_beta_billing.sql",
+      "sha256": "7890aa49ee118a2bee1470e73d084b4384a3197780359b95800a4fdfca9abf63"
+    },
+    {
+      "stage": "026",
+      "file": "db/migrations/026_revenue_desk.sql",
+      "sha256": "9dd3a806ca1e31a87e3df0485a089b18e3cba942451dc505225d97028be7de09"
+    },
+    {
+      "stage": "027",
+      "file": "db/migrations/027_revenue_desk_booking_lease.sql",
+      "sha256": "ead9a5d56f3b9bfb2ff7ce4db3f1c1f4a6a605753ea0154c3280338f93383a6e"
+    },
+    {
+      "stage": "028",
+      "file": "db/migrations/028_revenue_desk_hardening.sql",
+      "sha256": "3f582103c9b878f81168c7f0eb88cad09431309fd548e41c58453f2b22fa6ca4"
+    }
+  ],
+  "scaffold": [
+    {
+      "file": "db/shadow_env/000_supabase_scaffold.sql",
+      "sha256": "8e0526fb3d38a429189d3152e8a0a64d68cbe169bdb42d85c1e48d6b68449822"
+    },
+    {
+      "file": "db/test_profiles/preview/platform-defaults.sql",
+      "sha256": "932887b0c1f6e225dc5a93aa875963b1e7132ea8e1dcfdcf06094c73e231df09"
+    }
+  ]
+}
