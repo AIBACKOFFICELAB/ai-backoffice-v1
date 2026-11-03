@@ -8,6 +8,8 @@ import { PageHeader } from "@/components/ui/PageHeader";
 import { Card, CardBody } from "@/components/ui/Card";
 import { formatOperationalTimestamp } from "@/lib/format/timestamp";
 import { Alert } from "@/components/ui/Alert";
+import { transferLabel, transferEvidenceLabel } from "@/lib/revenueDesk/transfer";
+import { checkBookingEvidence } from "../actions";
 
 const ts = (v: string | null | undefined) => formatOperationalTimestamp(v)?.display ?? "—";
 
@@ -30,7 +32,8 @@ export default async function RevenueDeskCallPage({ params }: { params: Promise<
     ["Priority", call.priority ?? "Unclassified"],
     ["Urgency signals", (call.urgency_signals ?? []).join(", ") || "None"],
     ["Policy reasons", (intake.reasons ?? []).join(", ") || "—"],
-    ["Escalation", call.escalation_reason ? `${call.escalation_reason} → ${call.escalation_result ?? "requested"}` : "None"],
+    ["Escalation", call.escalation_result ? transferLabel[call.escalation_result] ?? "Unknown" : call.escalation_reason ?? "None"],
+    ["Transfer evidence", (call.transfer_evidence ?? []).map((e: string) => transferEvidenceLabel[e] ?? "Unverified observation").join("; ") || "None"],
     ["Booking outcome", call.booking_outcome ?? "Not attempted"],
     ["Failure", call.failure_category ?? "None"],
     ["Ended reason", call.ended_reason ?? "—"],
@@ -41,6 +44,7 @@ export default async function RevenueDeskCallPage({ params }: { params: Promise<
       <Link href="/revenue-desk" className="text-sm font-semibold text-brand-700">← Revenue Desk</Link>
       <PageHeader title={`Call · ${ts(call.created_at)}`} description="Structured operational evidence. Audio and full transcripts are not stored." />
       {followUp && <Alert tone="warning"><strong>Action needed: {followUp.label}.</strong> {followUp.detail}</Alert>}
+      {data.evidenceUnavailable && <Alert tone="danger">Some booking or audit evidence is unavailable. Do not infer that no appointment exists.</Alert>}
       <div className="grid gap-6 lg:grid-cols-2">
         <Card><CardBody>
           <h2 className="text-sm font-semibold text-ink-900">Service request</h2>
@@ -61,10 +65,14 @@ export default async function RevenueDeskCallPage({ params }: { params: Promise<
       </div>
       <Card><CardBody>
         <h2 className="text-sm font-semibold text-ink-900">Booking attempts</h2>
-        {bookings.length === 0 ? <p className="mt-2 text-sm text-ink-500">No booking was attempted.</p> : (
+        {bookings.length === 0 ? <p className="mt-2 text-sm text-ink-500">{data.evidenceUnavailable ? "Booking evidence unavailable." : "No booking was attempted."}</p> : (
           <ul className="mt-2 space-y-1.5 text-sm text-ink-700">
             {bookings.map((b: any) => (
-              <li key={b.id}>{ts(b.requested_start)} ({b.timezone}) — <strong>{b.status}</strong>{b.provider_event_id ? " · calendar event confirmed" : ""}{b.failure_category ? ` · ${b.failure_category}` : ""}</li>
+              <li key={b.id}>{ts(b.requested_start)} ({b.timezone}) — <strong>{b.status}</strong>{b.provider_event_id ? b.status === "confirmed" ? " · calendar event verified" : " · provider event reference retained; outcome unresolved" : ""}{b.failure_category ? ` · ${b.failure_category}` : ""}
+                {b.status === "pending" && <p>Do not arrange another appointment until this attempt is resolved.</p>}
+                {b.status === "pending" && b.failure_category === "CONFLICT_CLEANUP_PENDING" && <p>Calendar cleanup is unresolved. Independent operator review is required; automatic confirmation is disabled for this attempt.</p>}
+                {b.status === "pending" && b.failure_category !== "CONFLICT_CLEANUP_PENDING" && tenant.role === "owner" && <form action={checkBookingEvidence}><input type="hidden" name="bookingId" value={b.id} /><button className="underline" type="submit">Check calendar evidence</button></form>}
+              </li>
             ))}
           </ul>
         )}

@@ -1,6 +1,6 @@
 import { verifyVapiRequest, MAX_BODY_BYTES } from "./auth";
 import { parseVapiMessage } from "./parse";
-import { assistantContext, completeCall, handleToolCall, startOrResumeCall, transferDestination, type RevenueDeskDeps } from "@/lib/revenueDesk/service";
+import { assistantContext, completeCall, handleToolCall, startOrResumeCall, transferDestination, recordTransferInitiated, type RevenueDeskDeps } from "@/lib/revenueDesk/service";
 
 export type HttpResult = { status: number; body: Record<string, unknown> };
 
@@ -63,9 +63,12 @@ export async function handleVapiRequest(
     }
     case "transfer-destination-request": {
       const number = ctx ? await transferDestination(deps, ctx) : null;
-      if (!number) return { status: 200, body: { error: "No transfer destination is available.", message: { type: "request-start", message: "I'm sorry, I can't transfer you right now. The team will call you back." } } };
+      if (!number) return { status: 200, body: { error: "No transfer destination is available.", message: { type: "request-start", message: "I'm sorry, I can't transfer you right now. Please call the business again for help." } } };
       return { status: 200, body: { destination: { type: "number", number, message: "Connecting you to the team now." } } };
     }
+    case "transfer-update":
+      if (ctx) await recordTransferInitiated(deps, ctx);
+      return { status: 200, body: { ok: true } };
     case "status-update":
       return { status: 200, body: { ok: true } };
     case "end-of-call-report":

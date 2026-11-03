@@ -5,7 +5,8 @@ import { describe, expect, it, vi } from "vitest";
 import { parseRevenueDeskConfig, ConfigError, type RevenueDeskConfig } from "./config";
 import { classifyUrgency } from "./urgency";
 import { generateSlots, isSlotWithinPolicy, zonedToUtc } from "./slots";
-import { bookAppointment, BOOKING_CONFIRMATION_FOLLOW_UP, bookingIdempotencyKey, bookingUniqueViolation, BookingKeyConflictError, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
+import { bookAppointment as guardedBookAppointment, BOOKING_CONFIRMATION_FOLLOW_UP, bookingIdempotencyKey, bookingUniqueViolation, BookingKeyConflictError, CallAlreadyBookedError, SlotTakenError, PENDING_LEASE_MS, type Booking, type BookingStore } from "./booking";
+import { transferOutcome } from "./transfer";
 import { CalendarError, type CalendarProvider, type ProviderEvent } from "./calendar/types";
 import { handleToolCall, startOrResumeCall, completeCall, type CallRow, type RevenueDeskStore, type RevenueDeskDeps } from "./service";
 import { revenueDeskAgentDefinition, REVENUE_DESK_TOOLS } from "./tools";
@@ -51,6 +52,12 @@ const cfgA = (over: Record<string, any> = {}) => parseRevenueDeskConfig(row(over
 
 // Monday 2026-10-12 06:00 local (10:00Z, EDT) — before opening.
 const MON_6AM = new Date("2026-10-12T10:00:00Z");
+
+// Synthetic trusted-boundary fixture ONLY for the existing downstream booking
+// fault suite. Production installs no confirmation adapter. Separate tests below
+// exercise the real default gate with no fixture authorization.
+const syntheticConfirmations = { consume: async () => true };
+const bookAppointment: typeof guardedBookAppointment = (deps, req) => guardedBookAppointment({ confirmations: syntheticConfirmations, ...deps }, req);
 
 // ---------------------------------------------------------------- fakes
 class FakeCalendar implements CalendarProvider {
@@ -110,8 +117,9 @@ class FakeBookingStore implements BookingStore {
     if (live.some((r) => r.callId === b.callId)) throw new CallAlreadyBookedError();
     if (live.some((r) => r.calendarId === b.calendarId && r.start === b.start)) throw new SlotTakenError();
     const r: Booking = { ...b, id: randomUUID(), providerEventId: null, status: "pending", failureCategory: null, updatedAt: this.clock().toISOString() };
+    r.leaseToken = randomUUID();
     this.rows.push(r);
-    return r;
+    return { ...r };
   }
   claims = 0;
   /** Models migration 027: lease expiry judged ONLY by the database clock, atomically. */
@@ -120,13 +128,15 @@ class FakeBookingStore implements BookingStore {
     if (!r || r.status !== "pending" || leaseSeconds < 1 || leaseSeconds > 3600) return null;
     if (this.clock().getTime() - Date.parse(r.updatedAt) < leaseSeconds * 1000) return null;
     this.claims++;
+    r.leaseToken = randomUUID();
     r.updatedAt = this.clock().toISOString();
     return { ...r };
   }
-  async update(tenantId: string, id: string, patch: Partial<Booking>) {
+  async update(tenantId: string, id: string, patch: Partial<Booking>, leaseToken?: string) {
     const r = this.rows.find((x) => x.tenantId === tenantId && x.id === id)!;
+    if (!r || r.status !== "pending" || (leaseToken && r.leaseToken !== leaseToken)) throw new Error("stale lease");
     Object.assign(r, patch, { updatedAt: this.clock().toISOString() });
-    return r;
+    return { ...r };
   }
 }
 
@@ -142,6 +152,7 @@ class FakeStore implements RevenueDeskStore {
   leads: Array<{ tenantId: string; id: string; sourceRef: string; payload: Record<string, unknown> }> = [];
   events: Array<{ tenantId: string; eventType: string; idempotencyKey: string; payload: Record<string, unknown> }> = [];
   failLead = false;
+  receipts = new Map<string, { digest: string; revision: number }>();
   async resolveTenantByProviderNumber(id: string) {
     const c = this.configs.get(id);
     return c ? { config: c } : null;
@@ -170,6 +181,26 @@ class FakeStore implements RevenueDeskStore {
     this.leads.push(l);
     return l.id;
   }
+  async saveIntake(tenantId: string, call: CallRow, payload: Record<string, unknown>, patch: Record<string, any>, requestId: string) {
+    if (this.failLead) throw new Error("db down");
+    validateIntake(payload);
+    const current = this.calls.find((c) => c.tenantId === tenantId && c.id === call.id);
+    if (!current) throw new Error("cross tenant");
+    const digest = JSON.stringify({ payload, patch });
+    const key = `${tenantId}:${call.id}:${requestId}`;
+    const receipt = this.receipts.get(key);
+    if (receipt && (receipt.digest !== digest || receipt.revision !== current.intakeRevision)) throw new Error("superseded replay");
+    if (current.digest !== digest && (call.intakeRevision ?? 0) !== (current.intakeRevision ?? 0)) throw new Error("stale revision");
+    let lead = this.leads.find((l) => l.tenantId === tenantId && l.sourceRef === call.id);
+    if (!lead) { lead = { tenantId, id: randomUUID(), sourceRef: call.id, payload }; this.leads.push(lead); }
+    if (current.digest !== digest) {
+      lead.payload = payload;
+      Object.assign(current, patch, { leadId: lead.id, digest, intakeRevision: (current.intakeRevision ?? 0) + 1,
+        status: ["in_progress", "intake_captured"].includes(current.status) ? "intake_captured" : current.status });
+    }
+    this.receipts.set(key, { digest, revision: current.intakeRevision! });
+    return { ...current };
+  }
   async emit(i: any) {
     const contract = getEventContract(i.eventType);
     const v = contract!.validatePayload(i.payload);
@@ -189,7 +220,7 @@ function world(now = MON_6AM) {
   store.agents.set(T_B, agentFor(T_B));
   const calendar = new FakeCalendar();
   const bookings = new FakeBookingStore(() => now);
-  const deps: RevenueDeskDeps = { store, calendar, bookings, now: () => now };
+  const deps: RevenueDeskDeps = { store, calendar, bookings, now: () => now, confirmations: syntheticConfirmations };
   return { store, calendar, bookings, deps };
 }
 
@@ -219,6 +250,129 @@ describe("config — saved Vapi assistant", () => {
     expect(cfgA({ vapi_assistant_id: null }).vapiAssistantId).toBeNull();
     expect(() => cfgA({ vapi_assistant_id: "asst; drop" })).toThrow(ConfigError);
     expect(() => cfgA({ vapi_assistant_id: "https://evil.example/assistant" })).toThrow(ConfigError);
+  });
+});
+
+describe("H001 confirmation containment and canonical corrections", () => {
+  it.each([true, false, "yes", null])("model confirmation %s cannot authorize the live boundary", async (value) => {
+    const { deps, calendar, bookings } = world();
+    delete deps.confirmations;
+    const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "capture");
+    const r = await handleToolCall(deps, ctx, "revenue_desk_book_appointment", { slotStart: "2026-10-12T14:00:00Z", durationMinutes: 120, callerConfirmed: value }, "book");
+    expect(r.ok).toBe(false);
+    expect(calendar.calls.create).toBe(0);
+    expect(bookings.rows).toHaveLength(0);
+  });
+  it("direct write path also rejects absent or unavailable independent evidence", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore();
+    const req = { cfg: cfgA(), callId: "c", leadId: "l", start: "2026-10-12T14:00:00Z", durationMinutes: 60, callerConfirmed: true, summary: "test" };
+    for (const confirmations of [undefined, { consume: async () => false }, { consume: async () => { throw new Error("unavailable"); } }]) {
+      expect(await guardedBookAppointment({ calendar, store, now: () => MON_6AM, confirmations }, req)).toMatchObject({ confirmed: false, failure: "CONFIRMATION_UNAVAILABLE" });
+    }
+    expect(calendar.calls.create).toBe(0);
+    expect(store.rows).toHaveLength(0);
+  });
+  it("passes exact tenant/call/revision/calendar/time binding to the independent boundary", async () => {
+    const calendar = new FakeCalendar(), store = new FakeBookingStore();
+    const consume = vi.fn(async () => false);
+    await guardedBookAppointment({ calendar, store, now: () => MON_6AM, confirmations: { consume } }, { cfg: cfgA(), callId: "c", leadId: "l", intakeRevision: 3, start: "2026-10-12T14:00:00Z", durationMinutes: 60, callerConfirmed: true, summary: "test" });
+    expect(consume).toHaveBeenCalledWith({ tenantId: T_A, callId: "c", leadId: "l", intakeRevision: 3, calendarId: cfgA().calendarId, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ, idempotencyKey: bookingIdempotencyKey("c", "2026-10-12T14:00:00Z", 60) });
+  });
+  it("correction keeps one lead and matching authoritative call; old tool replay cannot undo it", async () => {
+    const { deps, store } = world(); const ctx = await startCall(deps);
+    await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "original");
+    const id = ctx.call.leadId;
+    expect(await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs({ serviceAddress: "2 Correct St", callbackPhone: "+13055559876", serviceCategory: "Drain Cleaning" }), "correction")).toMatchObject({ saved: true });
+    expect(store.leads).toHaveLength(1);
+    expect(store.leads[0].id).toBe(id);
+    expect(store.leads[0].payload).toMatchObject({ serviceAddress: "2 Correct St", phone: "+13055559876", serviceType: "Drain Cleaning" });
+    expect(store.calls[0].intake).toMatchObject({ serviceAddress: "2 Correct St", callbackPhone: "+13055559876", serviceCategory: "Drain Cleaning" });
+    expect(await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "original")).toMatchObject({ ok: false, error: "INTAKE_NOT_SAVED" });
+    expect(store.leads[0].payload.serviceAddress).toBe("2 Correct St");
+    expect((await handleToolCall(deps, ctx, "revenue_desk_check_availability", {})).error).toBe("INTAKE_REQUIRED");
+  });
+  it("concurrent conflicting revisions cannot both report successful corrections", async () => {
+    const { deps, store } = world(); const a = await startCall(deps);
+    await handleToolCall(deps, a, "revenue_desk_capture_intake", intakeArgs(), "first");
+    const b = await startCall(deps);
+    const rs = await Promise.all([handleToolCall(deps, a, "revenue_desk_capture_intake", intakeArgs({ serviceAddress: "2 A St" }), "a"), handleToolCall(deps, b, "revenue_desk_capture_intake", intakeArgs({ serviceAddress: "3 B St" }), "b")]);
+    expect(rs.filter(r => r.ok)).toHaveLength(1);
+    expect(store.leads[0].payload.serviceAddress).toBe(store.calls[0].intake!.serviceAddress);
+  });
+  it("ambiguous persistence acknowledgement never reports saved or uses stale intake", async () => {
+    const { deps, store } = world(); const ctx = await startCall(deps);
+    const save = store.saveIntake.bind(store);
+    store.saveIntake = async (...args) => { await save(...args); throw new Error("response lost"); };
+    expect(await handleToolCall(deps, ctx, "revenue_desk_capture_intake", intakeArgs(), "op")).toMatchObject({ ok: false, error: "INTAKE_NOT_SAVED" });
+    expect(ctx.call.intake).toBeNull();
+    expect(store.leads).toHaveLength(1);
+    store.saveIntake = save;
+    expect(await handleToolCall(deps, await startCall(deps), "revenue_desk_capture_intake", intakeArgs(), "op")).toMatchObject({ saved: true });
+    expect(store.leads).toHaveLength(1);
+  });
+});
+
+describe("H001 explicit transfer evidence", () => {
+  it.each([
+    ["assistant-forwarded-call", "transferred"],
+    ["call.in-progress.error-transfer-failed", "transfer_failed"],
+    ["customer-ended-call-during-transfer", "unknown"],
+    ["assistant-forwarded-call-failed", "unknown"],
+    ["transfer-super-success-human-answered", "unknown"],
+    [null, "unknown"],
+  ])("maps %s explicitly to %s", (reason, outcome) => expect(transferOutcome(reason)).toBe(outcome));
+  it("transfer-update records only initiation, ignoring human-answer claims", () => {
+    expect(parseVapiMessage({ message: { type: "transfer-update", call: { id: "c", phoneNumberId: "pn-A" }, humanAnswered: true, status: "completed" } })).toMatchObject({ kind: "transfer-update" });
+  });
+});
+
+describe("H001 uncertain calendar outcomes", () => {
+  const req = { cfg: cfgA(), callId: "c", leadId: "l", start: "2026-10-12T14:00:00Z", durationMinutes: 60, callerConfirmed: true, summary: "test" };
+  const setup = () => {
+    let time = MON_6AM.getTime(); const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(time));
+    return { calendar, store, deps: { calendar, store, now: () => MON_6AM }, expire: () => { time += PENDING_LEASE_MS + 1; } };
+  };
+  it("create timeout + empty lookup stays pending across repeated expired leases; delayed event is reconciled once", async () => {
+    const w = setup(); w.calendar.failCreateBeforeWrite = true;
+    expect(await bookAppointment(w.deps, req)).toMatchObject({ confirmed: false, statusUnknown: true });
+    for (let i=0;i<3;i++) { w.expire(); expect(await bookAppointment(w.deps, req)).toMatchObject({ statusUnknown: true }); }
+    expect(w.calendar.calls.create).toBe(1);
+    const b = w.store.rows[0]; expect(b.status).toBe("pending");
+    w.calendar.events.push({ calendarId: b.calendarId, eventId: "late", aiboBookingId: b.id, start: b.start, end: b.end });
+    w.expire(); expect(await bookAppointment(w.deps, req)).toMatchObject({ confirmed: true, providerEventId: "late" });
+    expect(w.calendar.calls.create).toBe(1);
+  });
+  it("cleanup timeout is non-final and cannot later become a confirmed booking", async () => {
+    const w = setup(); w.calendar.injectCompetitorOnCreate = true;
+    w.calendar.deleteEvent = async () => { throw new Error("timeout"); };
+    expect(await bookAppointment(w.deps, req)).toMatchObject({ statusUnknown: true });
+    expect(w.store.rows[0]).toMatchObject({ status: "pending", failureCategory: "CONFLICT_CLEANUP_PENDING", providerEventId: "ev-1" });
+    w.calendar.events = w.calendar.events.filter(e => e.eventId !== "competitor");
+    w.expire(); expect(await bookAppointment(w.deps, req)).toMatchObject({ statusUnknown: true });
+    expect(w.store.rows[0].status).toBe("pending");
+  });
+  it.each(["missing", "moved", "duplicate"])("%s own-event evidence cannot confirm", async mode => {
+    const w = setup(); const list = w.calendar.listEvents.bind(w.calendar);
+    w.calendar.listEvents = async (...args) => { const es = await list(...args); return mode === "missing" ? [] : mode === "moved" ? es.map(e => ({ ...e, end: "2026-10-12T16:00:00Z" })) : [...es, { ...es[0], eventId: "dup" }]; };
+    expect(await bookAppointment(w.deps, req)).toMatchObject({ statusUnknown: true });
+    expect(w.store.rows[0].status).toBe("pending");
+  });
+  it("database finalization failure never becomes a spoken success", async () => {
+    const w = setup(); const update = w.store.update.bind(w.store);
+    w.store.update = async (t,id,p,token) => { if (p.status === "confirmed") throw new Error("db down"); return update(t,id,p,token); };
+    expect(await bookAppointment(w.deps, req)).toMatchObject({ confirmed: false, statusUnknown: true });
+    expect(w.calendar.events).toHaveLength(1); expect(w.store.rows[0].status).toBe("pending");
+  });
+  it("expired lease fences the original worker while a delayed provider write completes", async () => {
+    const w = setup(); let release!: () => void;
+    w.calendar.createGate = new Promise<void>(r => { release = r; });
+    const first = bookAppointment(w.deps, req); await new Promise(r => setTimeout(r,0));
+    w.expire(); expect(await bookAppointment(w.deps, req)).toMatchObject({ statusUnknown: true });
+    release(); expect(await first).toMatchObject({ statusUnknown: true });
+    expect(w.store.rows[0].status).toBe("pending");
+    w.expire(); expect(await bookAppointment(w.deps, req)).toMatchObject({ confirmed: true });
+    expect(w.calendar.calls.create).toBe(1);
   });
 });
 
@@ -345,18 +499,19 @@ describe("booking state machine", () => {
     expect(await bookAppointment(inLease, req())).toMatchObject({ confirmed: false, statusUnknown: true });
     expect(calendar.calls.create).toBe(0);
     calendar.events.push({ calendarId: cfg.calendarId!, eventId: "ev-recovered", start: pending.start, end: pending.end, aiboBookingId: pending.id });
+    store.clock = () => new Date(MON_6AM.getTime() + PENDING_LEASE_MS + 1);
     expect(await bookAppointment(inLease, req())).toMatchObject({ confirmed: true, providerEventId: "ev-recovered" });
     expect(calendar.calls.create).toBe(0);
   });
-  it("expired pending lease with no provider event -> one retry with the SAME booking id", async () => {
+  it("expired pending lease with no provider event -> reconciliation only; no retry write", async () => {
     let dbNow = MON_6AM.getTime();
     const { calendar, store } = base(new FakeCalendar(), new FakeBookingStore(() => new Date(dbNow)));
     const cfg = cfgA();
     const key = bookingIdempotencyKey("call-1", "2026-10-12T14:00:00.000Z", 60);
     const pending = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: key, calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
     dbNow += PENDING_LEASE_MS + 1000; // lease expires by the DATABASE clock
-    expect(await bookAppointment({ calendar, store, now: () => MON_6AM }, req())).toMatchObject({ confirmed: true, bookingId: pending.id });
-    expect(calendar.events[0].aiboBookingId).toBe(pending.id);
+    expect(await bookAppointment({ calendar, store, now: () => MON_6AM }, req())).toMatchObject({ confirmed: false, statusUnknown: true, bookingId: pending.id });
+    expect(calendar.calls.create).toBe(0);
   });
   it("AIBO slot guard: a second call cannot book a slot already live for this calendar", async () => {
     const { calendar, deps } = base();
@@ -380,7 +535,7 @@ describe("Scenario A — routine booking end to end (fakes)", () => {
     expect(slot.durationMinutes).toBe(120); // service-specific duration
     const booked = await handleToolCall(deps, ctx, "revenue_desk_book_appointment", { slotStart: slot.slotStart, durationMinutes: slot.durationMinutes, callerConfirmed: true });
     expect(booked).toMatchObject({ ok: true, booked: true });
-    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 125, costUsd: 0.25, endedReason: "customer-ended-call", transferred: null });
+    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 125, costUsd: 0.25, endedReason: "customer-ended-call" });
 
     expect(store.calls).toHaveLength(1);
     expect(store.calls[0]).toMatchObject({ status: "booked", bookingOutcome: "confirmed", priority: "routine", durationSeconds: 125, providerCostUsd: 0.25 });
@@ -417,7 +572,7 @@ describe("Scenario B — urgent / human escalation", () => {
     expect(route).toMatchObject({ ok: true, transferAvailable: true });
     expect(JSON.stringify(route)).not.toContain("+1305"); // number never exposed to the model
     expect(calendar.calls.getBusy + calendar.calls.create).toBe(0);
-    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 60, costUsd: null, endedReason: "assistant-forwarded-call", transferred: true });
+    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 60, costUsd: null, endedReason: "assistant-forwarded-call" });
     expect(store.calls[0]).toMatchObject({ status: "escalated", escalationReason: "suspected_gas", escalationResult: "transferred" });
   });
   it("model cannot supply an arbitrary transfer destination", async () => {
@@ -430,7 +585,7 @@ describe("Scenario B — urgent / human escalation", () => {
     const ctx = await startCall(deps);
     await handleToolCall(deps, ctx, "revenue_desk_get_escalation_route", { reason: "caller_requests_human" });
     ctx.call.status = "escalated";
-    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 30, costUsd: null, endedReason: "assistant-forwarded-call-failed", transferred: false });
+    await completeCall(deps, ctx, { endedAt: null, startedAt: null, durationSeconds: 30, costUsd: null, endedReason: "call.in-progress.error-transfer-failed" });
     expect(store.calls[0].escalationResult).toBe("transfer_failed");
   });
 });
@@ -666,7 +821,7 @@ describe("Vapi adapter", () => {
     expect(a.status).toBe(200);
     expect(a.body).toEqual({
       assistantId: ASST_A,
-      assistantOverrides: { firstMessage: expect.stringContaining("Acme Plumbing"), variableValues: { businessName: "Acme Plumbing", serviceCategories: "Water Heater, Drain Cleaning, Leak Detection", bookingAvailable: true, faqs: "[]" } },
+      assistantOverrides: { firstMessage: expect.stringContaining("Acme Plumbing"), variableValues: { businessName: "Acme Plumbing", serviceCategories: "Water Heater, Drain Cleaning, Leak Detection", bookingAvailable: false, faqs: "[]" } },
     });
     const b = await handleVapiRequest(signed({ message: { type: "assistant-request", call: { ...call, id: "vapi-call-b", phoneNumberId: "pn-B" } } }), deps, secret);
     expect((b.body as any).assistantId).toBe(ASST_B);
@@ -725,6 +880,20 @@ describe("Vapi retry / replay inside the signature window (durable idempotency, 
   }
   const toolReq = (id: string, name: string, args: unknown) => signed({ message: { type: "tool-calls", call, toolCallList: [{ id, function: { name, arguments: args } }] } });
   const result = (r: { body: Record<string, unknown> }) => JSON.parse((r.body as any).results[0].result);
+
+  it("a signed destination request with no route cannot promise an unrecorded callback", async () => {
+    const { deps, store } = world(); store.configs.set("pn-A", cfgA({ escalation_phone: null }));
+    const r = await handleVapiRequest(signed({ message: { type: "transfer-destination-request", call } }), deps, secret);
+    expect(r.body).toHaveProperty("error");
+    expect(JSON.stringify(r.body)).not.toMatch(/team will call|call you back/i);
+    expect(store.calls[0].escalationReason).toBeNull();
+  });
+  it("signed duplicate transfer notifications record initiation once, never a human answer", async () => {
+    const { deps, store } = world(); const payload = signed({message:{type:"transfer-update",call,humanAnswered:true}});
+    await handleVapiRequest(payload,deps,secret); await handleVapiRequest(payload,deps,secret);
+    expect(store.calls[0].escalationResult).toBe("initiated");
+    expect(store.events.filter(e=>e.eventType==="revenue_desk.transfer_initiated")).toHaveLength(1);
+  });
 
   it("byte-identical redelivery of every message type is accepted and produces no duplicate business effect", async () => {
     const { deps, store, bookings, calendar } = world();
@@ -803,7 +972,7 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     findByIdempotencyKey: vi.fn().mockResolvedValueOnce(null).mockImplementation((t: string, k: string) => store.findByIdempotencyKey(t, k)),
     insertPending: (b) => store.insertPending(b),
     claimPending: (t, id, u) => store.claimPending(t, id, u),
-    update: (t, id, p) => store.update(t, id, p),
+    update: (t, id, p, token) => store.update(t, id, p, token),
   });
 
   it("maps real Postgres unique-violation messages to the guard that fired", () => {
@@ -854,13 +1023,14 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     calendar.events.push({ calendarId: cfg.calendarId!, eventId: "ev-winner", start: winner.start, end: winner.end, aiboBookingId: winner.id });
     // Simulate the insert race: lookup misses, insert collides, re-read finds the winner.
     const raced = racing(store);
+    store.clock = () => new Date(MON_6AM.getTime() + PENDING_LEASE_MS + 1);
     const r = await bookAppointment({ calendar, store: raced, now: () => MON_6AM }, req());
     expect(r).toMatchObject({ confirmed: true, providerEventId: "ev-winner", bookingId: winner.id });
     expect(calendar.calls.create).toBe(0);
     expect(store.rows[0].status).toBe("confirmed");
   });
 
-  it("unique conflict never takes over the winner's row, even if its lease looks expired", async () => {
+  it("unique conflict may claim an expired lease for reconciliation but never inserts", async () => {
     let dbNow = MON_6AM.getTime();
     const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(dbNow));
     const cfg = cfgA();
@@ -869,7 +1039,7 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     const raced = racing(store);
     dbNow += PENDING_LEASE_MS * 10;
     expect(await bookAppointment({ calendar, store: raced, now: () => MON_6AM }, req({ start: SLOT }))).toMatchObject(NOT_FINAL);
-    expect(store.claims).toBe(0);
+    expect(store.claims).toBe(1);
     expect(calendar.calls.create).toBe(0);
   });
 
@@ -881,12 +1051,13 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     const inLease = { calendar, store, now: () => new Date(Date.parse(p.updatedAt) + 1000) };
     expect(await bookAppointment(inLease, req())).toMatchObject(NOT_FINAL);
     calendar.findByAiboBookingId = async () => { throw new CalendarError("CALENDAR_UNAVAILABLE"); };
+    store.clock = () => new Date(MON_6AM.getTime() + PENDING_LEASE_MS + 1);
     expect(await bookAppointment(inLease, req())).toMatchObject({ ...NOT_FINAL, failure: "CALENDAR_UNAVAILABLE" });
     expect(calendar.calls.create).toBe(0);
     expect(store.rows[0].status).toBe("pending");
   });
 
-  it("concurrent retries of an EXPIRED lease: exactly one claims and writes; the other is non-final", async () => {
+  it("concurrent retries of an EXPIRED lease: exactly one checks evidence; both stay non-final", async () => {
     let dbNow = MON_6AM.getTime();
     const calendar = new FakeCalendar(), store = new FakeBookingStore(() => new Date(dbNow));
     const cfg = cfgA();
@@ -901,11 +1072,11 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     await tick();
     g.release();
     const rs = await Promise.all([a, b]);
-    expect(rs.filter((r) => r.confirmed)).toHaveLength(1);
-    expect(rs.filter((r) => !r.confirmed && r.statusUnknown)).toHaveLength(1);
+    expect(rs.filter((r) => r.confirmed)).toHaveLength(0);
+    expect(rs.filter((r) => !r.confirmed && r.statusUnknown)).toHaveLength(2);
     expect(store.claims).toBe(1);
-    expect(calendar.calls.create).toBe(1);
-    expect(calendar.events).toHaveLength(1);
+    expect(calendar.calls.create).toBe(0);
+    expect(calendar.events).toHaveLength(0);
   });
 
   it("clock skew: an app clock far AHEAD of the database cannot expire a live lease", async () => {
@@ -925,9 +1096,9 @@ describe("booking reliability under concurrent / indeterminate duplicates", () =
     const p = await store.insertPending({ tenantId: cfg.tenantId, callId: "call-1", leadId: "lead-1", idempotencyKey: bookingIdempotencyKey("call-1", SLOT, 60), calendarId: cfg.calendarId!, start: "2026-10-12T14:00:00.000Z", end: "2026-10-12T15:00:00.000Z", timezone: TZ });
     dbNow += PENDING_LEASE_MS + 1000;
     const skewedBehind = () => new Date(MON_6AM.getTime() - 3600_000); // app instance 1h slow
-    expect(await bookAppointment({ calendar, store, now: skewedBehind }, req())).toMatchObject({ confirmed: true, bookingId: p.id });
+    expect(await bookAppointment({ calendar, store, now: skewedBehind }, req())).toMatchObject({ confirmed: false, statusUnknown: true, bookingId: p.id });
     expect(store.claims).toBe(1);
-    expect(calendar.events).toHaveLength(1);
+    expect(calendar.events).toHaveLength(0);
   });
 
   it("genuine failures stay definitive: provider outage, another call holding the slot", async () => {
@@ -1043,8 +1214,8 @@ describe("assistant-facing booking outcomes are truthful", () => {
     release();
     await first;
     const resumed = await startCall(deps);
-    await completeCall(deps, resumed, { endedAt: null, startedAt: null, durationSeconds: 90, costUsd: null, endedReason: "customer-ended-call", transferred: false });
-    expect(store.calls[0]).toMatchObject({ escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP, escalationResult: "requested" });
+    await completeCall(deps, resumed, { endedAt: null, startedAt: null, durationSeconds: 90, costUsd: null, endedReason: "customer-ended-call" });
+    expect(store.calls[0]).toMatchObject({ escalationReason: BOOKING_CONFIRMATION_FOLLOW_UP, escalationResult: "unknown" });
     expect(ownerFollowUp({ escalation_reason: store.calls[0].escalationReason })).toMatchObject({ label: "Call back to confirm booking" });
     expect(ownerFollowUp({ escalation_reason: "caller_requests_human" })).toBeNull();
     expect(ownerFollowUp({ escalation_reason: null })).toBeNull();

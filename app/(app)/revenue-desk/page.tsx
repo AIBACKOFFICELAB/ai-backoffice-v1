@@ -26,10 +26,17 @@ export default async function RevenueDeskPage() {
         <Alert tone="danger">Revenue Desk activity is temporarily unavailable.</Alert>
       ) : (
         <>
+          {data.pendingUnavailable ? <Alert tone="danger">Booking exceptions could not be loaded. Their status is unknown.</Alert> : data.pendingBookings.length > 0 && (
+            <Card><CardBody>
+              <h2 className="font-semibold">Bookings needing verification ({data.pendingCount ?? "unknown"})</h2>
+              <p className="text-sm">These appointments are unresolved. Check calendar evidence before confirming, cancelling, or arranging another appointment. Showing the oldest 100.</p>
+              <ul>{data.pendingBookings.map((b) => <li key={b.id}><Link className="underline" href={`/revenue-desk/${b.call_id}`}>{formatOperationalTimestamp(b.requested_start)?.display} — {b.failure_category ?? "Interrupted or in progress"}</Link></li>)}</ul>
+            </CardBody></Card>
+          )}
           <Card>
             <CardBody className="flex flex-wrap gap-x-6 gap-y-1 text-sm text-ink-700">
               <span>Status: <strong>{data.status === "enabled" ? "Answering calls" : data.status === "disabled" ? "Configured, not answering" : "Not set up yet"}</strong></span>
-              <span>Booking: <strong>{data.bookingReady ? "Calendar connected" : "Not available"}</strong></span>
+              <span>Booking: <strong>{data.bookingReady ? "Calendar connected; automatic booking held for confirmation" : "Not available"}</strong></span>
               <span>Live transfer: <strong>{data.transferReady ? "Configured" : "Not configured"}</strong></span>
             </CardBody>
           </Card>

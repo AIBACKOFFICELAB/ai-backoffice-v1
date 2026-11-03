@@ -4,6 +4,7 @@ import { emitEvent } from "@/lib/events/service";
 import { SupabaseBusinessEventStore } from "@/lib/events/store";
 import { createCanonicalLeadFromIntake } from "@/lib/leads/intake/service";
 import { createLiveIntakeDeps } from "@/lib/leads/intake/server";
+import { mapLeadToRow, mapRowToLead, type LeadRow } from "@/lib/leads/supabase";
 import type { Agent } from "@/lib/agents/types";
 import { parseRevenueDeskConfig, ConfigError } from "./config";
 import { bookingUniqueViolation, type Booking, type BookingStore } from "./booking";
@@ -23,9 +24,9 @@ function db() {
   });
 }
 
-const CALL_COLS = "id, tenant_id, provider_call_id, caller_phone, lead_id, status, priority, intake, escalation_reason";
+const CALL_COLS = "id, tenant_id, provider_call_id, caller_phone, lead_id, status, priority, intake, intake_revision, escalation_reason";
 function mapCall(r: Record<string, any>): CallRow {
-  return { id: r.id, tenantId: r.tenant_id, providerCallId: r.provider_call_id, callerPhone: r.caller_phone, leadId: r.lead_id, status: r.status, priority: r.priority, intake: r.intake, escalationReason: r.escalation_reason };
+  return { id: r.id, tenantId: r.tenant_id, providerCallId: r.provider_call_id, callerPhone: r.caller_phone, leadId: r.lead_id, status: r.status, priority: r.priority, intake: r.intake, intakeRevision: r.intake_revision, escalationReason: r.escalation_reason };
 }
 
 const PATCH_COLUMNS: Record<keyof CallPatch, string> = {
@@ -33,6 +34,7 @@ const PATCH_COLUMNS: Record<keyof CallPatch, string> = {
   intake: "intake", escalationReason: "escalation_reason", escalationResult: "escalation_result", bookingOutcome: "booking_outcome",
   availabilityCheckedAt: "availability_checked_at", endedAt: "ended_at", startedAt: "started_at", durationSeconds: "duration_seconds",
   providerCostUsd: "provider_cost_usd", endedReason: "ended_reason", failureCategory: "failure_category",
+  transferFinal: "transfer_final",
 };
 
 export function createRevenueDeskStore(): RevenueDeskStore {
@@ -84,14 +86,27 @@ export function createRevenueDeskStore(): RevenueDeskStore {
       };
     },
 
-    async createLead(tenantId, payload) {
+    async saveIntake(tenantId, call, payload, patch, requestId) {
       const { data: tenant, error } = await client.from("tenants").select("id, name, email").eq("id", tenantId).single();
       if (error || !tenant) throw new Error("tenant unavailable");
       // Reuse canonical intake persistence + lead.created, but with NO owner email:
       // Revenue Desk must not introduce any outbound email path.
-      const deps = { ...createLiveIntakeDeps(), notify: async () => {} };
-      const result = await createCanonicalLeadFromIntake(payload, tenant, "voice_receptionist", null, deps);
-      return result.lead.id;
+      let saved: CallRow | undefined;
+      const deps = { ...createLiveIntakeDeps(), notify: async () => {},
+        persist: async (lead: Parameters<ReturnType<typeof createLiveIntakeDeps>["persist"]>[0]) => {
+          const { data, error: saveError } = await client.rpc("revenue_desk_save_intake", {
+            p_tenant_id: tenantId, p_call_id: call.id, p_expected_revision: call.intakeRevision ?? 0,
+            p_request_id: requestId, p_lead: mapLeadToRow(lead),
+            p_intake: patch.intake, p_priority: patch.priority, p_signals: patch.urgencySignals, p_category: patch.serviceCategory,
+          });
+          if (saveError || !data?.call || !data?.lead) throw new Error("atomic intake unavailable or stale");
+          saved = mapCall(data.call);
+          return { lead: mapRowToLead(data.lead as LeadRow), deduped: data.deduped === true };
+        },
+      };
+      await createCanonicalLeadFromIntake(payload, tenant, "voice_receptionist", null, deps);
+      if (!saved) throw new Error("intake acknowledgement unavailable");
+      return saved;
     },
 
     async emit(input) {
@@ -104,8 +119,15 @@ function mapBooking(r: Record<string, any>): Booking {
   return {
     id: r.id, tenantId: r.tenant_id, callId: r.call_id, leadId: r.lead_id, idempotencyKey: r.idempotency_key, calendarId: r.calendar_id,
     start: new Date(r.requested_start).toISOString(), end: new Date(r.requested_end).toISOString(), timezone: r.timezone,
-    providerEventId: r.provider_event_id, status: r.status, failureCategory: r.failure_category, updatedAt: r.updated_at,
+    providerEventId: r.provider_event_id, status: r.status, failureCategory: r.failure_category, updatedAt: r.updated_at, leaseToken: r.lease_token,
   };
+}
+
+/** Caller must resolve an authenticated owner tenant before using this seam. */
+export async function getBookingForReconciliation(tenantId: string, id: string): Promise<Booking | null> {
+  const { data, error } = await db().from("revenue_desk_bookings").select("*").eq("tenant_id", tenantId).eq("id", id).maybeSingle();
+  if (error) throw new Error("booking unavailable");
+  return data ? mapBooking(data) : null;
 }
 
 export function createBookingStore(): BookingStore {
@@ -134,12 +156,13 @@ export function createBookingStore(): BookingStore {
       const row = Array.isArray(data) ? data[0] : data;
       return row ? mapBooking(row) : null;
     },
-    async update(tenantId, id, patch) {
+    async update(tenantId, id, patch, leaseToken) {
+      if (!leaseToken) throw new Error("booking lease token missing");
       const row: Record<string, unknown> = {}; // updated_at is set by Postgres (migration 027 trigger)
       if (patch.status !== undefined) row.status = patch.status;
       if (patch.providerEventId !== undefined) row.provider_event_id = patch.providerEventId;
       if (patch.failureCategory !== undefined) row.failure_category = patch.failureCategory;
-      const { data, error } = await client.from("revenue_desk_bookings").update(row).eq("tenant_id", tenantId).eq("id", id).select("*").single();
+      const { data, error } = await client.from("revenue_desk_bookings").update(row).eq("tenant_id", tenantId).eq("id", id).eq("status", "pending").eq("lease_token", leaseToken).select("*").single();
       if (error || !data) throw new Error("booking update failed");
       return mapBooking(data);
     },

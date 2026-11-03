@@ -72,8 +72,10 @@ export class GoogleCalendarProvider implements CalendarProvider {
   async findByAiboBookingId(calendarId: string, aiboBookingId: string, timeMin: string, timeMax: string) {
     try {
       const res = await this.cal().events.list({ calendarId, timeMin, timeMax, singleEvents: true, privateExtendedProperty: [`${AIBO_PROP}=${aiboBookingId}`] });
-      const ev = (res.data.items ?? []).map(mapEvent).find((x) => x?.aiboBookingId === aiboBookingId);
-      return ev ?? null;
+      if (res.data.nextPageToken) throw new CalendarError("PROVIDER_ERROR", "incomplete marker evidence");
+      const matches = (res.data.items ?? []).filter((e) => e.status !== "cancelled" && e.transparency !== "transparent").map(mapEvent).filter((x) => x?.aiboBookingId === aiboBookingId);
+      if (matches.length > 1) throw new CalendarError("PROVIDER_ERROR", "ambiguous marker evidence");
+      return matches[0] ?? null;
     } catch (e) {
       wrap(e);
     }
@@ -82,6 +84,8 @@ export class GoogleCalendarProvider implements CalendarProvider {
   async listEvents(calendarId: string, timeMin: string, timeMax: string) {
     try {
       const res = await this.cal().events.list({ calendarId, timeMin, timeMax, singleEvents: true, maxResults: 50 });
+      // Bounded verification: never treat a truncated result as a clear slot.
+      if (res.data.nextPageToken) throw new CalendarError("PROVIDER_ERROR", "incomplete overlap evidence");
       return (res.data.items ?? []).filter((e) => e.status !== "cancelled" && e.transparency !== "transparent").map(mapEvent).filter((x): x is ProviderEvent => !!x);
     } catch (e) {
       wrap(e);

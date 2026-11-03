@@ -9,6 +9,8 @@ import { bookAppointment, BOOKING_CONFIRMATION_FOLLOW_UP, type BookingStore } fr
 import { CalendarError, type CalendarProvider } from "./calendar/types";
 import { REVENUE_DESK_TOOLS, type CaptureIntakeInput, type RevenueDeskToolName } from "./tools";
 import { toCanonicalIntakePayload } from "./intake";
+import type { CallerConfirmationStore } from "./confirmation";
+import { transferOutcome, type TransferOutcome } from "./transfer";
 
 export type CallStatus = "in_progress" | "intake_captured" | "booked" | "escalated" | "completed" | "failed";
 
@@ -22,6 +24,7 @@ export type CallRow = {
   priority: UrgencyDecision["priority"] | null;
   intake: (CaptureIntakeInput & { reasons?: string[] }) | null;
   escalationReason: string | null;
+  intakeRevision?: number;
 };
 
 export type CallPatch = Partial<{
@@ -32,7 +35,8 @@ export type CallPatch = Partial<{
   serviceCategory: string | null;
   intake: Record<string, unknown>;
   escalationReason: string;
-  escalationResult: "requested" | "transferred" | "transfer_failed" | "not_required";
+  escalationResult: TransferOutcome;
+  transferFinal: boolean;
   bookingOutcome: "confirmed" | "conflict" | "failed" | "not_attempted" | "unavailable";
   availabilityCheckedAt: string;
   endedAt: string;
@@ -52,12 +56,13 @@ export interface RevenueDeskStore {
   upsertCall(input: { tenantId: string; providerCallId: string; providerPhoneNumberId: string; callerPhone: string | null; calledPhone: string | null; startedAt: string | null }): Promise<{ call: CallRow; created: boolean }>;
   updateCall(tenantId: string, callId: string, patch: CallPatch): Promise<void>;
   getAgent(tenantId: string): Promise<Agent | null>;
-  /** Canonical intake (source voice_receptionist, sourceRef = callId). Returns lead id. */
-  createLead(tenantId: string, payload: Record<string, unknown>): Promise<string>;
+  /** Canonical validation + atomic, revision-checked call/lead correction.
+   * A receipt prevents delayed replay from restoring superseded intake. */
+  saveIntake(tenantId: string, call: CallRow, payload: Record<string, unknown>, patch: CallPatch, requestId: string): Promise<CallRow>;
   emit(input: EmitEventInput): Promise<void>;
 }
 
-export type RevenueDeskDeps = { store: RevenueDeskStore; bookings: BookingStore; calendar: CalendarProvider; now?: () => Date };
+export type RevenueDeskDeps = { store: RevenueDeskStore; bookings: BookingStore; calendar: CalendarProvider; now?: () => Date; confirmations?: CallerConfirmationStore };
 
 export type ToolResponse = Record<string, unknown> & { ok: boolean };
 
@@ -91,7 +96,7 @@ export function assistantContext(cfg: RevenueDeskConfig) {
     greeting: cfg.greeting ?? `Thanks for calling ${cfg.businessName}. How can we help today?`,
     serviceCategories: cfg.serviceCategories,
     faqs: cfg.faqs,
-    bookingAvailable: bookingConfigProblem(cfg) === null,
+    bookingAvailable: false, // No independently trusted live confirmation adapter.
   };
 }
 
@@ -152,7 +157,7 @@ async function executeTool(
   try {
     switch (tool.name) {
       case "revenue_desk_capture_intake":
-        return await captureIntake(deps, ctx, parsed.value as CaptureIntakeInput);
+        return await captureIntake(deps, ctx, parsed.value as CaptureIntakeInput, providerToolCallId);
       case "revenue_desk_classify_urgency":
         return classify(ctx);
       case "revenue_desk_check_availability":
@@ -178,28 +183,23 @@ function decide(cfg: RevenueDeskConfig, intake: CaptureIntakeInput): UrgencyDeci
   return classifyUrgency(cfg, { signals: intake.urgencySignals, serviceCategory: intake.serviceCategory, postalCode: intake.postalCode });
 }
 
-async function captureIntake(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }, input: CaptureIntakeInput): Promise<ToolResponse> {
+async function captureIntake(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }, input: CaptureIntakeInput, requestId?: string): Promise<ToolResponse> {
   const { config, call } = ctx;
   const decision = decide(config, input);
-  let leadId: string;
+  let saved: CallRow;
+  const patch: CallPatch = { priority: decision.priority, urgencySignals: decision.signals, serviceCategory: input.serviceCategory, intake: { ...input, reasons: decision.reasons } };
   try {
-    leadId = await deps.store.createLead(config.tenantId, toCanonicalIntakePayload(call.id, call.callerPhone, input, decision));
+    saved = await deps.store.saveIntake(config.tenantId, call, toCanonicalIntakePayload(call.id, call.callerPhone, input, decision), patch, requestId ?? hashProviderId(JSON.stringify(input)));
   } catch {
-    // Truthful failure: nothing was saved; hand to a human with what we have.
+    // Commit/response or audit failure can be ambiguous: never claim nothing
+    // exists, and never use the unacknowledged correction for later tools.
+    ctx.call = { ...call, intake: null };
     await deps.store.updateCall(config.tenantId, call.id, { failureCategory: "INTAKE_PERSIST_FAILED" });
     return { ok: false, error: "INTAKE_NOT_SAVED", requiredAction: "escalate", instruction: "Do not say the request was saved. Offer a transfer to the team." };
   }
-  const nextStatus: CallStatus = call.status === "booked" || call.status === "escalated" ? call.status : "intake_captured";
-  await deps.store.updateCall(config.tenantId, call.id, {
-    leadId,
-    status: nextStatus,
-    priority: decision.priority,
-    urgencySignals: decision.signals,
-    serviceCategory: input.serviceCategory,
-    intake: { ...input, reasons: decision.reasons },
-  });
-  ctx.call = { ...call, leadId, status: nextStatus, priority: decision.priority, intake: { ...input, reasons: decision.reasons } };
-  await safeEmit(deps, config.tenantId, "revenue_desk.intake_captured", call.id, `rd:${call.id}:intake`, { callId: call.id, leadId, serviceCategory: input.serviceCategory });
+  ctx.call = saved;
+  const leadId = saved.leadId!;
+  await safeEmit(deps, config.tenantId, "revenue_desk.intake_captured", call.id, `rd:${call.id}:intake:${saved.intakeRevision}`, { callId: call.id, leadId, serviceCategory: input.serviceCategory });
   await safeEmit(deps, config.tenantId, "revenue_desk.urgency_classified", call.id, `rd:${call.id}:urgency:${decision.priority}`, { callId: call.id, priority: decision.priority, requiredAction: decision.requiredAction, reasons: decision.reasons, signals: decision.signals });
   return { ok: true, saved: true, priority: decision.priority, requiredAction: decision.requiredAction };
 }
@@ -255,8 +255,8 @@ async function book(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; cal
 
   await safeEmit(deps, config.tenantId, "revenue_desk.booking_requested", call.id, `rd:${call.id}:book-req:${input.slotStart}`, { callId: call.id, durationMinutes: input.durationMinutes });
   const result = await bookAppointment(
-    { store: deps.bookings, calendar: deps.calendar, now: deps.now },
-    { cfg: config, callId: call.id, leadId: call.leadId, start: input.slotStart, durationMinutes: input.durationMinutes, callerConfirmed: input.callerConfirmed, summary: `AIBO booking — ${call.intake.serviceCategory ?? "Service"} (${call.intake.customerName})` }
+    { store: deps.bookings, calendar: deps.calendar, now: deps.now, confirmations: deps.confirmations },
+    { cfg: config, callId: call.id, leadId: call.leadId, intakeRevision: call.intakeRevision, start: input.slotStart, durationMinutes: input.durationMinutes, callerConfirmed: input.callerConfirmed, summary: `AIBO booking — ${call.intake.serviceCategory ?? "Service"} (${call.intake.customerName})` }
   );
   if (result.confirmed) {
     await deps.store.updateCall(config.tenantId, call.id, { status: "booked", bookingOutcome: "confirmed" });
@@ -288,6 +288,9 @@ async function book(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; cal
       requiredAction: "offer_callback",
       instruction: "This appointment is NOT confirmed yet, and it has NOT failed. Do not say it is booked and do not say it failed. Do not try to book again or offer another time. Tell the caller the team has been asked to call them back to confirm the appointment.",
     };
+  }
+  if (result.failure === "CONFIRMATION_UNAVAILABLE") {
+    return { ok: false, booked: false, error: result.failure, requiredAction: "escalate", instruction: "Independent caller confirmation is unavailable. No new appointment was created. Do not say it is booked. Offer a transfer to arrange the appointment." };
   }
   if (result.callAlreadyBooked) {
     return { ok: false, booked: false, error: "CALL_ALREADY_HAS_BOOKING", instruction: "This call already has an appointment booked or being confirmed. Do not book another. If the caller wants to change it, offer a team callback." };
@@ -326,13 +329,19 @@ async function escalationRoute(deps: RevenueDeskDeps, ctx: { config: RevenueDesk
 
 /** Server-side answer to the provider's transfer-destination request. */
 export async function transferDestination(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }): Promise<string | null> {
+  if (ctx.config.escalationPhone) await deps.store.updateCall(ctx.config.tenantId, ctx.call.id, { escalationResult: "requested" });
   return ctx.config.escalationPhone;
+}
+
+export async function recordTransferInitiated(deps: RevenueDeskDeps, ctx: { config: RevenueDeskConfig; call: CallRow }) {
+  await deps.store.updateCall(ctx.config.tenantId, ctx.call.id, { escalationResult: "initiated" });
+  await safeEmit(deps, ctx.config.tenantId, "revenue_desk.transfer_initiated", ctx.call.id, `rd:${ctx.call.id}:transfer-initiated`, { callId: ctx.call.id });
 }
 
 export async function completeCall(
   deps: RevenueDeskDeps,
   ctx: { config: RevenueDeskConfig; call: CallRow },
-  report: { endedAt: string | null; startedAt: string | null; durationSeconds: number | null; costUsd: number | null; endedReason: string | null; transferred: boolean | null }
+  report: { endedAt: string | null; startedAt: string | null; durationSeconds: number | null; costUsd: number | null; endedReason: string | null }
 ) {
   const { config, call } = ctx;
   const failed = !!report.endedReason && /error|failed|fault/i.test(report.endedReason);
@@ -342,7 +351,10 @@ export async function completeCall(
   if (report.startedAt) patch.startedAt = report.startedAt;
   if (report.durationSeconds != null) patch.durationSeconds = Math.round(report.durationSeconds);
   if (report.costUsd != null) patch.providerCostUsd = report.costUsd;
-  if (call.status === "escalated" && report.transferred != null) patch.escalationResult = report.transferred ? "transferred" : "transfer_failed";
+  // Record terminal evidence even if a requested/initiated callback arrives
+  // later. The DB transition trigger serializes duplicate/out-of-order events.
+  patch.escalationResult = transferOutcome(report.endedReason);
+  patch.transferFinal = true;
   if (failed) patch.failureCategory = "PROVIDER_CALL_ERROR";
   await deps.store.updateCall(config.tenantId, call.id, patch);
   await safeEmit(deps, config.tenantId, failed ? "revenue_desk.call_failed" : "revenue_desk.call_completed", call.id, `rd:${call.id}:ended`, {

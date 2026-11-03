@@ -10,10 +10,9 @@ name: CI
 #     lib/testHarness/pgTestDb.ts) rather than silently claiming to prove
 #     something it didn't run.
 #   - test-db: the SAME suite again, this time against a real ephemeral
-#     Postgres service container with db/migrations/001-020 actually
-#     applied — this is what actually executes the *.pg.test.ts files (see
-#     db/shadow_env/000_supabase_scaffold.sql for what that container needs
-#     beyond a bare `CREATE DATABASE`). GitHub Actions' Postgres service
+#     PostgreSQL 17 service using the pinned local Preview security profile
+#     (sanitized 008, SEC-01, canonical through 027, local H001 028).
+#     See db/test_profiles/preview/README.md. GitHub Actions' Postgres service
 #     container is a standard, well-supported primitive — not the
 #     "expensive or fragile" kind of CI infrastructure the Slice D
 #     directive said to avoid without need; it costs one extra job, no
@@ -45,11 +44,11 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: ai_backoffice_shadow
+          POSTGRES_DB: aibo_test_preview
         ports:
           - 5432:5432
         options: >-
@@ -58,7 +57,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ai_backoffice_shadow
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/aibo_test_preview
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -66,14 +65,7 @@ jobs:
           node-version: "22"
           cache: "npm"
       - run: npm ci
-      - name: Apply Supabase-compatibility scaffold + migrations 001-020
-        run: |
-          set -e
-          for f in db/shadow_env/000_supabase_scaffold.sql db/migrations/0*.sql; do
-            echo "applying $f"
-            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$f"
-          done
-        env:
-          PGPASSWORD: postgres
+      - name: Bootstrap local Preview security profile (SEC-01 and H001 028)
+        run: npm run test:db:bootstrap
       - name: Run full suite against the real database (nothing skipped)
         run: npm test

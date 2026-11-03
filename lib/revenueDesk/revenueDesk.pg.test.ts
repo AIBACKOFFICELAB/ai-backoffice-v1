@@ -52,11 +52,19 @@ DESCRIBE("Revenue Desk schema + RLS (real Postgres)", () => {
       const tA = await insertTenant(c); const uA = randomUUID(); await insertMembership(c, tA, uA);
       await c.query(`INSERT INTO public.revenue_desk_settings (tenant_id, escalation_phone) VALUES ($1,'+13055550100')`, [tA]);
       const callId = await call(c, tA);
+      const beforeSettings = (await c.query(`SELECT * FROM revenue_desk_settings WHERE tenant_id=$1`, [tA])).rows;
+      const beforeCalls = (await c.query(`SELECT * FROM revenue_desk_calls WHERE tenant_id=$1`, [tA])).rows;
+      const beforeBookings = (await c.query(`SELECT * FROM revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows;
       await setRole(c, "authenticated", uA);
-      expect((await c.query(`UPDATE public.revenue_desk_settings SET escalation_phone='+19995550000', enabled=true WHERE tenant_id=$1`, [tA])).rowCount).toBe(0);
-      expect((await c.query(`UPDATE public.revenue_desk_calls SET status='booked' WHERE tenant_id=$1`, [tA])).rowCount).toBe(0);
+      // Preview SEC-01 denies SQL UPDATE privileges before RLS is evaluated.
+      await expectCode(c, () => c.query(`UPDATE public.revenue_desk_settings SET escalation_phone='+19995550000', enabled=true WHERE tenant_id=$1`, [tA]), "42501");
+      await expectCode(c, () => c.query(`UPDATE public.revenue_desk_calls SET status='booked' WHERE tenant_id=$1`, [tA]), "42501");
       await expectCode(c, () => c.query(`INSERT INTO public.revenue_desk_calls (tenant_id, provider_call_id) VALUES ($1,'x')`, [tA]), "42501");
       await expectCode(c, () => booking(c, tA, callId), "42501");
+      await c.query("RESET ROLE");
+      expect((await c.query(`SELECT * FROM revenue_desk_settings WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeSettings);
+      expect((await c.query(`SELECT * FROM revenue_desk_calls WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeCalls);
+      expect((await c.query(`SELECT * FROM revenue_desk_bookings WHERE tenant_id=$1`, [tA])).rows).toEqual(beforeBookings);
     }));
 
   it("anon is refused", () =>
@@ -115,6 +123,146 @@ DESCRIBE("Revenue Desk schema + RLS (real Postgres)", () => {
       await lead();
       await expectCode(c, () => lead(), "23505");
     }));
+});
+
+DESCRIBE("H001 atomic corrections and evidence (proposal 028, disposable Postgres)", () => {
+  function inputs(callId: string, address = "1 Test St") {
+    return { id: randomUUID(), date: "2026-10-15T00:00:00Z", source: "voice_receptionist", source_ref: callId,
+      customer_name: "Synthetic", phone: "+13055550123", service_address: address, property_type: "Other", service_type: "Other",
+      emergency: "No", urgency: "Flexible", job_description: "Synthetic job", customer_role: "Other", lead_source: "Other" };
+  }
+  async function save(c: C, tenant: string, id: string, revision: number, request: string, address = "1 Test St", priority = "routine") {
+    const lead = inputs(id,address);
+    return (await c.query(`SELECT public.revenue_desk_save_intake($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,ARRAY[]::text[],'Other') result`,
+      [tenant,id,revision,request,JSON.stringify(lead),JSON.stringify({ customerName: "Synthetic", serviceAddress: address }),priority])).rows[0].result;
+  }
+  it("correction updates the same canonical lead and call atomically without resetting lifecycle/provenance", () => withRollback(async c => {
+    const t = await insertTenant(c), id = await call(c,t);
+    const first = await save(c,t,id,0,"initial");
+    await c.query(`UPDATE leads SET status='Contacted',estimate_amount=123,internal_notes='owner',sms_sent_at=now() WHERE id=$1`, [first.lead.id]);
+    const corrected = await save(c,t,id,1,"correction","2 Correct St");
+    expect(corrected.lead).toMatchObject({ id:first.lead.id,service_address:"2 Correct St",status:"Contacted",estimate_amount:123,internal_notes:"owner",source:"voice_receptionist",source_ref:id });
+    expect(corrected.lead.sms_sent_at).not.toBeNull();
+    expect(corrected.lead.received_at).toBe(first.lead.received_at);
+    expect(corrected.call).toMatchObject({ lead_id:first.lead.id,intake_revision:2,intake:{serviceAddress:"2 Correct St"} });
+    expect((await c.query(`SELECT count(*)::int n FROM leads WHERE tenant_id=$1`,[t])).rows[0].n).toBe(1);
+    expect((await save(c,t,id,1,"correction","2 Correct St")).call.intake_revision).toBe(2);
+    await expectCode(c,()=>save(c,t,id,2,"initial"),"P0001");
+    await expectCode(c,()=>save(c,t,id,1,"stale","3 Wrong St"),"P0001");
+    expect((await c.query(`SELECT intake FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].intake.serviceAddress).toBe("2 Correct St");
+  }));
+  it("a call constraint failure after lead UPDATE rolls back the correction and receipt", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t); const before=await save(c,t,id,0,"initial");
+    await expectCode(c,()=>save(c,t,id,1,"fault","2 Wrong St","invalid-priority"),"23514");
+    expect((await c.query(`SELECT service_address FROM leads WHERE id=$1`,[before.lead.id])).rows[0].service_address).toBe("1 Test St");
+    expect((await c.query(`SELECT intake_revision FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].intake_revision).toBe(1);
+    expect((await c.query(`SELECT count(*)::int n FROM revenue_desk_intake_receipts WHERE call_id=$1`,[id])).rows[0].n).toBe(1);
+  }));
+  it.each(["initial", "identical-new-id", "genuine-correction"])("F01 rejects canonical drift for %s without overwriting owner edits or writing a receipt", op => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);
+    const first=await save(c,t,id,0,"initial");
+    await c.query(`UPDATE leads SET service_address='2 Owner Corrected St' WHERE tenant_id=$1 AND id=$2`,[t,first.lead.id]);
+    await expectCode(c,()=>save(c,t,id,1,op,op==="genuine-correction"?"3 Caller Correction St":"1 Test St"),"P0001");
+    expect((await c.query(`SELECT service_address FROM leads WHERE tenant_id=$1 AND id=$2`,[t,first.lead.id])).rows[0].service_address).toBe("2 Owner Corrected St");
+    expect((await c.query(`SELECT intake_revision,intake FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0]).toMatchObject({intake_revision:1,intake:{serviceAddress:"1 Test St"}});
+    expect((await c.query(`SELECT count(*)::int n FROM revenue_desk_intake_receipts WHERE call_id=$1`,[id])).rows[0].n).toBe(1);
+  }));
+  it("F01 exact replay stays idempotent after lifecycle-only owner changes", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);const first=await save(c,t,id,0,"initial");
+    await c.query(`UPDATE leads SET status='Contacted',internal_notes='Owner note',estimate_amount=42 WHERE id=$1`,[first.lead.id]);
+    const replay=await save(c,t,id,0,"initial");
+    expect(replay).toMatchObject({deduped:true,lead:{id:first.lead.id,status:"Contacted",internal_notes:"Owner note",estimate_amount:42},call:{intake_revision:1}});
+    expect(replay.call.intake_lead_snapshot).toEqual(first.call.intake_lead_snapshot);
+  }));
+  it("F01 refuses legacy intake without independently accepted canonical snapshot", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);const first=await save(c,t,id,0,"initial");
+    await c.query(`UPDATE revenue_desk_calls SET intake_lead_snapshot=NULL,intake_digest=NULL,intake_revision=0 WHERE id=$1`,[id]);
+    await expectCode(c,()=>save(c,t,id,0,"legacy-replay","2 Stale St"),"P0001");
+    expect((await c.query(`SELECT service_address FROM leads WHERE id=$1`,[first.lead.id])).rows[0].service_address).toBe("1 Test St");
+  }));
+  it("F01 a missing accepted lead cannot be silently replaced on replay", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);const first=await save(c,t,id,0,"initial");
+    await c.query(`DELETE FROM leads WHERE id=$1`,[first.lead.id]);
+    await expectCode(c,()=>save(c,t,id,1,"initial"),"P0001");
+    expect((await c.query(`SELECT count(*)::int n FROM leads WHERE tenant_id=$1`,[t])).rows[0].n).toBe(0);
+  }));
+  it("cross-tenant binding and member/anon RPC execution are refused", () => withRollback(async c => {
+    const a=await insertTenant(c), b=await insertTenant(c),id=await call(c,a);
+    await expectCode(c,()=>save(c,b,id,0,"foreign"),"P0002");
+    const user=randomUUID(); await insertMembership(c,a,user);
+    for (const role of ["authenticated","anon"] as const) {
+      await c.query("SAVEPOINT rolecheck"); await setRole(c,role,user);
+      await expect(save(c,a,id,0,"blocked")).rejects.toMatchObject({code:"42501"});
+      await c.query("ROLLBACK TO SAVEPOINT rolecheck");
+    }
+  }));
+  it("concurrent corrections with the same expected revision have exactly one transaction winner", async () => {
+    const pool=getPgTestPool(); const c=await pool.connect(); let t="";
+    try {
+      t=await insertTenant(c); const id=await call(c,t); await save(c,t,id,0,"initial");
+      const results=await runConcurrently(["2 A St","3 B St"].map((address,i)=>async conn=> {
+        await conn.query("BEGIN"); const r=await save(conn,t,id,1,`correction-${i}`,address); await conn.query("COMMIT"); return r;
+      }));
+      expect(results.filter(r=>r.status==="fulfilled")).toHaveLength(1);
+      const joined=(await c.query(`SELECT l.service_address,c.intake,c.intake_revision FROM revenue_desk_calls c JOIN leads l ON l.id=c.lead_id AND l.tenant_id=c.tenant_id WHERE c.id=$1`,[id])).rows[0];
+      expect(joined.intake_revision).toBe(2); expect(joined.service_address).toBe(joined.intake.serviceAddress);
+      expect((await c.query(`SELECT count(*)::int n FROM leads WHERE tenant_id=$1`,[t])).rows[0].n).toBe(1);
+    } finally { if(t) await c.query(`DELETE FROM tenants WHERE id=$1`,[t]); c.release(); }
+  });
+  it("duplicate and out-of-order transfer callbacks cannot downgrade or invent human-answer evidence", () => withRollback(async c => {
+    const t=await insertTenant(c), id=await call(c,t);
+    const state=async(result:string,final=false)=> {
+      const reason=result==="transferred"?"assistant-forwarded-call":result==="transfer_failed"?"call.in-progress.error-transfer-failed":null;
+      await c.query(`UPDATE revenue_desk_calls SET escalation_result=$2,transfer_final=$3,ended_reason=coalesce($4,ended_reason) WHERE id=$1`,[id,result,final,reason]);
+      return (await c.query(`SELECT escalation_result,transfer_final FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0];
+    };
+    expect((await state("requested")).escalation_result).toBe("requested");
+    expect((await state("initiated")).escalation_result).toBe("initiated");
+    expect((await state("requested")).escalation_result).toBe("initiated");
+    expect((await state("transferred",true)).escalation_result).toBe("transferred");
+    expect((await state("transferred",true)).escalation_result).toBe("transferred");
+    expect(await state("initiated")).toEqual({escalation_result:"transferred",transfer_final:true});
+    expect((await state("transfer_failed",true)).escalation_result).toBe("unknown");
+    expect((await state("transferred",true)).escalation_result).toBe("unknown");
+  }));
+  it("call-end before transfer notification yields unknown, never a successful handoff", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);
+    await c.query(`UPDATE revenue_desk_calls SET transfer_final=true,escalation_result='unknown',ended_reason='customer-ended-call' WHERE id=$1`,[id]);
+    expect((await c.query(`SELECT escalation_result FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].escalation_result).toBeNull();
+    await c.query(`UPDATE revenue_desk_calls SET transfer_final=true,escalation_result='unknown',ended_reason='customer-ended-call' WHERE id=$1`,[id]);
+    expect((await c.query(`SELECT escalation_result FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].escalation_result).toBeNull();
+    await c.query(`UPDATE revenue_desk_calls SET escalation_result='initiated' WHERE id=$1`,[id]);
+    expect((await c.query(`SELECT escalation_result FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].escalation_result).toBe("unknown");
+  }));
+  it("lease takeover fences the former writer and a process-interrupted row remains in the owner queue", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);
+    const b=(await c.query(`INSERT INTO revenue_desk_bookings(tenant_id,call_id,idempotency_key,calendar_id,requested_start,requested_end,timezone,updated_at) VALUES($1,$2,'interrupted','cal',now(),now()+interval '1h','UTC',now()-interval '1 minute') RETURNING *`,[t,id])).rows[0];
+    const claimed=(await c.query(`SELECT * FROM revenue_desk_claim_booking_lease($1,$2,45)`,[t,b.id])).rows[0];
+    expect(claimed.lease_token).not.toBe(b.lease_token);
+    expect((await c.query(`UPDATE revenue_desk_bookings SET status='confirmed',provider_event_id='late' WHERE tenant_id=$1 AND id=$2 AND lease_token=$3 AND status='pending'`,[t,b.id,b.lease_token])).rowCount).toBe(0);
+    expect((await c.query(`SELECT id FROM revenue_desk_bookings WHERE tenant_id=$1 AND status='pending'`,[t])).rows.map(r=>r.id)).toEqual([b.id]);
+    expect((await c.query(`SELECT escalation_reason FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0].escalation_reason).toBeNull();
+  }));
+  it("confirmed recovery updates the call summary in the same transaction and retains the promised follow-up", () => withRollback(async c => {
+    const t=await insertTenant(c),id=await call(c,t);
+    await c.query(`UPDATE revenue_desk_calls SET escalation_reason='booking_pending_confirmation',escalation_result='requested' WHERE id=$1`,[id]);
+    const b=(await booking(c,t,id)).rows[0].id;
+    await setRole(c,"service_role");
+    await c.query(`UPDATE revenue_desk_bookings SET status='confirmed',provider_event_id='verified-event' WHERE id=$1 AND tenant_id=$2`,[b,t]);
+    expect((await c.query(`SELECT status,booking_outcome,escalation_reason FROM revenue_desk_calls WHERE id=$1`,[id])).rows[0]).toEqual({status:"booked",booking_outcome:"confirmed",escalation_reason:"booking_pending_confirmation"});
+  }));
+  it("intake receipts are tenant-readable and immutable to members", () => withRollback(async c => {
+    const a=await insertTenant(c),b=await insertTenant(c),user=randomUUID();
+    await insertMembership(c,a,user); await save(c,a,await call(c,a),0,"a"); await save(c,b,await call(c,b),0,"b");
+    const receipts = () => c.query(`SELECT * FROM revenue_desk_intake_receipts WHERE tenant_id=ANY($1::uuid[]) ORDER BY tenant_id,call_id,request_id`, [[a,b]]);
+    const before = (await receipts()).rows;
+    await setRole(c,"authenticated",user);
+    expect((await c.query(`SELECT tenant_id FROM revenue_desk_intake_receipts`)).rows.map(r=>r.tenant_id)).toEqual([a]);
+    await expectCode(c,()=>c.query(`UPDATE revenue_desk_intake_receipts SET revision=999`),"42501");
+    await expectCode(c,()=>c.query(`DELETE FROM revenue_desk_intake_receipts`),"42501");
+    await c.query("RESET ROLE");
+    expect((await receipts()).rows).toEqual(before);
+  }));
 });
 
 DESCRIBE("Revenue Desk concurrency (separate real transactions)", () => {

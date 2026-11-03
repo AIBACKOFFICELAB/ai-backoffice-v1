@@ -14,8 +14,9 @@ export type VapiMessage =
   | { kind: "assistant-request"; call: VapiCallRef }
   | { kind: "tool-calls"; call: VapiCallRef; toolCalls: Array<{ id: string; name: string; args: unknown }> }
   | { kind: "transfer-destination-request"; call: VapiCallRef }
+  | { kind: "transfer-update"; call: VapiCallRef }
   | { kind: "status-update"; call: VapiCallRef; status: string }
-  | { kind: "end-of-call-report"; call: VapiCallRef; endedReason: string | null; durationSeconds: number | null; costUsd: number | null; startedAt: string | null; endedAt: string | null; transferred: boolean | null }
+  | { kind: "end-of-call-report"; call: VapiCallRef; endedReason: string | null; durationSeconds: number | null; costUsd: number | null; startedAt: string | null; endedAt: string | null }
   | { kind: "ignored"; type: string };
 
 const s = (v: unknown, max = 200) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : null);
@@ -38,7 +39,7 @@ export function parseVapiMessage(body: unknown): VapiMessage | null {
   const msg = (body as { message?: Record<string, any> })?.message;
   if (!msg || typeof msg.type !== "string") return null;
   const type = msg.type;
-  const known = ["assistant-request", "tool-calls", "transfer-destination-request", "status-update", "end-of-call-report"];
+  const known = ["assistant-request", "tool-calls", "transfer-destination-request", "transfer-update", "status-update", "end-of-call-report"];
   if (!known.includes(type)) return { kind: "ignored", type: type.slice(0, 40) };
   const call = callRef(msg);
   if (!call) return null;
@@ -48,6 +49,8 @@ export function parseVapiMessage(body: unknown): VapiMessage | null {
       return { kind: "assistant-request", call };
     case "transfer-destination-request":
       return { kind: "transfer-destination-request", call };
+    case "transfer-update":
+      return { kind: "transfer-update", call };
     case "status-update":
       return { kind: "status-update", call, status: s(msg.status, 40) ?? "unknown" };
     case "tool-calls": {
@@ -77,7 +80,6 @@ export function parseVapiMessage(body: unknown): VapiMessage | null {
         costUsd: n(msg.cost) ?? n(msg.call?.cost),
         startedAt: started,
         endedAt: ended,
-        transferred: endedReason ? /transfer/i.test(endedReason) && !/fail/i.test(endedReason) : null,
       };
     }
   }

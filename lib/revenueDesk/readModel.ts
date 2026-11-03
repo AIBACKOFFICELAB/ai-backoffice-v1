@@ -92,9 +92,12 @@ export async function getRevenueDeskOverview(tenantId: string) {
   const now = new Date();
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).getTime();
   const since = new Date(Math.min(Date.now() - 30 * 86400000, monthStart)).toISOString();
-  const [settings, calls] = await Promise.all([
+  const [settings, calls, pending] = await Promise.all([
     db.from("revenue_desk_settings").select("enabled, booking_enabled, calendar_id, escalation_phone, vapi_phone_number_id").eq("tenant_id", tenantId).maybeSingle(),
     db.from("revenue_desk_calls").select(SUMMARY_COLS).eq("tenant_id", tenantId).gte("created_at", since).order("created_at", { ascending: false }).limit(5000),
+    // Independent of call end/follow-up and date window: a crashed worker's
+    // pending row remains visible until independently resolved.
+    db.from("revenue_desk_bookings").select("id, call_id, requested_start, failure_category", { count: "exact" }).eq("tenant_id", tenantId).eq("status", "pending").order("created_at").limit(100),
   ]);
   if (calls.error) return { error: true as const };
   const rows = (calls.data ?? []) as CallSummaryRow[];
@@ -104,6 +107,9 @@ export async function getRevenueDeskOverview(tenantId: string) {
     status: !s ? "not_configured" : !s.enabled ? "disabled" : "enabled",
     bookingReady: !!(s?.booking_enabled && s.calendar_id),
     transferReady: !!s?.escalation_phone,
+    pendingBookings: pending.data ?? [],
+    pendingCount: pending.count,
+    pendingUnavailable: !!pending.error,
     summary: summarizeCalls(rows.filter((r) => Date.parse(r.created_at) >= Date.now() - 30 * 86400000)),
     allowance: computeAllowance(rows, now),
     recent: rows.slice(0, 50),
@@ -119,5 +125,5 @@ export async function getRevenueDeskCall(tenantId: string, callId: string) {
     db.from("revenue_desk_bookings").select("id, status, requested_start, requested_end, timezone, provider_event_id, failure_category, created_at, updated_at").eq("tenant_id", tenantId).eq("call_id", callId).order("created_at"),
     db.from("business_events").select("id, event_type, occurred_at, payload").eq("tenant_id", tenantId).eq("correlation_id", callId).order("occurred_at"),
   ]);
-  return { call: call.data, bookings: bookings.data ?? [], events: events.data ?? [] };
+  return { call: call.data, bookings: bookings.data ?? [], events: events.data ?? [], evidenceUnavailable: !!bookings.error || !!events.error };
 }

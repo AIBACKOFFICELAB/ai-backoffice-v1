@@ -49,16 +49,25 @@ DESCRIBE("billing_subscriptions / stripe_webhook_events RLS (real Postgres)", ()
 
   it("authenticated tenant users cannot self-assign paid status or change entitlement (no write policy)", () =>
     withRollback(async (c) => {
-      const { tA, uA } = await seedTwoTenants(c);
+      const { tA, tB, uA } = await seedTwoTenants(c);
+      // Make the attempted self-upgrade observable, then compare both tenants
+      // as the privileged fixture role after each denied statement recovers.
+      await c.query(`UPDATE billing_subscriptions SET entitlement='restricted' WHERE tenant_id=$1`, [tA]);
+      const rows = () => c.query(`SELECT * FROM billing_subscriptions WHERE tenant_id=ANY($1::uuid[]) ORDER BY tenant_id`, [[tA,tB]]);
+      const before = (await rows()).rows;
       await setRole(c, "authenticated", uA);
-      const upd = await c.query(`UPDATE public.billing_subscriptions SET entitlement='active', onboarding_status='complete' WHERE tenant_id=$1`, [tA]);
-      expect(upd.rowCount).toBe(0); // RLS filters the row out of any write
-      const del = await c.query(`DELETE FROM public.billing_subscriptions WHERE tenant_id=$1`, [tA]);
-      expect(del.rowCount).toBe(0);
-      await c.query("SAVEPOINT s");
-      await expect(
-        c.query(`INSERT INTO public.billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, subscription_status) VALUES ($1,'cus_x','sub_x','active')`, [randomUUID()])
-      ).rejects.toMatchObject({ code: "42501" });
+      for (const statement of [
+        `UPDATE public.billing_subscriptions SET entitlement='active', onboarding_status='complete' WHERE tenant_id=$1`,
+        `DELETE FROM public.billing_subscriptions WHERE tenant_id=$1`,
+        `INSERT INTO public.billing_subscriptions (tenant_id, stripe_customer_id, stripe_subscription_id, subscription_status) VALUES ($1,'cus_x','sub_x','active')`,
+      ]) {
+        await c.query("SAVEPOINT denied_write");
+        await expect(c.query(statement, [tA])).rejects.toMatchObject({ code: "42501" });
+        await c.query("ROLLBACK TO SAVEPOINT denied_write");
+        await c.query("RELEASE SAVEPOINT denied_write");
+      }
+      await c.query("RESET ROLE");
+      expect((await rows()).rows).toEqual(before);
     }));
 
   it("anon is refused outright (no EXECUTE on is_tenant_member, migration 003)", () =>

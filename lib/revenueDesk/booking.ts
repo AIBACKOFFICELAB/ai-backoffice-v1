@@ -1,6 +1,7 @@
 import { bookingConfigProblem, type RevenueDeskConfig } from "./config";
 import { isSlotWithinPolicy } from "./slots";
 import { CalendarError, type CalendarFailure, type CalendarProvider } from "./calendar/types";
+import type { CallerConfirmationStore } from "./confirmation";
 
 export type BookingStatus = "pending" | "confirmed" | "conflict" | "failed" | "cancelled";
 export type Booking = {
@@ -17,6 +18,7 @@ export type Booking = {
   status: BookingStatus;
   failureCategory: string | null;
   updatedAt: string;
+  leaseToken?: string;
 };
 
 export class SlotTakenError extends Error {}
@@ -39,7 +41,7 @@ export interface BookingStore {
   /** Atomically takes over a pending row whose lease has expired by the
    * DATABASE clock; returns null while the lease is live or if another request won. */
   claimPending(tenantId: string, id: string, leaseSeconds: number): Promise<Booking | null>;
-  update(tenantId: string, id: string, patch: Partial<Pick<Booking, "status" | "providerEventId" | "failureCategory">>): Promise<Booking>;
+  update(tenantId: string, id: string, patch: Partial<Pick<Booking, "status" | "providerEventId" | "failureCategory">>, leaseToken?: string): Promise<Booking>;
 }
 
 export type BookingResult =
@@ -64,8 +66,8 @@ export function bookingIdempotencyKey(callId: string, start: string, durationMin
  * booking id stored in the provider event's private extended properties.
  */
 export async function bookAppointment(
-  deps: { store: BookingStore; calendar: CalendarProvider; now?: () => Date },
-  req: { cfg: RevenueDeskConfig; callId: string; leadId: string | null; start: string; durationMinutes: number; callerConfirmed: boolean; summary: string }
+  deps: { store: BookingStore; calendar: CalendarProvider; now?: () => Date; confirmations?: CallerConfirmationStore },
+  req: { cfg: RevenueDeskConfig; callId: string; leadId: string | null; intakeRevision?: number; start: string; durationMinutes: number; callerConfirmed: boolean; summary: string }
 ): Promise<BookingResult> {
   const now = deps.now?.() ?? new Date();
   const { cfg } = req;
@@ -82,10 +84,14 @@ export async function bookAppointment(
 
   let booking = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
   if (booking) {
-    const resumed = await resumeExisting(deps, booking, start, end);
-    if ("done" in resumed) return resumed.done;
-    booking = resumed.claimed;
+    return reconcileBooking(deps, booking);
   } else {
+    // A model boolean is necessary for the old tool contract, never sufficient.
+    // The live adapter has no independently trustworthy evidence source and
+    // deliberately supplies no confirmation store. No row or event is created.
+    const authorized = await deps.confirmations?.consume({ tenantId: cfg.tenantId, callId: req.callId, leadId: req.leadId,
+      intakeRevision: req.intakeRevision ?? 0, calendarId, start, end, timezone: cfg.timezone, idempotencyKey: key }).catch(() => false);
+    if (authorized !== true) return { confirmed: false, failure: "CONFIRMATION_UNAVAILABLE", bookingId: null };
     try {
       booking = await deps.store.insertPending({ tenantId: cfg.tenantId, callId: req.callId, leadId: req.leadId, idempotencyKey: key, calendarId, start, end, timezone: cfg.timezone });
     } catch (e) {
@@ -95,8 +101,7 @@ export async function bookAppointment(
       // authoritative row; never take over a row another request just inserted.
       const winner = await deps.store.findByIdempotencyKey(cfg.tenantId, key);
       if (winner) {
-        const resumed = await resumeExisting(deps, winner, start, end, false);
-        return "done" in resumed ? resumed.done : pending(winner.id);
+        return reconcileBooking(deps, winner);
       }
       if (e instanceof SlotTakenError) return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: null };
       if (e instanceof CallAlreadyBookedError) return { confirmed: false, failure: "INVALID_REQUEST", bookingId: null, callAlreadyBooked: true };
@@ -109,18 +114,20 @@ export async function bookAppointment(
   try {
     const busy = await deps.calendar.getBusy(calendarId, new Date(startMs - buf).toISOString(), new Date(Date.parse(end) + buf).toISOString());
     if (busy.some((b) => Date.parse(b.start) < Date.parse(end) + buf && Date.parse(b.end) > startMs - buf)) {
-      await deps.store.update(cfg.tenantId, booking.id, { status: "conflict", failureCategory: "SLOT_UNAVAILABLE" });
+      await deps.store.update(cfg.tenantId, booking.id, { status: "conflict", failureCategory: "SLOT_UNAVAILABLE" }, booking.leaseToken);
       return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id };
     }
   } catch (e) {
     const cat = e instanceof CalendarError ? e.category : "PROVIDER_ERROR";
-    await deps.store.update(cfg.tenantId, booking.id, { status: "failed", failureCategory: cat });
+    await deps.store.update(cfg.tenantId, booking.id, { status: "failed", failureCategory: cat }, booking.leaseToken);
     return { confirmed: false, failure: cat, bookingId: booking.id };
   }
 
   // 2. write
   let eventId: string;
   try {
+    // Fence a worker that stalled during free/busy past lease takeover.
+    await deps.store.update(cfg.tenantId, booking.id, { failureCategory: "WRITE_OUTCOME_UNKNOWN" }, booking.leaseToken);
     const ev = await deps.calendar.createEvent(calendarId, { aiboBookingId: booking.id, tenantId: cfg.tenantId, start, end, timezone: cfg.timezone, summary: req.summary });
     eventId = ev.eventId;
   } catch {
@@ -128,11 +135,10 @@ export async function bookAppointment(
     const recovered = await safeFind(deps.calendar, calendarId, booking.id, start, end);
     if (recovered && recovered !== "error") {
       eventId = recovered.eventId;
-    } else if (recovered === "error") {
-      return { confirmed: false, failure: "CALENDAR_UNAVAILABLE", bookingId: booking.id, statusUnknown: true }; // stays pending; next retry reconciles
     } else {
-      await deps.store.update(cfg.tenantId, booking.id, { status: "failed", failureCategory: "PROVIDER_ERROR" });
-      return { confirmed: false, failure: "PROVIDER_ERROR", bookingId: booking.id };
+      // An empty lookup cannot exclude a delayed successful insert.
+      await markUncertain(deps.store, booking, "WRITE_OUTCOME_UNKNOWN");
+      return pending(booking.id);
     }
   }
   return finalize(deps, booking, eventId, start, end);
@@ -140,29 +146,31 @@ export async function bookAppointment(
 
 /**
  * Answers a duplicate from the existing row. Final states are authoritative;
- * a pending row is confirmed only via the provider event carrying its AIBO id
- * (+ post-write verification). Otherwise it stays non-final, unless the
- * database atomically grants this request its expired lease (then the caller
- * writes once more with the SAME booking id). No application clock is consulted.
+ * A lease grants one bounded reconciliation pass, NEVER a second insertion.
+ * Missing events remain unresolved even after expiry or process interruption.
  */
-async function resumeExisting(
+export async function reconcileBooking(
   deps: { store: BookingStore; calendar: CalendarProvider },
-  booking: Booking,
-  start: string,
-  end: string,
-  allowClaim = true
-): Promise<{ done: BookingResult } | { claimed: Booking }> {
-  if (booking.status === "confirmed") return { done: ok(booking, true) };
-  if (booking.status === "conflict") return { done: { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id } };
-  if (booking.status === "failed" || booking.status === "cancelled") return { done: { confirmed: false, failure: (booking.failureCategory as CalendarFailure) ?? "PROVIDER_ERROR", bookingId: booking.id } };
-  // pending: maybe the provider already created it before we recorded success.
-  const recovered = await safeFind(deps.calendar, booking.calendarId, booking.id, start, end);
-  if (recovered === "error") return { done: pending(booking.id, "CALENDAR_UNAVAILABLE") };
-  if (recovered) return { done: await finalize(deps, booking, recovered.eventId, start, end) };
-  if (!allowClaim) return { done: pending(booking.id) };
-  // Provider has no event for this id: only a request the DB grants the expired lease may retry with the SAME id.
+  booking: Booking
+): Promise<BookingResult> {
+  if (booking.status === "confirmed") return ok(booking, true);
+  if (booking.status === "conflict") return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id };
+  if (booking.status === "failed" || booking.status === "cancelled") return { confirmed: false, failure: "PROVIDER_ERROR", bookingId: booking.id };
   const claimed = await deps.store.claimPending(booking.tenantId, booking.id, PENDING_LEASE_MS / 1000);
-  return claimed ? { claimed } : { done: pending(booking.id) };
+  if (!claimed) return pending(booking.id);
+  // Cleanup was attempted: never promote that event to confirmed, even if a
+  // timed-out deletion is still in flight. Requires explicit owner resolution.
+  if (claimed.failureCategory === "CONFLICT_CLEANUP_PENDING") return pending(booking.id);
+  // pending: maybe the provider already created it before we recorded success.
+  const recovered = await safeFind(deps.calendar, booking.calendarId, booking.id, booking.start, booking.end);
+  if (recovered === "error") return pending(booking.id, "CALENDAR_UNAVAILABLE");
+  if (recovered) return finalize(deps, claimed, recovered.eventId, booking.start, booking.end, false);
+  return pending(booking.id);
+}
+
+async function markUncertain(store: BookingStore, booking: Booking, failureCategory: string, providerEventId?: string) {
+  return store.update(booking.tenantId, booking.id, { failureCategory, ...(providerEventId ? { providerEventId } : {}) }, booking.leaseToken).then(() => true, () => false);
+  // Even if annotation fails, the pre-existing pending row is the owner queue.
 }
 
 /** Indeterminate: neither success nor failure is established. */
@@ -171,25 +179,42 @@ function pending(bookingId: string | null, failure: CalendarFailure = "PROVIDER_
 }
 
 /** 3. post-write verification: any OTHER overlapping event -> remove ours, report conflict. */
-async function finalize(deps: { store: BookingStore; calendar: CalendarProvider }, booking: Booking, eventId: string, start: string, end: string): Promise<BookingResult> {
+async function finalize(deps: { store: BookingStore; calendar: CalendarProvider }, booking: Booking, eventId: string, start: string, end: string, allowCleanup = true): Promise<BookingResult> {
+  if (!await markUncertain(deps.store, booking, "VERIFICATION_PENDING", eventId)) return pending(booking.id);
   let events;
   try {
     events = await deps.calendar.listEvents(booking.calendarId, start, end);
   } catch {
     return { confirmed: false, failure: "CALENDAR_UNAVAILABLE", bookingId: booking.id, statusUnknown: true };
   }
+  const own = events.filter((e) => e.aiboBookingId === booking.id);
+  if (own.length !== 1 || own[0].eventId !== eventId || Date.parse(own[0].start) !== Date.parse(start) || Date.parse(own[0].end) !== Date.parse(end)) {
+    await markUncertain(deps.store, booking, "EVENT_MISMATCH", eventId);
+    return pending(booking.id);
+  }
   const competing = events.filter((e) => e.eventId !== eventId && Date.parse(e.start) < Date.parse(end) && Date.parse(e.end) > Date.parse(start));
   if (competing.length > 0) {
+    if (!allowCleanup) {
+      await markUncertain(deps.store, booking, "CONFLICT_REQUIRES_REVIEW", eventId);
+      return pending(booking.id);
+    }
     try {
+      // Persist intent BEFORE deletion: a crashed/timed-out cleanup must never
+      // be mistaken for an appointment awaiting positive confirmation.
+      await deps.store.update(booking.tenantId, booking.id, { failureCategory: "CONFLICT_CLEANUP_PENDING", providerEventId: eventId }, booking.leaseToken);
       await deps.calendar.deleteEvent(booking.calendarId, eventId);
-      await deps.store.update(booking.tenantId, booking.id, { status: "conflict", failureCategory: "SLOT_UNAVAILABLE" });
+      await deps.store.update(booking.tenantId, booking.id, { status: "conflict", failureCategory: "SLOT_UNAVAILABLE" }, booking.leaseToken);
     } catch {
-      await deps.store.update(booking.tenantId, booking.id, { status: "failed", failureCategory: "CONFLICT_CLEANUP_FAILED" });
+      return pending(booking.id);
     }
     return { confirmed: false, failure: "SLOT_UNAVAILABLE", bookingId: booking.id };
   }
-  const saved = await deps.store.update(booking.tenantId, booking.id, { status: "confirmed", providerEventId: eventId, failureCategory: null });
-  return ok(saved, false);
+  try {
+    const saved = await deps.store.update(booking.tenantId, booking.id, { status: "confirmed", providerEventId: eventId, failureCategory: null }, booking.leaseToken);
+    return ok(saved, false);
+  } catch {
+    return pending(booking.id);
+  }
 }
 
 async function safeFind(cal: CalendarProvider, calendarId: string, bookingId: string, start: string, end: string) {
